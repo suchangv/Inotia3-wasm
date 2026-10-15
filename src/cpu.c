@@ -48,7 +48,26 @@ static uint32_t g_tr_ins[TRACE_N];
 static int      g_tr_i;
 static int      g_tr_on;
 
+/* Per-instruction trace to the host, for differential testing against
+ * the Unicorn oracle. Emitted at the top of the loop for the
+ * *previous* instruction, so what is reported is the register state
+ * after that instruction retired -- which is what a divergence needs
+ * to be attributed to a specific instruction. */
+int g_trace_insn_on;
+static uint32_t g_prev_pc;
+static int      g_have_prev;
+
 void cpu_enable_trace(int on) { g_tr_on = on; g_tr_i = 0; }
+
+/* Emit the last executed instruction. The in-loop emit fires at the top of an
+ * iteration, so whichever instruction caused the run to end would otherwise
+ * never appear -- and that is usually the interesting one. Keeping the two
+ * traces symmetric is what lets difftrace.py compare line for line. */
+void cpu_trace_final(void)
+{
+    if (g_trace_insn_on && g_have_prev)
+        host_trace_insn(g_prev_pc, g_cpu.r, g_cpu.cpsr);
+}
 
 void cpu_dump_trace(void)
 {
@@ -248,14 +267,27 @@ int cpu_run(uint32_t entry, uint32_t sp, uint64_t budget)
     g_prof.cur = -1;
     g_prof.lo = 0;
     g_prof.hi = 0;
+    g_have_prev = 0;
     prof_transfer(pc);
 
     for (;;) {
         if (g_insn_count >= g_budget)
             return HALT_BUDGET;
 
+        /* Emit the previous instruction now that its effects are in R.
+         * Clearing g_have_prev here is what keeps cpu_trace_final() from
+         * emitting the same instruction a second time when the run ends
+         * before the loop reaches another top. */
+        if (g_trace_insn_on && g_have_prev) {
+            host_trace_insn(g_prev_pc, R, g_cpu.cpsr);
+            g_have_prev = 0;
+        }
+
         if (pc < g_img->text_lo || pc >= g_img->text_hi)
             return HALT_BAD_PC;
+
+        g_prev_pc = pc;
+        g_have_prev = 1;
 
         if (g_prof.on && g_prof.cur >= 0)
             g_prof.counts[g_prof.cur]++;
@@ -499,7 +531,10 @@ int cpu_run(uint32_t entry, uint32_t sp, uint64_t budget)
                     int idx = import_index_of_stub(pc);
                     if (idx >= 0 && idx < g_nimports) {
                         R[15] = pc + 2;
-                        import_dispatch(idx);
+                        if (import_dispatch(idx)) {
+                            R[15] = pc;
+                            return HALT_IMPORT;
+                        }
                         /* Return through LR: a Thumb caller leaves bit0 set,
                          * an ARM caller does not. Respect both. */
                         val = R[14];
@@ -761,6 +796,14 @@ int cpu_run(uint32_t entry, uint32_t sp, uint64_t budget)
                         return trap(pc, ins, 4);
                 }
 
+                /* add_c()/sub_c() write all four flags unconditionally -- they
+                 * are the flag-setting primitives. ARM's data-processing
+                 * instructions only write flags when S is set, so the incoming
+                 * flags are captured here and put back for the common case.
+                 * Without this, `add ip, pc, #0` in the PLT -- which has no S
+                 * bit -- silently clears the condition flags, and any later
+                 * conditional branch in the caller reads garbage. */
+                uint32_t flags_in = g_cpu.cpsr & (F_N | F_Z | F_C | F_V);
                 uint32_t a = R[rn], res;
                 switch (opcode) {
                 case 0x0: res = a & op2; break;                       /* AND */
@@ -784,6 +827,8 @@ int cpu_run(uint32_t entry, uint32_t sp, uint64_t budget)
                 if (S) {
                     set_nz(res);
                     g_cpu.cpsr = (g_cpu.cpsr & ~F_C) | shc;
+                } else {
+                    g_cpu.cpsr = (g_cpu.cpsr & ~(F_N | F_Z | F_C | F_V)) | flags_in;
                 }
                 if (rd == 15) {
                     /* A write to PC from a data-processing instruction is a
@@ -799,12 +844,25 @@ int cpu_run(uint32_t entry, uint32_t sp, uint64_t budget)
 
             /* ---- single data transfer ---- */
             if (op1 == 2 || op1 == 3) {
-                uint32_t I = (ins >> 25) & 1;
+                /* Bit 25 selects the offset form, and it is the opposite way
+                 * round from the field's usual name: 0 selects the 12-bit
+                 * immediate, 1 selects the register-shifted form.
+                 *
+                 * Settled empirically against QEMU rather than from the ARM
+                 * ARM, because getting it backwards still produces a
+                 * structurally valid instruction: 0xE5BCF388 (bit25=0) is
+                 * `ldr pc, [ip, #0x388]!` and lands on a real JUMP_SLOT slot,
+                 * while decoding it as a register offset yields r8<<7 and a
+                 * writeback that misses the GOT entirely. The tell was that
+                 * the two candidate addresses differed by exactly imm12.
+                 *
+                 * This one instruction is on the path of all 178 imports. */
+                uint32_t reg_offset = (ins >> 25) & 1;
                 uint32_t P = (ins >> 24) & 1, U = (ins >> 23) & 1;
                 uint32_t B = (ins >> 22) & 1, W = (ins >> 21) & 1;
                 uint32_t L = (ins >> 20) & 1;
                 uint32_t off;
-                if (I) {
+                if (!reg_offset) {
                     off = ins & 0xfff;
                 } else {
                     uint32_t rm = ins & 0xf;
@@ -915,6 +973,7 @@ const char *cpu_halt_str(int reason)
     case HALT_UNDEFINED: return "undefined instruction";
     case HALT_TRAP:      return "unimplemented instruction (valid, not emulated)";
     case HALT_BAD_PC:    return "PC left the loaded image";
+    case HALT_IMPORT:    return "stopped at host crossing (oracle mode)";
     default:             return "?";
     }
 }

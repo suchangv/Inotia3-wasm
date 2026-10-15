@@ -136,6 +136,7 @@ static run_result run_entry(const char *what, uint32_t entry, uint64_t budget)
     uint64_t before = g_insn_count;
     double t0 = host_now();
     r.reason = cpu_run(entry, g_cpu.r[13], g_insn_count + budget);
+    cpu_trace_final();
     r.seconds = host_now() - t0;
     r.insns = g_insn_count - before;
     return r;
@@ -176,11 +177,47 @@ static void report_run(const run_result *r)
     }
 }
 
+/* ---- guest memory dump ---------------------------------------------------
+ *
+ * For the differential test: the oracle maps exactly the memory this process
+ * relocated, so a divergence between the two traces cannot be a loader
+ * difference. Only regions that can hold non-zero data are written; Unicorn
+ * hands out zero-filled pages for everything else, which is what the guest
+ * space holds there anyway.
+ */
+static const struct { uint32_t addr, size; } k_dump_regions[] = {
+    { GUEST_IMAGE_BASE, 0x00E00000u },  /* relocated .so, .data, .bss */
+    { GUEST_STUB_BASE,  0x00500000u },  /* import stubs + host data   */
+};
+
+static void dump_guest(const char *path)
+{
+    FILE *f = fopen(path, "wb");
+    if (!f)
+        host_fatal("cannot open %s for the guest memory dump\n", path);
+
+    uint32_t n = (uint32_t)(sizeof(k_dump_regions) / sizeof(k_dump_regions[0]));
+    fwrite("GIMG", 1, 4, f);
+    fwrite(&n, 4, 1, f);
+    for (uint32_t i = 0; i < n; i++) {
+        fwrite(&k_dump_regions[i].addr, 4, 1, f);
+        fwrite(&k_dump_regions[i].size, 4, 1, f);
+    }
+    for (uint32_t i = 0; i < n; i++)
+        fwrite(g_mem + k_dump_regions[i].addr, 1, k_dump_regions[i].size, f);
+
+    fclose(f);
+    host_log("guest memory dumped to %s (%u regions)\n", path, n);
+}
+
 /* ---- entry --------------------------------------------------------------- */
 
 int main(int argc, char **argv)
 {
     const char *path = NULL;
+    const char *dump_path = NULL;
+    const char *trace_path = NULL;
+    uint32_t only_entry = 0;
     uint64_t budget = 200u * 1000u * 1000u;
     int do_init_array = 0, do_jni = 0, do_profile = 1, trace = 0;
 
@@ -197,6 +234,14 @@ int main(int argc, char **argv)
             do_profile = 0;
         else if (strcmp(argv[i], "--trace") == 0)
             trace = 1;
+        else if (strcmp(argv[i], "--oracle") == 0)
+            g_oracle_mode = 1;
+        else if (strncmp(argv[i], "--dump-guest=", 13) == 0)
+            dump_path = argv[i] + 13;
+        else if (strncmp(argv[i], "--trace-insns=", 14) == 0)
+            trace_path = argv[i] + 14;
+        else if (strncmp(argv[i], "--entry=", 8) == 0)
+            only_entry = (uint32_t)strtoul(argv[i] + 8, NULL, 16);
         else if (argv[i][0] != '-')
             path = argv[i];
     }
@@ -238,9 +283,22 @@ int main(int argc, char **argv)
     cpu_set_profile(do_profile);
     cpu_enable_trace(trace);
 
+    if (dump_path)
+        dump_guest(dump_path);
+    if (trace_path) {
+        host_trace_open(trace_path);
+        g_trace_insn_on = 1;
+    }
+
     /* ---- run it ---- */
     host_log("\n");
-    if (do_init_array) {
+    if (only_entry) {
+        /* One entry point only, so a differential run covers a single guest
+         * function from entry to return rather than concatenating five of them
+         * into one trace file. */
+        run_result rr = run_entry("entry", only_entry, budget);
+        report_run(&rr);
+    } else if (do_init_array) {
         if (!g_img.init_array) {
             host_log("no DT_INIT_ARRAY in the image\n");
         } else {
@@ -273,6 +331,12 @@ int main(int argc, char **argv)
         uint32_t jni = find_symbol("JNI_OnLoad");
         run_result rr = run_entry("JNI_OnLoad", jni, budget);
         report_run(&rr);
+    }
+
+    if (trace_path) {
+        g_trace_insn_on = 0;
+        host_trace_close();
+        host_log("\ninstruction trace written to %s\n", trace_path);
     }
 
     /* ---- report ---- */

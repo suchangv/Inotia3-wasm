@@ -100,8 +100,17 @@ static inline int import_index_of_stub(uint32_t addr)
 
 /* Call the host implementation for import `idx` with the arguments the guest
  * placed in r0-r3 and on the stack. The return value is written back to r0
- * (and r1, for the 64-bit-returning libc functions). */
-void import_dispatch(int idx);
+ * (and r1, for the 64-bit-returning libc functions).
+ *
+ * Returns non-zero if the interpreter should stop. In oracle mode (see
+ * g_oracle_mode) it stops at the first crossing, which bounds a differential
+ * test against Unicorn to pure CPU semantics: neither side's shims can be the
+ * explanation for a difference in the traces. */
+int import_dispatch(int idx);
+
+/* When set, host implementations are not called at all and the guest stops at
+ * its first import. Used by the differential test. */
+extern int g_oracle_mode;
 
 /* The implementation switch, in host_libc.c. Kept separate from the stub and
  * bookkeeping machinery above so that "what the guest can call" and "how the

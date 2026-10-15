@@ -90,4 +90,15 @@ void *host_alloc(size_t n);          /* zeroed, in host memory (not guest) */
 double host_now(void);               /* monotonic seconds                  */
 void host_fatal(const char *fmt, ...);
 
+/* ---- per-instruction trace, for differential testing ---------------------
+ *
+ * Emitted *after* an instruction has executed, keyed by the PC of the
+ * instruction that ran. The oracle (tools/oracle.py, driven by Unicorn)
+ * produces the same lines from the same guest memory image; the first line
+ * that differs is the first instruction whose semantics are wrong. That turns
+ * "the guest crashed somewhere" into a specific address and register.
+ */
+extern int g_trace_insn_on;
+void host_trace_insn(uint32_t pc, const uint32_t *regs, uint32_t cpsr);
+
 #endif /* GUEST_H */

@@ -28,6 +28,7 @@ enum {
     HALT_UNDEFINED,    /* an encoding the decoder does not implement */
     HALT_TRAP,         /* a valid instruction we deliberately do not emulate */
     HALT_BAD_PC,       /* PC left the loaded image */
+    HALT_IMPORT,       /* stopped at a host crossing (oracle mode) */
 };
 
 const char *cpu_halt_str(int reason);
@@ -58,5 +59,6 @@ uint64_t *cpu_profile_counts(void);
  * from a signal handler. */
 void cpu_enable_trace(int on);
 void cpu_dump_trace(void);
+void cpu_trace_final(void);
 
 #endif /* CPU_H */

@@ -26,14 +26,18 @@ diffed against this one instruction by instruction.
 | Import table (183 symbols) | **done** — 178 functions, 4 variables, 84 implemented |
 | Guest heap | **done** — first-fit free list with coalescing |
 | Thumb-1 decoder | **working** — full format coverage |
-| ARM decoder | **in progress** — reaches the PLT, faults in its own handling |
+| ARM decoder | **working** — verified instruction-for-instruction against Unicorn |
 | VFPv2 | not started |
 | JNI / GLES1 / audio / assets | not started |
+| Differential oracle | **working** — `tools/difftest.sh`, all entries identical |
 | Browser host | not started |
 
-Progress: the static constructors now run real engine code — `SGL_Context`'s
-constructor, `operator new`, `jMemory_*` — and reach the ARM PLT. The run gets
-345 instructions in before faulting inside the ARM decoder.
+Progress: the four static constructors run real engine code — `SGL_Context`'s
+constructor, `operator new`, `jMemory_*` — through the ARM PLT, and their
+execution now matches Unicorn instruction for instruction. Coverage is still
+shallow (133 instructions) because every import is stubbed to a no-op, so the
+guest walks into a NULL soon after; widening it means implementing imports
+identically on both sides, which is the next milestone, not a decoder question.
 
 ## Findings from the real binary
 
@@ -82,6 +86,51 @@ Verified against observed execution rather than only the ARM ARM:
 | `0x0ea590` | `f7e4 ff40` | `11111` | `0x0cf414` — Thumb, `operator new` |
 | `0x0cf426` | `f789 eaea` | `11101` | `0x0589fe` — ARM, `.plt` |
 
+## The differential oracle
+
+`tools/difftest.sh` runs every guest entry point twice — once under the
+hand-written interpreter, once under Unicorn 2.1.4 — and diffs
+`tools/difftrace.py`. Both sides start from the *same* relocated memory image
+(the interpreter dumps it, the oracle loads it), stub every import to a no-op
+returning 0, and stop when PC leaves the image. That leaves pure CPU semantics,
+so a mismatch is a decoder bug by construction and the first differing line
+names the instruction.
+
+Why Unicorn is an oracle and not the product is in the parent repo's
+WASM_PORT_ASSESSMENT.md and the README: its speed comes from QEMU's TCG JIT and
+a browser cannot execute generated code, so in wasm it runs TCI — a two-level
+interpreter that does strictly more work per guest instruction than a direct
+decoder. It is also GPLv2. As a *reference* it is exactly right, and it is the
+reason the two bugs below were found in minutes rather than by bisecting
+crashes.
+
+Setting it up needs no system packages and no pip: create a venv with
+`--without-pip` and unpack the PyPI wheel into its `site-packages`. The
+environment is gitignored.
+
+### Harness asymmetries that cost real time
+
+Each of these reported a divergence that had nothing to do with the CPU. They
+are recorded because anyone re-running this will hit them in the same order:
+
+1. **CPSR is not comparable verbatim.** The interpreter tracks only N/Z/C/V;
+   Unicorn reports the whole architectural word including mode and T bits. Mask
+   to `0xF0000000` before comparing, and clear only the flags on the oracle
+   side — writing a literal CPSR silently clears the Thumb bit and makes
+   Unicorn decode Thumb code as ARM.
+2. **`r0`/`r1` must be cleared on both sides at an import.** The interpreter
+   cleared them inside `host_import_call`, which oracle mode skips entirely.
+3. **The address spaces must match.** The interpreter's space is one flat
+   buffer, so a stray write to address 0 is harmless; Unicorn raises
+   `UC_ERR_WRITE_UNMAPPED` unless the whole space is mapped. Same memory model,
+   or the diff lies.
+4. **Both must agree on when a run ends.** The interpreter reports
+   `HALT_BAD_PC` when PC leaves the image; with the whole space mapped, Unicorn
+   would happily execute the zero bytes at address 0 forever.
+5. **The final instruction must be emitted exactly once.** The trace is written
+   at the top of the loop for the *previous* instruction, so a run that ends
+   before the next top would either miss the last instruction or emit it twice.
+
 ## Interpreter bugs found
 
 Each was found by running the real binary and reading the fault report, not by
@@ -105,6 +154,23 @@ interpreter expensive, and because the same traps await the translated build.
    jump into the middle of `.bss` rather than an immediate crash.
 4. **`BL`/`BLX` discriminator** — see above.
 5. **Missing interworking bit on import stubs** — see above.
+6. **ARM data processing clobbered the flags without S.** `add_c()`/`sub_c()`
+   write all four flags unconditionally — they are the flag-setting
+   primitives — and `if (S)` only re-wrote them. So `add ip, pc, #0` in the PLT,
+   which has no S bit, silently cleared NZCV, and the caller's next conditional
+   branch read garbage. Fixed by saving the incoming flags and restoring them
+   for the `S == 0` case.
+7. **Bit 25 of the ARM load/store offset field is inverted from expectation.**
+   `0` selects the 12-bit immediate, `1` selects the register-shifted form —
+   the opposite way round from the field's usual name. Getting it backwards
+   still produces a structurally valid instruction, so nothing crashes at the
+   decode: `0xE5BCF388` decoded as a register offset yields `r8 << 7` and a
+   writeback that misses the GOT entirely.
+
+   Both candidates were plausible, so it was settled by fact rather than
+   argument: the two addresses differ by exactly `imm12`, and only `ip + 0x388`
+   appears in `.rel.plt` as a `R_ARM_JUMP_SLOT` offset. **This single
+   instruction is on the path of all 178 imports.**
 
 Two structural notes worth carrying forward:
 
@@ -119,12 +185,16 @@ Two structural notes worth carrying forward:
 
 ## Next steps
 
-1. Finish the ARM decoder: fix the current fault, then let the trap report drive
-   the rest. Coprocessor space (VFPv2) and `SWI` trap with their encodings
-   recorded rather than being guessed at.
-2. Recover function ranges from `.ARM.exidx` so the profile stops under-counting
+1. Widen the differential coverage: implement imports identically on both sides
+   so the comparison is not bounded by the first NULL. The constructors only
+   reach 133 instructions that way.
+2. Let the trap report drive the rest of the ARM work, then VFPv2. Coprocessor
+   space and `SWI` should keep trapping with their encodings recorded rather
+   than being guessed at — and the first one is checked against the oracle
+   immediately, which is the whole point of having built it.
+3. Recover function ranges from `.ARM.exidx` so the profile stops under-counting
    and reports anonymous ranges instead of dropping them.
-3. Wire in `FalsoJNI` + `java.c` from the Vita port and call `JNI_OnLoad`. The
+4. Wire in `FalsoJNI` + `java.c` from the Vita port and call `JNI_OnLoad`. The
    guest reaches JNI through the `JavaVM`/`JNIEnv` function tables, not through
    ELF imports, so this is where the existing JNI layer becomes load-bearing.
 4. Run to the first real frame and record the two numbers that justify the

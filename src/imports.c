@@ -227,11 +227,29 @@ void imports_build_stubs(void)
 
 /* ---- dispatch ------------------------------------------------------------ */
 
-void import_dispatch(int idx)
+int g_oracle_mode;
+
+int import_dispatch(int idx)
 {
     guest_import *im = &g_imports[idx];
     im->calls++;
+    if (g_oracle_mode) {
+        /* Deterministic no-op returning 0, matching the oracle's stub exactly.
+         * Two different shim implementations would make any later divergence
+         * ambiguous -- was it the CPU or the shim? -- so in this mode neither
+         * side implements anything, and the comparison stays about the
+         * decoder. The guest will usually walk into a NULL return soon after,
+         * but it does so identically on both sides, which is the point.
+         *
+         * r0/r1 are cleared here rather than left to host_import_call(): that
+         * function is skipped entirely in this mode, and the oracle does clear
+         * them, so leaving them alone shows up as a phantom divergence. */
+        g_cpu.r[0] = 0;
+        g_cpu.r[1] = 0;
+        return 0;
+    }
     host_import_call(im);
+    return 0;
 }
 
 void imports_report(int top_n)

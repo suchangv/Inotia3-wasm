@@ -66,6 +66,10 @@ static void segv_handler(int sig, siginfo_t *info, void *uctx)
                 i, g_cpu.r[i], i + 1, g_cpu.r[i + 1],
                 i + 2, g_cpu.r[i + 2], i + 3, g_cpu.r[i + 3]);
     cpu_dump_trace();
+    /* The instruction trace is buffered inside stdio and _exit() does not
+     * flush, so a crash would otherwise truncate it to nothing -- and the
+     * instructions right before the fault are exactly the interesting ones. */
+    host_trace_close();
     _exit(139);
 }
 
@@ -123,6 +127,48 @@ double host_now(void)
     struct timespec ts;
     clock_gettime(CLOCK_MONOTONIC, &ts);
     return (double)ts.tv_sec + (double)ts.tv_nsec * 1e-9;
+}
+
+/* ---- per-instruction trace -----------------------------------------------
+ *
+ * Format is shared with tools/oracle.py and is deliberately dumb: one line per
+ * retired instruction, PC first then the whole register file and CPSR. A
+ * diff of the two files names the first instruction whose semantics differ,
+ * which is the only thing that makes debugging an interpreter tractable.
+ */
+static FILE *g_trace_out;
+
+void host_trace_open(const char *path);
+void host_trace_close(void);
+
+void host_trace_open(const char *path)
+{
+    g_trace_out = fopen(path, "w");
+    if (!g_trace_out)
+        host_fatal("cannot open trace file %s\n", path);
+    /* A megabyte of buffer: the trace is written from inside the interpreter's
+     * inner loop, so the syscall count is what would dominate the run. */
+    static char buf[1 << 20];
+    setvbuf(g_trace_out, buf, _IOFBF, sizeof(buf));
+}
+
+void host_trace_close(void)
+{
+    if (g_trace_out) {
+        fclose(g_trace_out);
+        g_trace_out = NULL;
+    }
+}
+
+void host_trace_insn(uint32_t pc, const uint32_t *r, uint32_t cpsr)
+{
+    if (!g_trace_out)
+        return;
+    fprintf(g_trace_out,
+            "%08x %08x %08x %08x %08x %08x %08x %08x %08x %08x %08x %08x "
+            "%08x %08x %08x %08x %08x\n",
+            pc, r[0], r[1], r[2], r[3], r[4], r[5], r[6], r[7],
+            r[8], r[9], r[10], r[11], r[12], r[13], r[14], cpsr);
 }
 
 /* ---- guest mmap ----------------------------------------------------------
