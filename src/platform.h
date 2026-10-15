@@ -1,0 +1,22 @@
+/*
+ * platform.h -- services the core needs but cannot provide itself.
+ *
+ * guest.h declares the four that every port must supply (host_log, host_alloc,
+ * host_now, host_fatal). This header adds the ones that only *some* hosts can
+ * answer, so that a host which cannot answer one yet fails visibly at the
+ * import boundary rather than at link time -- the point being that the boot
+ * path should not have to wait for the asset path to be written.
+ */
+#ifndef PLATFORM_H
+#define PLATFORM_H
+
+#include <stdint.h>
+
+/* Guest mmap arena. Returns a guest address, or 0 on exhaustion. */
+uint32_t host_guest_mmap(uint32_t size);
+
+/* Optional: translate a host-level crash back into a guest PC. A no-op where
+ * the host has no such notion (the browser). */
+void host_install_crash_handler(void);
+
+#endif /* PLATFORM_H */

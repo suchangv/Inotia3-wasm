@@ -1,0 +1,25 @@
+# --- Copyrighted game material: never commit ---
+# Supply your own legally-obtained copy (libgame.so + assets) locally.
+game/
+*.so
+*.apk
+*.obb
+*.zip
+
+# --- Build output ---
+build/
+*.o
+*.wasm
+*.a
+*.d
+
+# --- Logs / profiles ---
+*.log
+*.json
+*.csv
+profiles/
+
+# --- Editor ---
+.vscode/
+.idea/
+*.swp
