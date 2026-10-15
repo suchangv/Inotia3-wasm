@@ -24,3 +24,6 @@ profiles/
 .idea/
 *.swp
 .venv/
+
+# Third-party dependency checkouts (see docs/REUSE.md).
+vendor/
