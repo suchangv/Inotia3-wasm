@@ -268,6 +268,9 @@ int cpu_run(uint32_t entry, uint32_t sp, uint64_t budget)
     g_prof.lo = 0;
     g_prof.hi = 0;
     g_have_prev = 0;
+    /* Reset the ring per run: a trace that spans several entry points shows
+     * whichever ran last, which is not the one being debugged. */
+    g_tr_i = 0;
     prof_transfer(pc);
 
     for (;;) {
@@ -403,6 +406,21 @@ int cpu_run(uint32_t entry, uint32_t sp, uint64_t budget)
                     case 1: R[rd] = sub_c(R[rd], src, 1); break;/* CMP, flags */
                     case 2: R[rd] = src; break;                 /* MOV, no flags */
                     default: {                                  /* BX / BLX */
+                        /* Bit 7 tells them apart, and the difference is LR:
+                         * `blx Rm` is a call and must leave a return address
+                         * behind, `bx Rm` is a jump and must not.
+                         *
+                         * Treating them alike is invisible until a stubbed
+                         * import is reached through `blx`, at which point the
+                         * callee returns to whatever LR the *caller's* caller
+                         * left there -- one frame too high up. That is what
+                         * made JNI_OnLoad fail: getEnv()'s `blx r3` reached the
+                         * GetEnv stub, the stub returned straight into
+                         * JNI_OnLoad, and the JNI_OK that GetEnv returned was
+                         * read as getEnv()'s own result, so its `env == NULL`
+                         * test saw 0 and the module gave up. */
+                        if (ins & 0x0080)          /* BLX: set LR */
+                            R[14] = (pc + 2) | 1u;
                         g_thumb = (src & 1) != 0;
                         pc = src & ~1u;
                         R[15] = pc;
