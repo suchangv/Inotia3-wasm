@@ -41,6 +41,14 @@
  * requires. */
 #define RETURN_SENTINEL 0x0BADF00Du
 
+/* WrapperJinterface.setTextViewHeight(1024, 1024, false) is called during the
+ * Java onSurfaceCreated() right before nativeInit(), and the .so's pointer
+ * arithmetic against the pixel buffer depends on this exact size (see the Vita
+ * port's source/main.c). It is 4 MB of guest heap, which the 64 MB arena holds
+ * comfortably. */
+#define TEXTVIEW_WIDTH  1024
+#define TEXTVIEW_HEIGHT 1024
+
 static guest_image g_img;
 
 static uint32_t find_symbol(const char *name)
@@ -316,7 +324,16 @@ int main(int argc, char **argv)
          * sequence is what puts the guest on the path to its first frame. */
         host_log("=== boot sequence ===\n");
         for (uint32_t i = 0; i < g_img.init_array_n; i++) {
-            uint32_t fn = LD32(g_img.init_array + i * 4) | 1u;
+            uint32_t raw = LD32(g_img.init_array + i * 4);
+            /* The image's .init_array has a trailing NULL entry (ARRAYSZ
+             * counts it). Executing it would be exactly the "branch through a
+             * NULL function pointer" case the return sentinel exists to
+             * distinguish, so skip rather than run. */
+            if (!raw) {
+                host_log("ctor[%u]                : (null entry, skipped)\n", i);
+                continue;
+            }
+            uint32_t fn = raw | 1u;
             char label[32];
             label[0]='c'; label[1]='t'; label[2]='o'; label[3]='r';
             label[4]='['; label[5]=(char)('0'+(i%10)); label[6]=']'; label[7]=0;
@@ -345,7 +362,12 @@ int main(int argc, char **argv)
             uint32_t array = jni_host_new_int_array(3);
             g_cpu.r[13] = GUEST_STACK_TOP - 0x1000;
             ST32(g_cpu.r[13], 544);          /* screenH, the fifth argument */
-            g_cpu.r[14] = 1;
+            /* LR must be the same sentinel run_entry_arg uses. This was 1,
+             * which lands the return at PC 0 -- indistinguishable from a
+             * branch through a null function pointer, and reported as "PC left
+             * the loaded image" even when the function's epilogue ran
+             * correctly. Same class of mistake as the sentinel having been 0. */
+            g_cpu.r[14] = RETURN_SENTINEL;
             for (int i = 0; i < 13; i++) g_cpu.r[i] = 0;
             g_cpu.r[0] = g_jnienv_ptr;
             g_cpu.r[1] = 0;                  /* clazz: the guest ignores it */
@@ -369,6 +391,54 @@ int main(int argc, char **argv)
             host_log("    module globals at 0115a36c: vm=%08x env=%08x\n",
                      LD32(0x0115a36c), LD32(0x0115a370));
         }
+
+        uint32_t init = find_symbol(
+            "Java_com_com2us_wrapper_WrapperRenderer_nativeInit");
+        if (!init) {
+            host_log("nativeInit symbol not found\n");
+        } else {
+            /* nativeInit(JNIEnv *env, jobject clazz, jlongArray sysTime,
+             *            jintArray upTime, jintArray pixel, jfloatArray gyro,
+             *            jobject activity) -- seven arguments, so the last
+             *            three go on the guest stack in order.
+             *
+             * The arrays are handles the guest itself calls Get*ArrayElements
+             * on; the Java side that would have allocated and filled them is
+             * mirrored here. sysTime is wall-clock ms on Android; host_now() is
+             * monotonic, so this is "some plausible non-zero ms" rather than a
+             * real epoch -- enough to tell whether the engine reads it once or
+             * every frame. */
+            uint32_t sysTime = jni_host_new_array(8, 1);
+            uint32_t sys_addr = jni_host_array_addr(sysTime);
+            ST32(sys_addr, (uint32_t)(host_now() * 1000.0));
+            ST32(sys_addr + 4, 0);
+            uint32_t upTime = jni_host_new_array(4, 1);
+            uint32_t pixel  = jni_host_new_array(4, TEXTVIEW_WIDTH * TEXTVIEW_HEIGHT);
+            uint32_t gyro   = jni_host_new_array(4, 3);
+            uint32_t activity = guest_heap_alloc(16);  /* opaque jobject */
+
+            g_cpu.r[13] = GUEST_STACK_TOP - 0x1000;
+            ST32(g_cpu.r[13] + 0, pixel);
+            ST32(g_cpu.r[13] + 4, gyro);
+            ST32(g_cpu.r[13] + 8, activity);
+            g_cpu.r[14] = RETURN_SENTINEL;
+            for (int i = 0; i < 13; i++) g_cpu.r[i] = 0;
+            g_cpu.r[0] = g_jnienv_ptr;
+            g_cpu.r[1] = 0;                  /* clazz: the guest ignores it */
+            g_cpu.r[2] = sysTime;
+            g_cpu.r[3] = upTime;
+            g_cpu.cpsr = 0x10;
+            uint64_t ibefore = g_insn_count;
+            double it0 = host_now();
+            run_result ri;
+            ri.what = "nativeInit";
+            ri.entry = init;
+            ri.reason = cpu_run(init, g_cpu.r[13], g_insn_count + budget);
+            cpu_trace_final();
+            ri.insns = g_insn_count - ibefore;
+            ri.seconds = host_now() - it0;
+            report_run(&ri);
+        }
     } else if (only_entry) {
         /* One entry point only, so a differential run covers a single guest
          * function from entry to return rather than concatenating five of them
@@ -383,8 +453,12 @@ int main(int argc, char **argv)
             for (uint32_t i = 0; i < g_img.init_array_n; i++) {
                 /* The constructors are C++ global ctors emitted by GCC for
                  * ARMv5TE, so they are Thumb functions and arrive without the
-                 * Thumb bit set in the table -- set it. */
-                uint32_t fn = LD32(g_img.init_array + i * 4) | 1u;
+                 * Thumb bit set in the table -- set it. A NULL entry is
+                 * padding, not a constructor: see the boot sequence above. */
+                uint32_t raw = LD32(g_img.init_array + i * 4);
+                if (!raw)
+                    continue;
+                uint32_t fn = raw | 1u;
                 char label[32];
                 /* Labels are built by hand: snprintf into a host buffer is
                  * fine here, this is not guest code. */

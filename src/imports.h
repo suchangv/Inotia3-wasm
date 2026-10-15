@@ -58,6 +58,12 @@ enum {
     IMPL_fopen, IMPL_fclose, IMPL_fread, IMPL_fwrite, IMPL_fseek, IMPL_fstat,
     IMPL_open, IMPL_close, IMPL_read, IMPL_write, IMPL_lseek,
     IMPL_snprintf, IMPL_sprintf, IMPL_vsnprintf, IMPL_vsprintf, IMPL_fprintf,
+    /* JNI table entries. They are not dispatched by this switch -- host_import
+     * call routes anything named "jni/" to jni_host_call first -- but they need
+     * an impl id so the report distinguishes "handled by the JNI layer" from
+     * "the guest called something nobody provides". Without it every JNI call
+     * was listed under "unimplemented imports were actually called". */
+    IMPL_jni,
     IMPL_IMPL_COUNT
 };
 

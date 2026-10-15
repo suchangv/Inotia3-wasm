@@ -53,10 +53,17 @@ extern uint32_t g_javavm_ptr;
  * import_register() -- and before running any guest code. */
 void jni_guest_init(void);
 
-/* Create a fake int array handle for the host side to pass into a guest entry
+/* Create a fake array handle for the host side to pass into a guest entry
  * point -- nativePreInit() takes a jintArray out-parameter that the Java side
- * would have allocated. */
+ * would have allocated, and nativeInit() takes jlongArray/jintArray/jfloatArray
+ * in-parameters. `elem` is the element size in bytes (4 for int/float, 8 for
+ * long). */
 uint32_t jni_host_new_int_array(int n);
+uint32_t jni_host_new_array(int elem, int n);
+
+/* Guest address of an array handle's payload, for the host to fill in a value
+ * the Java side would have supplied (e.g. the current wall-clock time). */
+uint32_t jni_host_array_addr(uint32_t handle);
 
 /* True if the named import is a JNI table entry, and if so, call it.
  * Returns 1 when it handled the call. */

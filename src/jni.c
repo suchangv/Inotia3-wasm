@@ -365,18 +365,21 @@ int jni_host_call(const char *name, uint32_t *args, int nargs, uint32_t *ret_lo,
         return 1;
     }
     if (strcmp(fn, "NewIntArray") == 0 || strcmp(fn, "NewByteArray") == 0 ||
-        strcmp(fn, "NewShortArray") == 0 || strcmp(fn, "NewFloatArray") == 0) {
-        uint32_t elem = 4;
-        if (strcmp(fn, "NewByteArray") == 0) elem = 1;
-        else if (strcmp(fn, "NewShortArray") == 0) elem = 2;
-        uint32_t buf = guest_heap_alloc(a1 * elem + 4);
-        memset(g_mem + buf, 0, a1 * elem + 4);
-        uint32_t h = handle_new(H_ARRAY);
-        jni_handle *o = handle_of(h);
-        o->guest = buf;
-        o->len = a1;
-        o->elem = elem;
-        *ret_lo = h;
+        strcmp(fn, "NewShortArray") == 0 || strcmp(fn, "NewFloatArray") == 0 ||
+        strcmp(fn, "NewLongArray") == 0 || strcmp(fn, "NewDoubleArray") == 0 ||
+        strcmp(fn, "NewCharArray") == 0 || strcmp(fn, "NewBooleanArray") == 0) {
+        /* Element size by type. Getting this wrong does not fault -- the
+         * payload is flat guest memory and the guest indexes it itself -- it
+         * just makes the guest read past what was allocated, or read a
+         * neighbouring element, so it is worth being explicit. */
+        int elem = 4;
+        if (strcmp(fn, "NewByteArray") == 0 ||
+            strcmp(fn, "NewBooleanArray") == 0)      elem = 1;
+        else if (strcmp(fn, "NewShortArray") == 0 ||
+                 strcmp(fn, "NewCharArray") == 0)        elem = 2;
+        else if (strcmp(fn, "NewLongArray") == 0 ||
+                 strcmp(fn, "NewDoubleArray") == 0)      elem = 8;
+        *ret_lo = jni_host_new_array(elem, (int)a1);
         st->implemented = 1;
         return 1;
     }
@@ -389,7 +392,14 @@ int jni_host_call(const char *name, uint32_t *args, int nargs, uint32_t *ret_lo,
     if (strcmp(fn, "GetIntArrayElements") == 0 ||
         strcmp(fn, "GetByteArrayElements") == 0 ||
         strcmp(fn, "GetShortArrayElements") == 0 ||
-        strcmp(fn, "GetFloatArrayElements") == 0) {
+        strcmp(fn, "GetFloatArrayElements") == 0 ||
+        strcmp(fn, "GetLongArrayElements") == 0 ||
+        strcmp(fn, "GetDoubleArrayElements") == 0 ||
+        strcmp(fn, "GetCharArrayElements") == 0 ||
+        strcmp(fn, "GetBooleanArrayElements") == 0) {
+        /* Hands back the payload itself, not a copy: every caller in this
+         * guest writes through the pointer expecting Java to see it, and there
+         * is no Java. isCopy is reported false accordingly. */
         jni_handle *o = handle_of(a1);
         if (a2)
             ST8(a2, 0);
@@ -400,21 +410,37 @@ int jni_host_call(const char *name, uint32_t *args, int nargs, uint32_t *ret_lo,
     if (strcmp(fn, "ReleaseIntArrayElements") == 0 ||
         strcmp(fn, "ReleaseByteArrayElements") == 0 ||
         strcmp(fn, "ReleaseShortArrayElements") == 0 ||
-        strcmp(fn, "ReleaseFloatArrayElements") == 0) {
+        strcmp(fn, "ReleaseFloatArrayElements") == 0 ||
+        strcmp(fn, "ReleaseLongArrayElements") == 0 ||
+        strcmp(fn, "ReleaseDoubleArrayElements") == 0 ||
+        strcmp(fn, "ReleaseCharArrayElements") == 0 ||
+        strcmp(fn, "ReleaseBooleanArrayElements") == 0) {
+        /* Nothing to commit: Get*ArrayElements handed out the payload. */
         st->implemented = 1;
         return 1;
     }
-    if (strcmp(fn, "GetIntArrayRegion") == 0) {
+    if (strncmp(fn, "Get", 3) == 0 && strstr(fn, "ArrayRegion")) {
+        /* jint Get<T>ArrayRegion(env, array, start, len, T *buf): copies out
+         * of the array into guest memory. The element size comes from the
+         * handle rather than the function name, so this covers every element
+         * type with one body. */
         jni_handle *o = handle_of(a1);
-        if (o && a2)
-            memcpy(g_mem + a2, g_mem + o->guest + a3 * 4, a4 * 4);
+        if (o && a2 && o->elem) {
+            uint32_t n = a4 * o->elem;
+            if (a3 + a4 <= o->len)
+                memcpy(g_mem + a2, g_mem + o->guest + a3 * o->elem, n);
+        }
         st->implemented = 1;
         return 1;
     }
-    if (strcmp(fn, "SetIntArrayRegion") == 0) {
+    if (strncmp(fn, "Set", 3) == 0 && strstr(fn, "ArrayRegion")) {
+        /* jint Set<T>ArrayRegion(env, array, start, len, const T *buf) */
         jni_handle *o = handle_of(a1);
-        if (o && a2)
-            memcpy(g_mem + o->guest + a3 * 4, g_mem + a2, a4 * 4);
+        if (o && a2 && o->elem) {
+            uint32_t n = a4 * o->elem;
+            if (a3 + a4 <= o->len)
+                memcpy(g_mem + o->guest + a3 * o->elem, g_mem + a2, n);
+        }
         st->implemented = 1;
         return 1;
     }
@@ -471,16 +497,32 @@ int jni_host_call(const char *name, uint32_t *args, int nargs, uint32_t *ret_lo,
     return 1;
 }
 
-uint32_t jni_host_new_int_array(int n)
+uint32_t jni_host_new_array(int elem, int n)
 {
-    uint32_t buf = guest_heap_alloc((uint32_t)n * 4u);
-    memset(g_mem + buf, 0, (size_t)n * 4u);
+    uint32_t bytes = (uint32_t)n * (uint32_t)elem;
+    if (!bytes)
+        bytes = 1;             /* a zero-length array still needs a non-NULL
+                                * payload: the guest stores the pointer and may
+                                * add to it before ever reading */
+    uint32_t buf = guest_heap_alloc(bytes);
+    memset(g_mem + buf, 0, bytes);
     uint32_t h = handle_new(H_ARRAY);
     jni_handle *o = handle_of(h);
     o->guest = buf;
     o->len = (uint32_t)n;
-    o->elem = 4;
+    o->elem = (uint32_t)elem;
     return h;
+}
+
+uint32_t jni_host_new_int_array(int n)
+{
+    return jni_host_new_array(4, n);
+}
+
+uint32_t jni_host_array_addr(uint32_t handle)
+{
+    jni_handle *o = handle_of(handle);
+    return o ? o->guest : 0;
 }
 
 void jni_report(int top_n)

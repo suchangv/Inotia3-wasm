@@ -177,6 +177,11 @@ int import_register(const char *name, int is_object)
 
     const known_import *k = lookup_known(im->name);
     im->impl = k ? k->impl : IMPL_NONE;
+    /* The JNI function tables are registered through the same mechanism as the
+     * ELF imports (see jni.c), so they need the same accounting; jni_host_call
+     * is what actually services them. */
+    if (strncmp(im->name, "jni/", 4) == 0)
+        im->impl = IMPL_jni;
     /* Trust the symbol table over the table above: what matters is whether the
      * .so's own symbol is a variable, since that decides stub vs storage. */
     im->is_object = is_object || (k && k->is_object);
