@@ -430,6 +430,14 @@ int gl4es_dispatch(const char *name, const uint32_t *args, int nargs,
         return 1;
     }
     if (strcmp(name, "glTexSubImage2D") == 0) {
+        static int logged;
+        if (logged < 4) {
+            logged++;
+            host_log("  [gl] glTexSubImage2D nargs=%d target=%04x level=%d "
+                     "x=%d y=%d w=%d h=%d format=%04x type=%04x px=%08x\n",
+                     nargs, a0, (int)a1, (int)a2, (int)a3, (int)a4,
+                     (int)a5, a6, a7, a8);
+        }
         gl4es_glTexSubImage2D(a0, (int32_t)a1, (int32_t)a2, (int32_t)a3,
                               (int32_t)a4, (int32_t)a5, a6, a7, G(a8));
         return 1;
