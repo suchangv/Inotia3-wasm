@@ -52,6 +52,22 @@
 #define TEXTVIEW_WIDTH  1024
 #define TEXTVIEW_HEIGHT 1024
 
+#ifdef WASM_FREESTANDING
+/* The wasm build has no filesystem: the driver allocates space in linear
+ * memory, copies libgame.so into it, and hands the address here before calling
+ * main(). Keeping the file-reading in main() behind this branch means the rest
+ * of the runner -- and every option parser -- is identical on both platforms,
+ * so a measurement taken under wasm is measuring the same code. */
+static const uint8_t *g_wasm_so;
+static size_t         g_wasm_so_len;
+
+void spike_set_so(const uint8_t *p, size_t n)
+{
+    g_wasm_so = p;
+    g_wasm_so_len = n;
+}
+#endif
+
 static guest_image g_img;
 
 /* Guest address of the jlong sysTime[1] handed to nativeInit(). The guest reads
@@ -167,6 +183,46 @@ static run_result run_entry_arg(const char *what, uint32_t entry, uint32_t arg0,
     return r;
 }
 
+/* A guest entry point taking (JNIEnv*, jclass) and nothing else -- nativeResume
+ * and nativeResumeClet are the two. */
+static run_result run_entry_env(const char *what, uint32_t entry, uint64_t budget)
+{
+    return run_entry_arg(what, entry, g_jnienv_ptr, budget);
+}
+
+/* nativeRender(JNIEnv *env, jobject clazz, jint timerID), driven once per timer
+ * that came due.
+ *
+ * This is the call the whole spike exists to measure: it fuses the engine's
+ * per-tick game logic and its GLES1 drawing into one function, so instructions
+ * retired here are the guest work per frame, and the GL and host-crossing
+ * counters reset around it give the other two numbers.
+ *
+ * `timer_id` is the opaque handle the guest registered through SetTimer and
+ * must be passed back unchanged -- see timers.h. */
+static run_result run_native_render(uint32_t entry, uint32_t timer_id,
+                                    uint64_t budget)
+{
+    run_result r;
+    r.what = "nativeRender";
+    r.entry = entry;
+    g_cpu.r[13] = GUEST_STACK_TOP - 0x1000;
+    g_cpu.r[14] = RETURN_SENTINEL;
+    for (int i = 0; i < 13; i++)
+        g_cpu.r[i] = 0;
+    g_cpu.r[0] = g_jnienv_ptr;
+    g_cpu.r[1] = 0;
+    g_cpu.r[2] = timer_id;
+    g_cpu.cpsr = 0x10;
+    uint64_t before = g_insn_count;
+    double t0 = host_now();
+    r.reason = cpu_run(entry, g_cpu.r[13], g_insn_count + budget);
+    cpu_trace_final();
+    r.insns = g_insn_count - before;
+    r.seconds = host_now() - t0;
+    return r;
+}
+
 static void report_run(const run_result *r)
 {
     const char *status;
@@ -211,6 +267,10 @@ static void report_run(const run_result *r)
  * hands out zero-filled pages for everything else, which is what the guest
  * space holds there anyway.
  */
+#ifndef WASM_FREESTANDING
+/* The guest memory dump feeds the differential test, which needs a filesystem.
+ * There is none in the wasm build, and the wasm build exists to measure
+ * throughput rather than to be diffed. */
 static const struct { uint32_t addr, size; } k_dump_regions[] = {
     { GUEST_IMAGE_BASE, 0x00E00000u },  /* relocated .so, .data, .bss */
     { GUEST_STUB_BASE,  0x00500000u },  /* import stubs + host data   */
@@ -235,41 +295,9 @@ static void dump_guest(const char *path)
     fclose(f);
     host_log("guest memory dumped to %s (%u regions)\n", path, n);
 }
-
-/* A guest entry point taking (JNIEnv*, jclass) and nothing else -- nativeResume
- * and nativeResumeClet. */
-static run_result run_entry_env(const char *what, uint32_t entry, uint64_t budget)
-{
-    return run_entry_arg(what, entry, g_jnienv_ptr, budget);
-}
-
-/* nativeRender(JNIEnv *env, jobject clazz, jint timerID), driven per frame.
- *
- * This is the call the whole spike exists to measure: it fuses the engine's
- * per-tick game logic and its GLES1 drawing into one function, so instructions
- * retired here are the guest work per frame, and the GL and host-crossing
- * counters reset around it give the other two numbers. */
-static run_result run_native_render(uint32_t entry, int timer_id, uint64_t budget)
-{
-    run_result r;
-    r.what = "nativeRender";
-    r.entry = entry;
-    g_cpu.r[13] = GUEST_STACK_TOP - 0x1000;
-    g_cpu.r[14] = RETURN_SENTINEL;
-    for (int i = 0; i < 13; i++)
-        g_cpu.r[i] = 0;
-    g_cpu.r[0] = g_jnienv_ptr;
-    g_cpu.r[1] = 0;
-    g_cpu.r[2] = (uint32_t)timer_id;
-    g_cpu.cpsr = 0x10;
-    uint64_t before = g_insn_count;
-    double t0 = host_now();
-    r.reason = cpu_run(entry, g_cpu.r[13], g_insn_count + budget);
-    cpu_trace_final();
-    r.insns = g_insn_count - before;
-    r.seconds = host_now() - t0;
-    return r;
-}
+#else
+static void dump_guest(const char *path) { (void)path; }
+#endif
 
 /* ---- entry --------------------------------------------------------------- */
 
@@ -285,6 +313,7 @@ int main(int argc, char **argv)
     int do_init_array = 0, do_jni = 0, do_profile = 1, trace = 0, do_boot = 0;
     (void)0;
 
+#ifndef WASM_FREESTANDING
     for (int i = 1; i < argc; i++) {
         if (strncmp(argv[i], "--budget=", 9) == 0)
             budget = (uint64_t)strtoull(argv[i] + 9, NULL, 10);
@@ -319,10 +348,19 @@ int main(int argc, char **argv)
         else if (argv[i][0] != '-')
             path = argv[i];
     }
+#endif
+#ifdef WASM_FREESTANDING
+    /* No argv: run the measurement the wasm build exists for. */
+    (void)argc; (void)argv; (void)path;
+    do_boot = 1;
+    if (frames < 2)
+        frames = 30;
+#else
     if (!path) {
         host_log("usage: spike <libgame.so> [--all] [--budget=N] [--no-profile]\n");
         return 2;
     }
+#endif
 
     g_mem = (uint8_t *)host_alloc(GUEST_MEM_SIZE);
     host_log("guest address space: %u MB at %p\n", GUEST_MEM_SIZE >> 20, (void *)g_mem);
@@ -333,25 +371,40 @@ int main(int argc, char **argv)
     host_install_crash_handler();
 
     /* ---- read the .so ---- */
+    const uint8_t *buf;
+    size_t len;
+#ifdef WASM_FREESTANDING
+    buf = g_wasm_so;
+    len = g_wasm_so_len;
+    if (!buf || !len) {
+        host_log("no image supplied: call spike_set_so() first\n");
+        return 2;
+    }
+    host_log("loaded libgame.so (%u bytes, supplied by the driver)\n",
+             (unsigned)len);
+#else
     FILE *f = fopen(path, "rb");
     if (!f) {
         host_log("cannot open %s\n", path);
         return 2;
     }
     fseek(f, 0, SEEK_END);
-    long len = ftell(f);
+    long flen = ftell(f);
     fseek(f, 0, SEEK_SET);
-    uint8_t *buf = (uint8_t *)host_alloc((size_t)len);
-    if (fread(buf, 1, (size_t)len, f) != (size_t)len) {
+    uint8_t *fread_buf = (uint8_t *)host_alloc((size_t)flen);
+    if (fread(fread_buf, 1, (size_t)flen, f) != (size_t)flen) {
         host_log("short read on %s\n", path);
         fclose(f);
         return 2;
     }
     fclose(f);
-    host_log("loaded %s (%ld bytes)\n", path, len);
+    buf = fread_buf;
+    len = (size_t)flen;
+    host_log("loaded %s (%ld bytes)\n", path, flen);
+#endif
 
     /* ---- map and relocate it ---- */
-    if (elf_load(buf, (size_t)len, &g_img) != 0)
+    if (elf_load(buf, len, &g_img) != 0)
         return 1;
     /* Deliberate modifications to the guest binary, before anything runs.
      * Without these the engine boots and then idles: see patches.c. */
@@ -681,3 +734,15 @@ int main(int argc, char **argv)
              near ? near : "?", near ? g_cpu.r[15] - at : 0);
     return 0;
 }
+
+#ifdef WASM_FREESTANDING
+/* The driver's entry point.
+ *
+ * clang renames main() to __main_argc_argv when targeting wasm (the real entry
+ * would be _start), and that name is a compiler detail rather than an
+ * interface. This wrapper gives the JS driver a stable name to call. */
+int spike_main(void)
+{
+    return main(0, 0);
+}
+#endif

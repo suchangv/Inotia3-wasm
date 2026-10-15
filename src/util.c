@@ -94,6 +94,25 @@ int strncmp(const char *a, const char *b, size_t n)
     }
     return 0;
 }
+char *strchr(const char *s, int c)
+{
+    for (; *s; s++)
+        if (*s == (char)c)
+            return (char *)s;
+    return (c == 0) ? (char *)s : 0;
+}
+char *strstr(const char *h, const char *n)
+{
+    if (!*n)
+        return (char *)h;
+    for (; *h; h++) {
+        const char *a = h, *b = n;
+        while (*b && *a == *b) { a++; b++; }
+        if (!*b)
+            return (char *)h;
+    }
+    return 0;
+}
 char *strncpy(char *d, const char *s, size_t n)
 {
     size_t i = 0;
