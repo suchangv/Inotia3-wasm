@@ -27,6 +27,8 @@
 #include "platform.h"
 #include "jni.h"
 #include "gl.h"
+#include "patches.h"
+#include "timers.h"
 
 #ifndef WASM_FREESTANDING
 #include <stdio.h>
@@ -51,6 +53,12 @@
 #define TEXTVIEW_HEIGHT 1024
 
 static guest_image g_img;
+
+/* Guest address of the jlong sysTime[1] handed to nativeInit(). The guest reads
+ * its clock from here (CS_knlCurrentTime), and the timer firetimes arriving
+ * from SetTimer are absolute in that same clock -- so the frame loop advances
+ * this array rather than keeping a host-side notion of "now". */
+static uint32_t g_sys_time_addr;
 
 static uint32_t find_symbol(const char *name)
 {
@@ -345,9 +353,18 @@ int main(int argc, char **argv)
     /* ---- map and relocate it ---- */
     if (elf_load(buf, (size_t)len, &g_img) != 0)
         return 1;
+    /* Deliberate modifications to the guest binary, before anything runs.
+     * Without these the engine boots and then idles: see patches.c. */
+    patches_apply(&g_img);
+
     /* Must follow elf_load: it registers the JNI table entries as imports and
      * re-stamps the stub page. */
     jni_guest_init();
+
+    /* After jni_guest_init: this writes the JavaVM's guest address into every
+     * .bss slot that a missing subsystem init would have filled. */
+    patches_fill_vm_caches(&g_img);
+
     gl_state_init();
 
     cpu_init(&g_img);
@@ -455,6 +472,7 @@ int main(int argc, char **argv)
              * every frame. */
             uint32_t sysTime = jni_host_new_array(8, 1);
             uint32_t sys_addr = jni_host_array_addr(sysTime);
+            g_sys_time_addr = sys_addr;
             ST32(sys_addr, (uint32_t)(host_now() * 1000.0));
             ST32(sys_addr + 4, 0);
             uint32_t upTime = jni_host_new_array(4, 1);
@@ -484,6 +502,35 @@ int main(int argc, char **argv)
             ri.seconds = host_now() - it0;
             report_run(&ri);
 
+            /* --- fire the UserAgree callback ---------------------------
+             *
+             * nativeInit() bootstraps the game but does not start it. The
+             * state machine is entered by STATE_Set(0) (the Init state), whose
+             * ONLY call site anywhere in the .so is inside UserAgreeCallback(0)
+             * -- and on Android that is reached by the Java-side Com2uS
+             * "ActiveUser"/UserAgree module calling back into
+             * Java_com_com2us_module_activeuser_ActiveUser_jniUserAgreeNotifier.
+             * There is no Java module here, so it is invoked directly.
+             *
+             * Without it the main timer fires steadily and nothing happens:
+             * MainProcess's per-tick check reads STATE_fpProcess, finds it NULL,
+             * and returns -- which is exactly the "boots perfectly, does
+             * nothing" state this port was in. The parent repository documents
+             * the same conclusion (source/patch.c, Corrida 33).
+             *
+             * Deliberately after nativeInit has fully returned, not inside it:
+             * startClet keeps initializing subsystems for several more lines
+             * after registering this callback, and firing inside would run the
+             * first Enter callback before that finishes -- an ordering Android
+             * never produces. */
+            uint32_t uac = find_symbol("UserAgreeCallback");
+            if (uac) {
+                run_result ru = run_entry_arg("UserAgreeCallback(0)", uac, 0, budget);
+                report_run(&ru);
+            } else {
+                host_log("UserAgreeCallback symbol not found\n");
+            }
+
             /* The Vita port's order after nativeInit: two resume calls, then
              * the render loop. Both resumes take (JNIEnv*, jclass). */
             uint32_t resume = find_symbol(
@@ -505,19 +552,43 @@ int main(int argc, char **argv)
             if (!render) {
                 host_log("nativeRender symbol not found\n");
             } else {
-                host_log("\n=== %d frame(s) of nativeRender ===\n", frames);
+                host_log("\n=== %d frame(s), timer-driven ===\n", frames);
+                if (!timers_active())
+                    host_log("  no timer registered -- the engine schedules its own\n"
+                             "  work, so there is nothing to run yet\n");
+
                 uint64_t total = 0;
                 int ok = 0;
+                int64_t clock = (int64_t)LD32(g_sys_time_addr) |
+                                ((int64_t)LD32(g_sys_time_addr + 4) << 32);
                 for (int f = 0; f < frames; f++) {
-                    /* Reset the per-frame counters so each frame's numbers are
-                     * its own rather than a running total. */
+                    /* Advance the guest's clock by one 16 ms tick and write it
+                     * back, so firetimes are compared against the same clock
+                     * the guest will read. */
+                    clock += 16;
+                    ST32(g_sys_time_addr, (uint32_t)clock);
+                    ST32(g_sys_time_addr + 4, (uint32_t)(clock >> 32));
+
+                    uint32_t due[TIMER_MAX];
+                    int ndue = timers_due(clock, due, TIMER_MAX);
+
                     uint64_t d0 = g_gl_draw_calls;
                     uint64_t x0 = 0;
                     for (int i = 0; i < g_nimports; i++)
                         x0 += g_imports[i].calls;
 
-                    run_result rf = run_native_render(render, timer_id, budget);
-                    cpu_trace_final();
+                    uint64_t frame_insns = 0;
+                    double frame_secs = 0.0;
+                    int reason = HALT_BUDGET;
+                    for (int d = 0; d < ndue; d++) {
+                        run_result rf = run_native_render(render, due[d], budget);
+                        cpu_trace_final();
+                        frame_insns += rf.insns;
+                        frame_secs += rf.seconds;
+                        reason = rf.reason;
+                        if (rf.reason == HALT_BUDGET)
+                            break;
+                    }
 
                     uint64_t d1 = g_gl_draw_calls;
                     uint64_t x1 = 0;
@@ -525,16 +596,17 @@ int main(int argc, char **argv)
                         x1 += g_imports[i].calls;
 
                     host_log("  frame %3d : %9llu instrs  %7.2f ms  %6.2f MIPS"
-                             "  draw=%llu host_calls=%llu  -> %s\n",
-                             f, (unsigned long long)rf.insns,
-                             rf.seconds * 1000.0,
-                             rf.seconds > 0 ? (double)rf.insns / rf.seconds / 1e6 : 0.0,
+                             "  timers=%d draw=%llu host_calls=%llu  -> %s\n",
+                             f, (unsigned long long)frame_insns,
+                             frame_secs * 1000.0,
+                             frame_secs > 0 ? (double)frame_insns / frame_secs / 1e6 : 0.0,
+                             ndue,
                              (unsigned long long)(d1 - d0),
                              (unsigned long long)(x1 - x0),
-                             rf.reason == HALT_BUDGET ? "budget exhausted"
-                                                      : cpu_halt_str(rf.reason));
-                    total += rf.insns;
-                    if (rf.reason != HALT_BUDGET)
+                             reason == HALT_BUDGET ? "budget exhausted"
+                                                   : cpu_halt_str(reason));
+                    total += frame_insns;
+                    if (reason != HALT_BUDGET)
                         ok++;
                     else
                         break;
@@ -598,6 +670,7 @@ int main(int argc, char **argv)
     /* ---- report ---- */
     if (do_profile)
         report_profile(20);
+    timers_report();
     imports_report(20);
     jni_report(15);
     gl_report(12);

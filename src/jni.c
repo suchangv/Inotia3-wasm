@@ -29,6 +29,7 @@
 #include "cpu.h"
 #include "imports.h"
 #include "compat.h"
+#include "timers.h"
 
 /* ---- guest layout -------------------------------------------------------- */
 
@@ -510,6 +511,33 @@ int jni_host_call(const char *name, uint32_t *args, int nargs, uint32_t *ret_lo,
     if ((strncmp(fn, "Call", 4) == 0 || strncmp(fn, "Get", 3) == 0) &&
         (strstr(fn, "Method") || strstr(fn, "Field"))) {
         note_method(a2);
+
+        /* The timer table is the one Java-side facility the engine cannot run
+         * without: it is how the game loop schedules itself (see timers.h).
+         * The registration arrives as an ordinary Java call, so it is
+         * intercepted here rather than implemented as a JNI entry point.
+         *
+         * CallStaticVoidMethod(env, clazz, methodID, id, firetime, interval):
+         * the varargs start at args[3], and each jlong occupies two words. */
+        {
+            jni_handle *m = handle_of(a2);
+            if (m && m->kind == H_METHOD && nargs >= 8) {
+                if (strcmp(m->name, "SetTimer") == 0) {
+                    timers_set(args[3],
+                               (int64_t)(((uint64_t)args[5] << 32) | args[4]),
+                               (int64_t)(((uint64_t)args[7] << 32) | args[6]));
+                    st->implemented = 1;
+                    *ret_lo = 0;
+                    return 1;
+                }
+                if (strcmp(m->name, "UnsetTimer") == 0) {
+                    timers_unset(args[3]);
+                    st->implemented = 1;
+                    *ret_lo = 0;
+                    return 1;
+                }
+            }
+        }
         /* The Java side is not there, so every call answers with a zero of the
          * right width. That is enough for the engine to keep running, and the
          * report says what would have to exist for it to be correct. */

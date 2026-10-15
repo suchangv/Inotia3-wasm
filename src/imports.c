@@ -182,6 +182,8 @@ int import_register(const char *name, int is_object)
      * is what actually services them. */
     if (strncmp(im->name, "jni/", 4) == 0)
         im->impl = IMPL_jni;
+    else if (im->name[0] == 'g' && im->name[1] == 'l')
+        im->impl = IMPL_gl;
     /* Trust the symbol table over the table above: what matters is whether the
      * .so's own symbol is a variable, since that decides stub vs storage. */
     im->is_object = is_object || (k && k->is_object);

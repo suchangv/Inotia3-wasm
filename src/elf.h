@@ -117,6 +117,12 @@ const char *elf_sym_name(const guest_image *img, const elf_sym *s);
  * returns a pointer into the image's string table (stable for the process). */
 const char *elf_func_name(const guest_image *img, uint32_t guest_addr);
 
+/* Look a defined symbol up by name. Returns its guest address with the Thumb
+ * bit preserved (st_value's bit 0), or 0 if not found. The Thumb bit matters:
+ * it is what tells cpu_run which instruction set to decode, and what a patch
+ * uses to choose between the Thumb and ARM encodings. */
+uint32_t elf_find_symbol(const guest_image *img, const char *name);
+
 /* Nearest symbol at or below `guest_addr`, even if it is a data symbol. */
 const char *elf_nearest_sym(const guest_image *img, uint32_t guest_addr,
                             uint32_t *out_addr);

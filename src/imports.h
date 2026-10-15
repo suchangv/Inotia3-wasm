@@ -64,6 +64,13 @@ enum {
      * "the guest called something nobody provides". Without it every JNI call
      * was listed under "unimplemented imports were actually called". */
     IMPL_jni,
+    /* GL entries are dispatched by name through gl_host_call() before this
+     * switch is reached (gl.c), for the same reason as the JNI ones: there are
+     * ~130 of them and a name table reads better than a 130-case switch. They
+     * need an id all the same, or the report lists every GL call under
+     * "unimplemented imports were actually called" -- which it did, making a
+     * working GL layer look like a missing one. */
+    IMPL_gl,
     IMPL_IMPL_COUNT
 };
 

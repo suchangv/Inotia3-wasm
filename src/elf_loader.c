@@ -28,6 +28,20 @@ const char *elf_sym_name(const guest_image *img, const elf_sym *s)
     return img->strtab + s->name_off;
 }
 
+uint32_t elf_find_symbol(const guest_image *img, const char *name)
+{
+    for (int i = 0; i < img->nsyms; i++) {
+        if (img->syms[i].shndx == 0 || !img->syms[i].value)
+            continue;
+        const char *n = elf_sym_name(img, &img->syms[i]);
+        if (n && strcmp(n, name) == 0) {
+            uint32_t v = img->syms[i].value;
+            return (v & ~1u) + img->base + (v & 1u);
+        }
+    }
+    return 0;
+}
+
 /* ---- address -> symbol, O(log n) ---------------------------------------- */
 
 /* Index of the last entry whose start is <= `addr`, or -1. */
