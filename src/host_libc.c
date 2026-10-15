@@ -16,6 +16,7 @@
 #include "cpu.h"
 #include "compat.h"
 #include "platform.h"
+#include "jni.h"
 
 /* ========================================================================== */
 /* Guest heap: first-fit free list with forward coalescing.                    */
@@ -41,7 +42,11 @@ static void heap_init(void)
     heap_break = heap_start;
     blk_hdr *h = (blk_hdr *)(g_mem + heap_start);
     uint32_t sz = GUEST_HEAP_SIZE - (heap_start - GUEST_HEAP_BASE) - HDR_SZ;
-    h->size = sz;
+    /* The free flag is part of the size word, not separate state, and the
+     * allocator's first act is to look for a block that has it. Forgetting it
+     * here makes the whole heap invisible and every allocation fail with
+     * "out of memory" on an empty 64 MB arena. */
+    h->size = sz | BLK_FREE;
     h->prev_size = 0;
     heap_break = heap_start + HDR_SZ + sz;
 }
@@ -109,6 +114,8 @@ static void heap_free(uint32_t ptr)
         }
     }
 }
+
+uint32_t guest_heap_alloc(uint32_t n) { return heap_alloc(n); }
 
 static uint32_t heap_usable(uint32_t ptr)
 {
@@ -361,9 +368,21 @@ void host_import_call(guest_import *im)
         args[i] = R[i];
     for (int i = 0; i < nextra; i++)
         args[4 + i] = extra[i];
+    int nargs = 4 + nextra;
 
     R[0] = 0;
     R[1] = 0;
+
+    /* JNI table entries arrive through the same mechanism as everything else:
+     * the guest branched to a BKPT stub and the interpreter derived its index
+     * from the stub address. Nothing here needs to know that. */
+    if (strncmp(im->name, "jni/", 4) == 0) {
+        uint32_t lo = 0, hi = 0;
+        jni_host_call(im->name, args, nargs, &lo, &hi);
+        R[0] = lo;
+        R[1] = hi;
+        return;
+    }
 
     switch (im->impl) {
 

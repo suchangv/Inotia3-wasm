@@ -25,6 +25,7 @@
 #include "imports.h"
 #include "compat.h"
 #include "platform.h"
+#include "jni.h"
 
 #ifndef WASM_FREESTANDING
 #include <stdio.h>
@@ -32,10 +33,13 @@
 #include <string.h>
 #endif
 
-/* Returning from an entry function lands the PC here: 1 is a Thumb address of
- * 0, which is below the loaded image, so the interpreter reports HALT_BAD_PC.
- * That is the "the function returned normally" signal. */
-#define RETURN_SENTINEL 1u
+/* Returning from an entry function lands the PC here. It must not be 0: a
+ * guest that reads a null function pointer and branches to it also arrives at
+ * PC 0, and with LR=1 the two are indistinguishable -- a real failure gets
+ * reported as a clean return. This value is outside the image (so HALT_BAD_PC
+ * fires) and recognisable on sight. The Thumb bit is set, as a `bx lr` return
+ * requires. */
+#define RETURN_SENTINEL 0x0BADF00Du
 
 static guest_image g_img;
 
@@ -111,7 +115,10 @@ typedef struct {
     double      seconds;
 } run_result;
 
-static run_result run_entry(const char *what, uint32_t entry, uint64_t budget)
+/* `arg0` is placed in r0 before the entry runs -- JNI_OnLoad expects the
+ * JavaVM* there, and the native* entry points expect a JNIEnv*. */
+static run_result run_entry_arg(const char *what, uint32_t entry, uint32_t arg0,
+                                uint64_t budget)
 {
     run_result r;
     r.what = what;
@@ -131,6 +138,7 @@ static run_result run_entry(const char *what, uint32_t entry, uint64_t budget)
     g_cpu.r[14] = RETURN_SENTINEL;
     for (int i = 0; i < 13; i++)
         g_cpu.r[i] = 0;
+    g_cpu.r[0] = arg0;
     g_cpu.cpsr = 0x10;   /* user mode, Thumb via the entry's bit0 */
 
     uint64_t before = g_insn_count;
@@ -145,7 +153,7 @@ static run_result run_entry(const char *what, uint32_t entry, uint64_t budget)
 static void report_run(const run_result *r)
 {
     const char *status;
-    if (r->reason == HALT_BAD_PC && g_cpu.r[15] == 0)
+    if (r->reason == HALT_BAD_PC && g_cpu.r[15] == (RETURN_SENTINEL & ~1u))
         status = "returned to caller";
     else
         status = cpu_halt_str(r->reason);
@@ -154,7 +162,8 @@ static void report_run(const run_result *r)
              r->what, r->entry, (unsigned long long)r->insns,
              r->seconds > 0 ? (double)r->insns / r->seconds / 1e6 : 0.0, status);
 
-    if (r->reason != HALT_BUDGET && !(r->reason == HALT_BAD_PC && g_cpu.r[15] == 0)) {
+    if (r->reason != HALT_BUDGET &&
+        !(r->reason == HALT_BAD_PC && g_cpu.r[15] == (RETURN_SENTINEL & ~1u))) {
         const char *nm = elf_func_name(&g_img, g_fault_pc);
         host_log("    fault at pc=%08x%s%s%s  insn=%08x (width %d)\n",
                  g_fault_pc, nm ? " in " : "", nm ? nm : "",
@@ -219,7 +228,8 @@ int main(int argc, char **argv)
     const char *trace_path = NULL;
     uint32_t only_entry = 0;
     uint64_t budget = 200u * 1000u * 1000u;
-    int do_init_array = 0, do_jni = 0, do_profile = 1, trace = 0;
+    int do_init_array = 0, do_jni = 0, do_profile = 1, trace = 0, do_boot = 0;
+    (void)0;
 
     for (int i = 1; i < argc; i++) {
         if (strncmp(argv[i], "--budget=", 9) == 0)
@@ -230,10 +240,14 @@ int main(int argc, char **argv)
             do_jni = 1;
         else if (strcmp(argv[i], "--all") == 0)
             do_init_array = do_jni = 1;
+        else if (strcmp(argv[i], "--boot") == 0)
+            do_boot = 1;
         else if (strcmp(argv[i], "--no-profile") == 0)
             do_profile = 0;
         else if (strcmp(argv[i], "--trace") == 0)
             trace = 1;
+        else if (strcmp(argv[i], "--jni-verbose") == 0)
+            g_jni_verbose = 1;
         else if (strcmp(argv[i], "--oracle") == 0)
             g_oracle_mode = 1;
         else if (strncmp(argv[i], "--dump-guest=", 13) == 0)
@@ -279,6 +293,10 @@ int main(int argc, char **argv)
     /* ---- map and relocate it ---- */
     if (elf_load(buf, (size_t)len, &g_img) != 0)
         return 1;
+    /* Must follow elf_load: it registers the JNI table entries as imports and
+     * re-stamps the stub page. */
+    jni_guest_init();
+
     cpu_init(&g_img);
     cpu_set_profile(do_profile);
     cpu_enable_trace(trace);
@@ -292,11 +310,70 @@ int main(int argc, char **argv)
 
     /* ---- run it ---- */
     host_log("\n");
-    if (only_entry) {
+    if (do_boot) {
+        /* src/utils/init.c in the Vita port, in order: static constructors,
+         * then JNI_OnLoad, then nativePreInit. Getting these three to run in
+         * sequence is what puts the guest on the path to its first frame. */
+        host_log("=== boot sequence ===\n");
+        for (uint32_t i = 0; i < g_img.init_array_n; i++) {
+            uint32_t fn = LD32(g_img.init_array + i * 4) | 1u;
+            char label[32];
+            label[0]='c'; label[1]='t'; label[2]='o'; label[3]='r';
+            label[4]='['; label[5]=(char)('0'+(i%10)); label[6]=']'; label[7]=0;
+            run_result rr = run_entry_arg(label, fn, 0, budget);
+            report_run(&rr);
+            if (rr.reason == HALT_TRAP)
+                break;
+        }
+
+        uint32_t jni_entry = find_symbol("JNI_OnLoad");
+        run_result rj = run_entry_arg("JNI_OnLoad", jni_entry, g_javavm_ptr, budget);
+        report_run(&rj);
+        host_log("    JNI_OnLoad returned %d (JNI_VERSION_1_6 is %d)\n",
+                 (int)g_cpu.r[0], JNI_VERSION_1_6);
+
+        uint32_t pre = find_symbol(
+            "Java_com_com2us_wrapper_WrapperRenderer_nativePreInit");
+        if (!pre) {
+            host_log("nativePreInit symbol not found\n");
+        } else {
+            /* nativePreInit(JNIEnv *env, jclass clazz, jintArray parameter,
+             *               jint screenW, jint screenH) -- five arguments, so
+             *               the last one is on the guest stack, which
+             *               run_entry_arg cannot express. Set the register file
+             *               directly and push the fifth word. */
+            uint32_t array = jni_host_new_int_array(3);
+            g_cpu.r[13] = GUEST_STACK_TOP - 0x1000;
+            ST32(g_cpu.r[13], 544);          /* screenH, the fifth argument */
+            g_cpu.r[14] = 1;
+            for (int i = 0; i < 13; i++) g_cpu.r[i] = 0;
+            g_cpu.r[0] = g_jnienv_ptr;
+            g_cpu.r[1] = 0;                  /* clazz: the guest ignores it */
+            g_cpu.r[2] = array;
+            g_cpu.r[3] = 960;
+            g_cpu.cpsr = 0x10;
+            uint64_t before = g_insn_count;
+            double t0 = host_now();
+            run_result rp;
+            rp.what = "nativePreInit";
+            rp.entry = pre;
+            rp.reason = cpu_run(pre, g_cpu.r[13], g_insn_count + budget);
+            cpu_trace_final();
+            rp.insns = g_insn_count - before;
+            rp.seconds = host_now() - t0;
+            report_run(&rp);
+            /* getEnv() and JNI_OnLoad() share this globals block: JNI_OnLoad
+             * stores the JavaVM* at +0 and getEnv() reads it back before
+             * calling vm->GetEnv, which writes the JNIEnv* at +4. Printing it
+             * says directly whether the two agree. */
+            host_log("    module globals at 0115a36c: vm=%08x env=%08x\n",
+                     LD32(0x0115a36c), LD32(0x0115a370));
+        }
+    } else if (only_entry) {
         /* One entry point only, so a differential run covers a single guest
          * function from entry to return rather than concatenating five of them
          * into one trace file. */
-        run_result rr = run_entry("entry", only_entry, budget);
+        run_result rr = run_entry_arg("entry", only_entry, 0, budget);
         report_run(&rr);
     } else if (do_init_array) {
         if (!g_img.init_array) {
@@ -314,7 +391,7 @@ int main(int argc, char **argv)
                 label[0] = 'c'; label[1] = 't'; label[2] = 'o'; label[3] = 'r';
                 label[4] = '['; label[5] = (char)('0' + (i % 10)); label[6] = ']';
                 label[7] = 0;
-                run_result rr = run_entry(label, fn, budget);
+                run_result rr = run_entry_arg(label, fn, 0, budget);
                 report_run(&rr);
                 if (rr.reason == HALT_TRAP)
                     break;
@@ -329,7 +406,7 @@ int main(int argc, char **argv)
          * null VM is still informative: it shows how far the module gets
          * before it first needs the JNI layer. */
         uint32_t jni = find_symbol("JNI_OnLoad");
-        run_result rr = run_entry("JNI_OnLoad", jni, budget);
+        run_result rr = run_entry_arg("JNI_OnLoad", jni, g_javavm_ptr, budget);
         report_run(&rr);
     }
 
@@ -343,6 +420,7 @@ int main(int argc, char **argv)
     if (do_profile)
         report_profile(20);
     imports_report(20);
+    jni_report(15);
 
     uint32_t at = 0;
     const char *near = elf_nearest_sym(&g_img, g_cpu.r[15], &at);

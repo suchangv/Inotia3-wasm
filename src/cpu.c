@@ -290,7 +290,8 @@ int cpu_run(uint32_t entry, uint32_t sp, uint64_t budget)
          * before this was noticed. */
         {
             int in_text = (pc >= g_img->text_lo && pc < g_img->text_hi);
-            int in_stub = (pc >= GUEST_STUB_BASE && pc < GUEST_STUB_BASE + 0x1000u);
+            int in_stub = (pc >= GUEST_STUB_BASE &&
+                           pc < GUEST_STUB_BASE + IMPORT_MAX * 4u);
             if (!in_text && !in_stub)
                 return HALT_BAD_PC;
         }

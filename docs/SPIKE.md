@@ -30,6 +30,9 @@ diffed against this one instruction by instruction.
 | VFPv2 | not started |
 | JNI / GLES1 / audio / assets | not started |
 | Differential oracle | **working** — `tools/difftest.sh`, all entries identical |
+| JNI environment | **in progress** — tables built, `GetEnv`/`GetIntArrayElements` correct |
+| `JNI_OnLoad` | **in progress** — runs, returns -1; see below |
+| `nativePreInit` | **runs** — 12 instructions, then reads a null pointer |
 | Browser host | not started |
 
 `ctor[3]` now reaches the import stubs and the host crossings count is
@@ -193,6 +196,56 @@ Two structural notes worth carrying forward:
    "PC left the loaded image" and the crossing count stayed at zero. Visible
    only once the stubs were reachable at all, which the bit-25 fix made
    possible. The executable range is `.text` *plus* the stub page.
+
+## The JNI environment
+
+`src/jni.c` materialises the JavaVM and JNIEnv **inside the guest address
+space**, with every slot of both function tables holding a BKPT stub. That is
+why `lib/falso_jni` cannot be vendored as-is: on the Vita the guest is native
+ARM sharing the loader's address space, so FalsoJNI's host-global `JavaVM jvm`
+/ `JNIEnv jni` are valid pointers to hand over. Here they are not. The
+*mechanism* had to change; reaching a JNI function is now the same operation as
+reaching `malloc`, and JNI calls land in the same crossing histogram.
+
+`src/jni_offsets.h` is generated from `lib/falso_jni/jni.h`. Two things about
+it are load-bearing and were both got wrong first:
+
+* **The order is the ABI.** The guest indexes the table by fixed offset, so an
+  entry one slot out of place calls its neighbour and the only symptom is a
+  wrong value much later.
+* **The two tables have different reserved-slot counts.** `JNINativeInterface`
+  has 4, `JNIInvokeInterface` has **3**. Assuming 4 for both shifted the whole
+  JavaVM table by one slot, and `GetEnv` -- recognisable by its
+  `JNI_VERSION_1_6` argument -- arrived as `DetachCurrentThread`. The generator
+  now detects the counts instead of taking them as given.
+
+### Where the boot sequence currently stops
+
+```
+ctor[0..3]     227, 24, 46, 79 instructions   returned normally
+JNI_OnLoad     22 instructions                returns -1
+nativePreInit  12 instructions                reads a null pointer
+```
+
+The module's own globals are correct after the run --
+`0115a36c: vm=08d00400 env=08d00000`, i.e. `JNI_OnLoad` stored the JavaVM and
+our `GetEnv` wrote the JNIEnv where `getEnv()` reads it. So the environment is
+being reached. What is unresolved is `JNI_OnLoad`'s early-exit test: it calls
+`getEnv()` (0x0d8780, 13 instructions, of which 9 ran), and branches to its
+`return -1` tail as though `getEnv()` had returned 0 -- while the global that
+`getEnv()` returns holds the right pointer. Either the disassembly reading above
+is wrong somewhere or `getEnv()` returns before writing it. That is the next
+thing to settle, and it is small.
+
+Two harness weaknesses this exposed, both now fixed:
+
+* **The return sentinel was 0**, which is also where a guest lands after
+  branching through a null function pointer. A real failure was being reported
+  as a clean return. It is now `0x0BADF00C`.
+* **JNI arguments were all read as strings.** A `jclass` or `jmethodID` is a
+  handle at `0x40000000`, so reading one as a NUL-terminated string
+  dereferences a gigabyte outside the guest space. Strings are now read only by
+  the functions that take one, and the read is bounds-checked.
 
 ## Next steps
 

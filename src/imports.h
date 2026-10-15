@@ -22,7 +22,8 @@
 
 #include "guest.h"
 
-#define IMPORT_MAX 512
+/* 182 ELF imports plus 234 JNI table entries, with headroom. */
+#define IMPORT_MAX 1024
 
 /* Implementation ids. import_register() maps an imported *name* to one of
  * these; -1 means "known to the .so but not provided by this host yet", which

@@ -46,6 +46,12 @@
 #define GUEST_STUB_SIZE    0x00400000u  /* 4 MB: room for 1M function stubs  */
 #define GUEST_HOSTDATA_BASE 0x08C00000u /* imported *variables* live here,   */
 #define GUEST_HOSTDATA_SIZE 0x00100000u /* not in the stub page -- see below */
+#define GUEST_JNI_BASE     0x08D00000u  /* JavaVM / JNIEnv structs and their
+                                         * function tables. They have to live
+                                         * in guest memory because the guest
+                                         * indexes them by offset; every slot
+                                         * holds a stub address. See jni.c.  */
+#define GUEST_JNI_SIZE     0x00001000u
 #define GUEST_MEM_SIZE     0x09000000u  /* 144 MB total                      */
 
 /* Guest heap/mmap actually start after their region bases so a zero-ish
@@ -89,6 +95,10 @@ void host_log(const char *fmt, ...);
 void *host_alloc(size_t n);          /* zeroed, in host memory (not guest) */
 double host_now(void);               /* monotonic seconds                  */
 void host_fatal(const char *fmt, ...);
+
+/* Allocate from the guest heap -- the same allocator the guest's own malloc()
+ * draws on, so JNI-allocated strings and arrays are ordinary guest memory. */
+uint32_t guest_heap_alloc(uint32_t n);
 
 /* ---- per-instruction trace, for differential testing ---------------------
  *
