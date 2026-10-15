@@ -726,7 +726,7 @@ int main(int argc, char **argv)
     timers_report();
     imports_report(20);
     jni_report(15);
-    gl_report(12);
+    gl_report(70);
 
     uint32_t at = 0;
     const char *near = elf_nearest_sym(&g_img, g_cpu.r[15], &at);

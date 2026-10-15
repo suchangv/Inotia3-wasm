@@ -234,6 +234,25 @@ void gl_host_call(const char *name, const uint32_t *args, int nargs,
             g_gl.cur_texture_2d = a1;
         return;
     }
+    /* Log the dimensions of the first few uploads. Whether the engine
+     * rasterises in software and presents one full-screen texture, or draws
+     * geometry through the fixed pipeline, changes the size of the renderer by
+     * a lot -- and the call sequence alone does not distinguish them. */
+    {
+        static int logged;
+        if ((strcmp(name, "glTexImage2D") == 0 ||
+             strcmp(name, "glTexSubImage2D") == 0) && logged < 8) {
+            logged++;
+            /* glTexImage2D(target, level, internalFormat, w, h, border, fmt,
+             *              type, pixels) / glTexSubImage2D(target, level,
+             *              xoff, yoff, w, h, fmt, type, pixels) */
+            int is_sub = strcmp(name, "glTexSubImage2D") == 0;
+            host_log("  [gl] %-18s w=%u h=%u %s fmt=%x pixels=%08x\n", name,
+                     is_sub ? args[4] : args[3], is_sub ? args[5] : args[4],
+                     is_sub ? "sub" : "full", is_sub ? args[6] : args[5],
+                     is_sub ? args[8] : args[8]);
+        }
+    }
     if (strcmp(name, "glTexImage2D") == 0 ||
         strcmp(name, "glTexSubImage2D") == 0 ||
         strcmp(name, "glCompressedTexImage2D") == 0 ||
