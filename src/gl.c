@@ -200,9 +200,17 @@ static int query_constant(uint32_t pname, uint32_t *out, int *count)
     }
 }
 
+int (*g_gl_backend)(const char *name, const uint32_t *args, int nargs,
+                    uint32_t *ret);
+
 void gl_host_call(const char *name, const uint32_t *args, int nargs,
                   uint32_t *ret_lo)
 {
+    /* A real renderer, if one is linked in, answers first. Everything below is
+     * the fallback that lets the engine believe it has a GL context. */
+    if (g_gl_backend && g_gl_backend(name, args, nargs, ret_lo))
+        return;
+
     if (!g_gl.inited)
         gl_state_init();
 

@@ -36,6 +36,7 @@ find_wasm_ld() {
 }
 
 COMMON="src/util.c src/elf_loader.c src/cpu.c src/imports.c src/host_libc.c src/jni.c src/gl.c src/patches.c src/timers.c"
+COMMON_BROWSER="$COMMON"
 
 build_native() {
     echo "== native =="
@@ -78,9 +79,54 @@ build_wasm() {
     echo "   -> build/spike.wasm"
 }
 
+# The browser build: emscripten plus gl4es, which is the real port. See
+# docs/REUSE.md. Needs vendor/gl4es/lib/libGL.a from tools/build_gl4es.sh.
+#
+#   tools/build.sh browser          -> build/spike.html (+ .js, .wasm, .data)
+#   ... then serve it and open the page.
+build_browser() {
+    echo "== browser (emscripten) =="
+    EMSDK=${EMSDK:-$HOME/emsdk}
+    EMCC=$EMSDK/upstream/emscripten/emcc
+    [ -x "$EMCC" ] || { echo "   no emscripten at $EMSDK"; exit 1; }
+    GL4ES=vendor/gl4es/lib
+    [ -f "$GL4ES/libGL.a" ] || {
+        echo "   no gl4es build. Run tools/build_gl4es.sh first."
+        exit 1
+    }
+    mkdir -p build
+    # gl4es must be named by path, not with -lGL: emscripten ships its own
+    # libGL (the GLES2 -> WebGL mapping) in its sysroot and -lGL finds that.
+    #
+    # --preload-file puts the game image and assets into the emscripten
+    # filesystem, so the loader's fopen sees them as ordinary files.
+    #
+    # FULL_ES2 supplies client-side vertex arrays, which the engine uses and
+    # which the WebGL-compatible GLES2 subset excludes by default.
+    # --preload-file keeps the source path, so the image would land at
+    # game/libgame.so; the "@" form places it where the loader looks.
+    PRELOAD="--preload-file game/libgame.so@libgame.so"
+    for d in ${ASSET_DIRS:-}; do
+        if [ -d "$d" ]; then PRELOAD="$PRELOAD --preload-file $d"; fi
+    done
+
+    $EMCC -O2 -I src \
+        $COMMON_BROWSER src/gl4es_bridge.c src/platform_emscripten.c src/main.c \
+        "$GL4ES/libGL.a" \
+        -sFULL_ES2=1 -sALLOW_MEMORY_GROWTH=1 \
+        -sMIN_WEBGL_VERSION=2 -sMAX_WEBGL_VERSION=2 \
+        -sEXIT_RUNTIME=0 \
+        -sEXPORTED_RUNTIME_METHODS=ccall,cwrap \
+        $PRELOAD \
+        -o build/spike.html
+    echo "   -> build/spike.html (serve this directory and open the page)"
+}
+
 case "${1:-both}" in
-    native) build_native ;;
-    wasm)   build_wasm ;;
-    both)   build_native; build_wasm ;;
-    *) echo "usage: $0 [native|wasm|both]"; exit 2 ;;
+    native)  build_native ;;
+    wasm)    build_wasm ;;
+    browser) build_browser ;;
+    both)    build_native; build_wasm ;;
+    all)     build_native; build_wasm; build_browser ;;
+    *) echo "usage: $0 [native|wasm|browser|both|all]"; exit 2 ;;
 esac

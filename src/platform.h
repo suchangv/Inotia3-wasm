@@ -19,6 +19,10 @@ uint32_t host_guest_mmap(uint32_t size);
  * the host has no such notion (the browser). */
 void host_install_crash_handler(void);
 
+/* Browser build only: create the WebGL context on the generated canvas.
+ * Returns 0 if the context could not be created. */
+int host_browser_gl_setup(void);
+
 /* Per-instruction trace sink, written from inside the interpreter loop.
  * Format is a contract with tools/oracle.py. */
 void host_trace_open(const char *path);

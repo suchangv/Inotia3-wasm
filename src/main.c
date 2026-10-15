@@ -44,6 +44,17 @@
  * requires. */
 #define RETURN_SENTINEL 0x0BADF00Du
 
+/* The surface the guest is told it has. WrapperJinterface.GetRealScreenWidth/
+ * Height feed these into nativePreInit(), and the engine lays its HUD and menus
+ * out against them -- so the same pair has to reach gl4es, or every glOrthox it
+ * sets is relative to a different size than the one it thinks it has.
+ *
+ * 960x544 is the Vita panel. It is also close to the 384x256 surface the engine
+ * renders internally (see the texture-upload sizes), so the scale factor stays
+ * simple. */
+#define SCREEN_W 960
+#define SCREEN_H 544
+
 /* WrapperJinterface.setTextViewHeight(1024, 1024, false) is called during the
  * Java onSurfaceCreated() right before nativeInit(), and the .so's pointer
  * arithmetic against the pixel buffer depends on this exact size (see the Vita
@@ -313,7 +324,11 @@ int main(int argc, char **argv)
     int do_init_array = 0, do_jni = 0, do_profile = 1, trace = 0, do_boot = 0;
     (void)0;
 
-#ifndef WASM_FREESTANDING
+#if defined(WASM_FREESTANDING) || defined(__EMSCRIPTEN__)
+    /* No command line in either wasm build. The browser one still reads its
+     * image with fopen -- emscripten gives it a real filesystem, and the .so is
+     * preloaded into it -- so only the option parsing is skipped. */
+#else
     for (int i = 1; i < argc; i++) {
         if (strncmp(argv[i], "--budget=", 9) == 0)
             budget = (uint64_t)strtoull(argv[i] + 9, NULL, 10);
@@ -349,13 +364,18 @@ int main(int argc, char **argv)
             path = argv[i];
     }
 #endif
-#ifdef WASM_FREESTANDING
-    /* No argv: run the measurement the wasm build exists for. */
-    (void)argc; (void)argv; (void)path;
+#if defined(WASM_FREESTANDING) || defined(__EMSCRIPTEN__)
+    (void)argc; (void)argv;
     do_boot = 1;
     if (frames < 2)
         frames = 30;
-#else
+#ifdef __EMSCRIPTEN__
+    /* The browser build reads the image from its own filesystem. */
+    if (!path)
+        path = "libgame.so";
+#endif
+#endif
+#if !defined(WASM_FREESTANDING)
     if (!path) {
         host_log("usage: spike <libgame.so> [--all] [--budget=N] [--no-profile]\n");
         return 2;
@@ -419,6 +439,14 @@ int main(int argc, char **argv)
     patches_fill_vm_caches(&g_img);
 
     gl_state_init();
+
+#ifdef __EMSCRIPTEN__
+    /* The browser build has a real renderer. The context has to exist before
+     * gl4es initialises -- with NOEGL nothing else can tell it the surface
+     * size -- and gl4es has to be up before any guest GL call arrives. */
+    host_browser_gl_setup();
+    gl4es_bridge_init(SCREEN_W, SCREEN_H);
+#endif
 
     cpu_init(&g_img);
     cpu_set_profile(do_profile);

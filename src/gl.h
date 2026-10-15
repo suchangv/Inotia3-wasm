@@ -46,6 +46,23 @@ void gl_note_call(const char *name);
  * the guest leans on. */
 void gl_report(int top_n);
 
+/* An optional real backend.
+ *
+ * This file is a state tracker: enough for the engine to run, not enough to
+ * draw. A backend that can actually render registers itself here and gets every
+ * entry point first -- see gl4es_bridge.c, which forwards to gl4es. The
+ * indirection exists so that the browser build can link a renderer while the
+ * other two builds (and the differential test) keep working without one.
+ *
+ * Returns 1 if it handled the call. */
+extern int (*g_gl_backend)(const char *name, const uint32_t *args,
+                           int nargs, uint32_t *ret);
+
+#ifdef __EMSCRIPTEN__
+/* Browser build only: bring gl4es up. See gl4es_bridge.c and docs/REUSE.md. */
+void gl4es_bridge_init(int fb_w, int fb_h);
+#endif
+
 /* Live counters, for the per-frame measurement. */
 extern uint64_t g_gl_draw_calls;
 extern uint64_t g_gl_textures_created;
