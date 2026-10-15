@@ -25,14 +25,16 @@ diffed against this one instruction by instruction.
 | ELF load + relocation | **done** — 3139 relocations, 0 unhandled, 7713 symbols indexed |
 | Import table (183 symbols) | **done** — 178 functions, 4 variables, 84 implemented |
 | Guest heap | **done** — first-fit free list with coalescing |
-| Thumb-1 decoder | **working** — full format coverage |
-| ARM decoder | **working** — verified instruction-for-instruction against Unicorn |
-| VFPv2 | not started |
-| JNI / GLES1 / audio / assets | not started |
+| Thumb-1 decoder | **working** — full format coverage, oracle-verified |
+| ARM decoder | **working** — verified against Unicorn |
+| VFPv2 | **not started** — traps with its encoding recorded |
+| JNI environment | **done** — 229 + 5 table entries in guest memory; 12 boot calls implemented |
+| Java-method worklist | **done** — the report names every method the guest calls |
+| GLES1 state layer | **done** — texture IDs, bindings, enable bits, queries (not a renderer) |
+| GLES1 renderer → WebGL2 | **not started** — the 6-10 week item |
 | Differential oracle | **working** — `tools/difftest.sh`, all entries identical |
-| JNI environment | **in progress** — tables built, `GetEnv`/`GetIntArrayElements` correct |
-| `JNI_OnLoad` | **in progress** — runs, returns -1; see below |
-| `nativePreInit` | **runs** — 12 instructions, then reads a null pointer |
+| Boot sequence | **completes** — ctors, JNI_OnLoad, nativePreInit, nativeInit, both resumes, nativeRender |
+| First real frame | **blocked** — startClet never runs, so no timer is registered |
 | Browser host | not started |
 
 `ctor[3]` now reaches the import stubs and the host crossings count is
