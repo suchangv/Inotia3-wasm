@@ -246,7 +246,12 @@ int import_dispatch(int idx)
          * them, so leaving them alone shows up as a phantom divergence. */
         g_cpu.r[0] = 0;
         g_cpu.r[1] = 0;
-        return 0;
+        /* Stop at the first crossing. Carrying on with every import stubbed
+         * to NULL is possible but the traces stop being symmetric about the
+         * stub itself, and the comparison is worth more clean than deep: what
+         * is being tested here is the decoder, and the run to the first import
+         * already exercises the whole PLT path. */
+        return 1;
     }
     host_import_call(im);
     return 0;

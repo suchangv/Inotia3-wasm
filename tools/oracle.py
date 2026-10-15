@@ -117,7 +117,7 @@ def main():
             out.write("%08x %s %08x\n" % (
                 prev, " ".join("%08x" % v for v in r), uc_.reg_read(UC_ARM_REG_CPSR)))
 
-        if pc < GUEST_IMAGE_BASE or pc >= TEXT_HI:
+        if pc < TEXT_LO or pc >= TEXT_HI:
             # Match the interpreter's HALT_BAD_PC, which fires when PC leaves
             # the loaded image. Both endings are real: the return sentinel
             # (LR=1, so a returning guest lands on 0) and a guest that walked
@@ -139,14 +139,8 @@ def main():
             # back the way a `bx lr` would leave it -- T bit from LR's bit 0 --
             # or the return lands in the wrong instruction set. The core
             # reaches the same conclusion through R[14] & 1.
-            lr = uc_.reg_read(UC_ARM_REG_R14)
-            cpsr = uc_.reg_read(UC_ARM_REG_CPSR)
-            cpsr = (cpsr | 0x20) if (lr & 1) else (cpsr & ~0x20)
-            uc_.reg_write(UC_ARM_REG_CPSR, cpsr)
-            uc_.reg_write(UC_ARM_REG_R0, 0)
-            uc_.reg_write(UC_ARM_REG_R1, 0)
-            uc_.reg_write(UC_ARM_REG_R15, lr & ~1)
-            return
+            state["stopped"] = True
+            uc_.emu_stop()
         state["prev"] = pc
         state["count"] += 1
 

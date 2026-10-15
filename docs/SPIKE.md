@@ -32,6 +32,10 @@ diffed against this one instruction by instruction.
 | Differential oracle | **working** — `tools/difftest.sh`, all entries identical |
 | Browser host | not started |
 
+`ctor[3]` now reaches the import stubs and the host crossings count is
+non-zero (16 across the constructors: `__aeabi_atexit`, `memcpy`, `malloc`,
+`memset`, `pthread_mutex_init`) — see bug 8 below for why it was zero before.
+
 Progress: the four static constructors run real engine code — `SGL_Context`'s
 constructor, `operator new`, `jMemory_*` — through the ARM PLT, and their
 execution now matches Unicorn instruction for instruction. Coverage is still
@@ -183,11 +187,20 @@ Two structural notes worth carrying forward:
   `.ARM.exidx` walk, which is also what an AOT translation wants — the two
   needs coincide.
 
+8. **The PC range check rejected the import stub page.** `cpu_run` bails out
+   with `HALT_BAD_PC` when PC is outside `.text`, and that check runs before the
+   BKPT at a stub is ever decoded — so every host crossing silently turned into
+   "PC left the loaded image" and the crossing count stayed at zero. Visible
+   only once the stubs were reachable at all, which the bit-25 fix made
+   possible. The executable range is `.text` *plus* the stub page.
+
 ## Next steps
 
-1. Widen the differential coverage: implement imports identically on both sides
-   so the comparison is not bounded by the first NULL. The constructors only
-   reach 133 instructions that way.
+1. Widen the differential coverage past the first import. Making both sides
+   stub imports to a uniform no-op does work, but the traces then stop being
+   symmetric about the stub itself, so the comparison is currently bounded at
+   the first crossing — clean rather than deep, which is the right trade while
+   the question is "is the decoder right".
 2. Let the trap report drive the rest of the ARM work, then VFPv2. Coprocessor
    space and `SWI` should keep trapping with their encodings recorded rather
    than being guessed at — and the first one is checked against the oracle

@@ -283,8 +283,17 @@ int cpu_run(uint32_t entry, uint32_t sp, uint64_t budget)
             g_have_prev = 0;
         }
 
-        if (pc < g_img->text_lo || pc >= g_img->text_hi)
-            return HALT_BAD_PC;
+        /* Executable ranges are .text and the import stub page. The stubs have
+         * to be allowed through here or the range check fires before the BKPT
+         * is ever decoded, and every host crossing silently becomes a
+         * HALT_BAD_PC -- which is exactly what "0 host crossings" looked like
+         * before this was noticed. */
+        {
+            int in_text = (pc >= g_img->text_lo && pc < g_img->text_hi);
+            int in_stub = (pc >= GUEST_STUB_BASE && pc < GUEST_STUB_BASE + 0x1000u);
+            if (!in_text && !in_stub)
+                return HALT_BAD_PC;
+        }
 
         g_prev_pc = pc;
         g_have_prev = 1;
@@ -532,6 +541,12 @@ int cpu_run(uint32_t entry, uint32_t sp, uint64_t budget)
                     if (idx >= 0 && idx < g_nimports) {
                         R[15] = pc + 2;
                         if (import_dispatch(idx)) {
+                            /* The stub is our dispatch mechanism, not guest
+                             * code. cpu_trace_final() would otherwise emit a
+                             * line for it that the oracle has no counterpart
+                             * for, and an extra line reads as a control-flow
+                             * divergence. */
+                            g_have_prev = 0;
                             R[15] = pc;
                             return HALT_IMPORT;
                         }
