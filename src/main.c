@@ -228,6 +228,41 @@ static void dump_guest(const char *path)
     host_log("guest memory dumped to %s (%u regions)\n", path, n);
 }
 
+/* A guest entry point taking (JNIEnv*, jclass) and nothing else -- nativeResume
+ * and nativeResumeClet. */
+static run_result run_entry_env(const char *what, uint32_t entry, uint64_t budget)
+{
+    return run_entry_arg(what, entry, g_jnienv_ptr, budget);
+}
+
+/* nativeRender(JNIEnv *env, jobject clazz, jint timerID), driven per frame.
+ *
+ * This is the call the whole spike exists to measure: it fuses the engine's
+ * per-tick game logic and its GLES1 drawing into one function, so instructions
+ * retired here are the guest work per frame, and the GL and host-crossing
+ * counters reset around it give the other two numbers. */
+static run_result run_native_render(uint32_t entry, int timer_id, uint64_t budget)
+{
+    run_result r;
+    r.what = "nativeRender";
+    r.entry = entry;
+    g_cpu.r[13] = GUEST_STACK_TOP - 0x1000;
+    g_cpu.r[14] = RETURN_SENTINEL;
+    for (int i = 0; i < 13; i++)
+        g_cpu.r[i] = 0;
+    g_cpu.r[0] = g_jnienv_ptr;
+    g_cpu.r[1] = 0;
+    g_cpu.r[2] = (uint32_t)timer_id;
+    g_cpu.cpsr = 0x10;
+    uint64_t before = g_insn_count;
+    double t0 = host_now();
+    r.reason = cpu_run(entry, g_cpu.r[13], g_insn_count + budget);
+    cpu_trace_final();
+    r.insns = g_insn_count - before;
+    r.seconds = host_now() - t0;
+    return r;
+}
+
 /* ---- entry --------------------------------------------------------------- */
 
 int main(int argc, char **argv)
@@ -236,6 +271,8 @@ int main(int argc, char **argv)
     const char *dump_path = NULL;
     const char *trace_path = NULL;
     uint32_t only_entry = 0;
+    int frames = 1;
+    int timer_id = 0;
     uint64_t budget = 200u * 1000u * 1000u;
     int do_init_array = 0, do_jni = 0, do_profile = 1, trace = 0, do_boot = 0;
     (void)0;
@@ -257,6 +294,10 @@ int main(int argc, char **argv)
             trace = 1;
         else if (strcmp(argv[i], "--jni-verbose") == 0)
             g_jni_verbose = 1;
+        else if (strncmp(argv[i], "--frames=", 9) == 0)
+            frames = (int)strtol(argv[i] + 9, NULL, 10);
+        else if (strncmp(argv[i], "--timer=", 8) == 0)
+            timer_id = (int)strtol(argv[i] + 8, NULL, 10);
         else if (strncmp(argv[i], "--watch=", 8) == 0)
             g_watch_addr = (uint32_t)strtoul(argv[i] + 8, NULL, 16);
         else if (strcmp(argv[i], "--oracle") == 0)
@@ -442,6 +483,66 @@ int main(int argc, char **argv)
             ri.insns = g_insn_count - ibefore;
             ri.seconds = host_now() - it0;
             report_run(&ri);
+
+            /* The Vita port's order after nativeInit: two resume calls, then
+             * the render loop. Both resumes take (JNIEnv*, jclass). */
+            uint32_t resume = find_symbol(
+                "Java_com_com2us_wrapper_WrapperRenderer_nativeResume");
+            uint32_t resume_clet = find_symbol(
+                "Java_com_com2us_wrapper_WrapperRenderer_nativeResumeClet");
+            if (resume) {
+                run_result rr2 = run_entry_env("nativeResume", resume, budget);
+                report_run(&rr2);
+            }
+            if (resume_clet) {
+                run_result rr3 = run_entry_env("nativeResumeClet", resume_clet, budget);
+                report_run(&rr3);
+            }
+
+            /* ---- the measurement ---- */
+            uint32_t render = find_symbol(
+                "Java_com_com2us_wrapper_WrapperRenderer_nativeRender");
+            if (!render) {
+                host_log("nativeRender symbol not found\n");
+            } else {
+                host_log("\n=== %d frame(s) of nativeRender ===\n", frames);
+                uint64_t total = 0;
+                int ok = 0;
+                for (int f = 0; f < frames; f++) {
+                    /* Reset the per-frame counters so each frame's numbers are
+                     * its own rather than a running total. */
+                    uint64_t d0 = g_gl_draw_calls;
+                    uint64_t x0 = 0;
+                    for (int i = 0; i < g_nimports; i++)
+                        x0 += g_imports[i].calls;
+
+                    run_result rf = run_native_render(render, timer_id, budget);
+                    cpu_trace_final();
+
+                    uint64_t d1 = g_gl_draw_calls;
+                    uint64_t x1 = 0;
+                    for (int i = 0; i < g_nimports; i++)
+                        x1 += g_imports[i].calls;
+
+                    host_log("  frame %3d : %9llu instrs  %7.2f ms  %6.2f MIPS"
+                             "  draw=%llu host_calls=%llu  -> %s\n",
+                             f, (unsigned long long)rf.insns,
+                             rf.seconds * 1000.0,
+                             rf.seconds > 0 ? (double)rf.insns / rf.seconds / 1e6 : 0.0,
+                             (unsigned long long)(d1 - d0),
+                             (unsigned long long)(x1 - x0),
+                             rf.reason == HALT_BUDGET ? "budget exhausted"
+                                                      : cpu_halt_str(rf.reason));
+                    total += rf.insns;
+                    if (rf.reason != HALT_BUDGET)
+                        ok++;
+                    else
+                        break;
+                }
+                if (ok)
+                    host_log("  average over %d frame(s): %llu instructions\n",
+                             ok, (unsigned long long)(total / (uint64_t)ok));
+            }
         }
     } else if (only_entry) {
         /* One entry point only, so a differential run covers a single guest

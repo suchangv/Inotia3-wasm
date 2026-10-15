@@ -175,6 +175,48 @@ typedef struct {
 static jni_stat g_stats[300];
 static int     g_nstats;
 
+/* Called Java methods, keyed by "Class.method" rather than by the JNI entry
+ * point that invoked them.
+ *
+ * The distinction matters: "CallStaticVoidMethod was called 400 times" says
+ * nothing about what the host has to implement, whereas
+ * "WrapperJinterface.SetTimer" is a work item. The guest reaches the Java side
+ * only through these, so this list *is* the specification for the Java
+ * semantics the port needs -- the same role the import table plays for libc. */
+typedef struct { char key[160]; uint64_t calls; } jni_method_stat;
+static jni_method_stat g_methods[200];
+static int             g_nmethods;
+
+static void note_method(uint32_t method_handle)
+{
+    jni_handle *m = handle_of(method_handle);
+    if (!m || (m->kind != H_METHOD && m->kind != H_FIELD))
+        return;
+    const char *cls = m->cls;
+    /* Strip the JNI slash form's leading L and trailing ; if present, so the
+     * key reads as a name rather than as a type descriptor. */
+    if (cls[0] == 'L') cls++;
+    char key[160];
+    size_t n = 0;
+    for (const char *p = cls; *p && *p != ';' && n + 1 < sizeof(key); p++)
+        key[n++] = *p;
+    if (n + 1 < sizeof(key)) key[n++] = '.';
+    for (const char *p = m->name; *p && n + 1 < sizeof(key); p++)
+        key[n++] = *p;
+    key[n] = 0;
+
+    for (int i = 0; i < g_nmethods; i++)
+        if (strcmp(g_methods[i].key, key) == 0) { g_methods[i].calls++; return; }
+    if (g_nmethods < (int)(sizeof(g_methods) / sizeof(g_methods[0]))) {
+        size_t i = 0;
+        for (; key[i] && i < sizeof(g_methods[0].key) - 1; i++)
+            g_methods[g_nmethods].key[i] = key[i];
+        g_methods[g_nmethods].key[i] = 0;
+        g_methods[g_nmethods].calls = 1;
+        g_nmethods++;
+    }
+}
+
 static jni_stat *stat_for(const char *name)
 {
     for (int i = 0; i < g_nstats; i++)
@@ -462,6 +504,21 @@ int jni_host_call(const char *name, uint32_t *args, int nargs, uint32_t *ret_lo,
         st->implemented = 1;
         return 1;
     }
+    /* Any Call*Method / Call*MethodV / Call*MethodA names the Java method in
+     * its second argument; Get*Field names a field. Recording them here is what
+     * produces the worklist. */
+    if ((strncmp(fn, "Call", 4) == 0 || strncmp(fn, "Get", 3) == 0) &&
+        (strstr(fn, "Method") || strstr(fn, "Field"))) {
+        note_method(a2);
+        /* The Java side is not there, so every call answers with a zero of the
+         * right width. That is enough for the engine to keep running, and the
+         * report says what would have to exist for it to be correct. */
+        *ret_lo = 0;
+        *ret_hi = 0;
+        st->implemented = 1;
+        return 1;
+    }
+
     if (strncmp(fn, "Exception", 9) == 0) {
         /* Nothing in the guest throws across this boundary; reporting "no
          * pending exception" is both true and what the guest expects. */
@@ -564,6 +621,20 @@ void jni_report(int top_n)
                  (unsigned long long)st->calls,
                  st->implemented ? "" : "<-- NOT IMPLEMENTED");
         shown++;
+    }
+
+    if (g_nmethods) {
+        host_log("\n--- Java methods the guest calls (the real worklist) ---\n");
+        int order2[200];
+        for (int i = 0; i < g_nmethods; i++) order2[i] = i;
+        for (int i = 0; i < g_nmethods; i++)
+            for (int j = i + 1; j < g_nmethods; j++)
+                if (g_methods[order2[j]].calls > g_methods[order2[i]].calls) {
+                    int t = order2[i]; order2[i] = order2[j]; order2[j] = t;
+                }
+        for (int i = 0; i < g_nmethods; i++)
+            host_log("  %-52s %8llu\n", g_methods[order2[i]].key,
+                     (unsigned long long)g_methods[order2[i]].calls);
     }
 
     if (n_missing) {
