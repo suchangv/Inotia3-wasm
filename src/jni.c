@@ -214,10 +214,18 @@ int jni_host_call(const char *name, uint32_t *args, int nargs, uint32_t *ret_lo,
     if (strncmp(name, "jni/", 4) != 0)
         return 0;
 
+    /* Names are "jni/env/Foo" and "jni/vm/Foo"; both prefixes have to come off
+     * before the comparison below. Stripping only "vm/" left every
+     * JNINativeInterface entry named "env/Foo", matching no case, falling
+     * through to the unimplemented tail -- while the report blamed the
+     * functions for not being implemented rather than the dispatcher for not
+     * routing them. */
     const char *fn = name + 4;
     int is_vm = strncmp(fn, "vm/", 3) == 0;
     if (is_vm)
         fn += 3;
+    else if (strncmp(fn, "env/", 4) == 0)
+        fn += 4;
 
     jni_stat *st = stat_for(name);
     st->calls++;
@@ -407,6 +415,16 @@ int jni_host_call(const char *name, uint32_t *args, int nargs, uint32_t *ret_lo,
         jni_handle *o = handle_of(a1);
         if (o && a2)
             memcpy(g_mem + o->guest + a3 * 4, g_mem + a2, a4 * 4);
+        st->implemented = 1;
+        return 1;
+    }
+    if (strcmp(fn, "NewGlobalRef") == 0 ||
+        strcmp(fn, "NewLocalRef") == 0) {
+        /* Handles have no local/global distinction here: they are indices into
+         * one table that lives as long as the process, so a reference is
+         * promoted by returning it. The guest may keep it indefinitely, which
+         * is exactly what a global ref promises. */
+        *ret_lo = a1;
         st->implemented = 1;
         return 1;
     }
