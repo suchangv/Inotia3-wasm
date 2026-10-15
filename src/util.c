@@ -85,6 +85,15 @@ int strcmp(const char *a, const char *b)
     while (*a && *a == *b) { a++; b++; }
     return (int)(uint8_t)*a - (int)(uint8_t)*b;
 }
+int strncmp(const char *a, const char *b, size_t n)
+{
+    while (n--) {
+        if (*a != *b) return (int)(uint8_t)*a - (int)(uint8_t)*b;
+        if (!*a) break;
+        a++; b++;
+    }
+    return 0;
+}
 char *strncpy(char *d, const char *s, size_t n)
 {
     size_t i = 0;

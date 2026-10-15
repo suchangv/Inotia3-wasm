@@ -17,6 +17,7 @@
 #include "compat.h"
 #include "platform.h"
 #include "jni.h"
+#include "gl.h"
 
 /* ========================================================================== */
 /* Guest heap: first-fit free list with forward coalescing.                    */
@@ -348,6 +349,43 @@ static int count_args(const char *fmt)
 }
 
 /* ========================================================================== */
+/* Guest-write watchpoint                                                      */
+/* ========================================================================== */
+
+/* Set to a guest address to log every host-side write that covers it.
+ *
+ * This exists because the two sides of the boundary fail very differently. A
+ * guest store that goes out of bounds is visible in the instruction trace; a
+ * *host* store is invisible, because the shim is C running on the host and the
+ * interpreter never sees it. When guest memory is corrupted and no guest
+ * instruction did it, this is how to find the culprit.
+ *
+ * Enabled by --watch=ADDR; off (and free) otherwise. */
+uint32_t g_watch_addr;
+
+static void watch_check_fmt(const char *what, uint32_t dst, uint32_t len,
+                            const char *fmt)
+{
+    if (!g_watch_addr || !len)
+        return;
+    if (dst <= g_watch_addr && g_watch_addr < dst + len)
+        host_log("  WATCH: %s() wrote %u bytes to %08x..%08x covering %08x"
+                 "  (return address %08x)\n    format: \"%s\"\n",
+                 what, len, dst, dst + len, g_watch_addr, g_cpu.r[14],
+                 fmt ? fmt : "?");
+}
+
+static void watch_check(const char *what, uint32_t dst, uint32_t len)
+{
+    if (!g_watch_addr || !len)
+        return;
+    if (dst <= g_watch_addr && g_watch_addr < dst + len)
+        host_log("  WATCH: %s() wrote %u bytes to %08x..%08x covering %08x"
+                 "  (return address %08x)\n",
+                 what, len, dst, dst + len, g_watch_addr, g_cpu.r[14]);
+}
+
+/* ========================================================================== */
 /* The dispatch                                                               */
 /* ========================================================================== */
 
@@ -384,6 +422,17 @@ void host_import_call(guest_import *im)
         return;
     }
 
+    /* GL is recognised by name rather than by an IMPL_* id: there are ~130
+     * entry points, most of them one line of state, and a name table keeps them
+     * in one readable place instead of a 130-case switch. gl_is_entry is the
+     * single source of truth for "is this GL", so a name cannot be dispatched
+     * without also being counted. */
+    if (gl_is_entry(im->name)) {
+        gl_note_call(im->name);
+        gl_host_call(im->name, args, nargs, &R[0]);
+        return;
+    }
+
     switch (im->impl) {
 
     /* ---- memory ---- */
@@ -406,9 +455,9 @@ void host_import_call(guest_import *im)
     }
 
     /* ---- strings ---- */
-    case IMPL_memcpy:  if (a0 && a1) memcpy(g_mem + a0, g_mem + a1, a2); R[0] = a0; break;
-    case IMPL_memset:  if (a0) memset(g_mem + a0, (int)a1, a2); R[0] = a0; break;
-    case IMPL_memmove: if (a0 && a1) memmove(g_mem + a0, g_mem + a1, a2); R[0] = a0; break;
+    case IMPL_memcpy:  watch_check("memcpy", a0, a2); if (a0 && a1) memcpy(g_mem + a0, g_mem + a1, a2); R[0] = a0; break;
+    case IMPL_memset:  watch_check("memset", a0, a2); if (a0) memset(g_mem + a0, (int)a1, a2); R[0] = a0; break;
+    case IMPL_memmove: watch_check("memmove", a0, a2); if (a0 && a1) memmove(g_mem + a0, g_mem + a1, a2); R[0] = a0; break;
     case IMPL_memcmp:  R[0] = a0 && a1 ? (uint32_t)(int32_t)memcmp(g_mem + a0, g_mem + a1, a2) : 0; break;
     case IMPL_strlen:  R[0] = a0 ? (uint32_t)strlen((const char *)(g_mem + a0)) : 0; break;
     case IMPL_strcmp:  R[0] = (uint32_t)(int32_t)strcmp(guest_str(a0, 4096), guest_str(a1, 4096)); break;
@@ -416,6 +465,7 @@ void host_import_call(guest_import *im)
     case IMPL_strcpy: {
         const char *s = guest_str(a1, 4096);
         size_t n = strlen(s) + 1;
+        watch_check("strcpy", a0, (uint32_t)n);
         if (a0) memcpy(g_mem + a0, s, n);
         R[0] = a0;
         break;
@@ -424,6 +474,7 @@ void host_import_call(guest_import *im)
         const char *s = guest_str(a1, a2 + 1);
         size_t n = strlen(s);
         if (n > a2) n = a2;
+        watch_check("strncpy", a0, a2);
         if (a0) { memcpy(g_mem + a0, s, n); memset(g_mem + a0 + n, 0, a2 - n); }
         R[0] = a0;
         break;
@@ -547,11 +598,49 @@ void host_import_call(guest_import *im)
 
     /* ---- runtime ---- */
     case IMPL_abort:
-    case IMPL_stack_chk_fail:
-        host_log("guest: %s() called -- this is a guest-side bug\n", im->name);
+        host_log("guest: abort() called\n");
         g_cpu.r[0] = 0;
         /* Do not kill the host: the spike wants the run to continue and report
          * the profile so far, not to abort the whole session. */
+        break;
+    case IMPL_stack_chk_fail:
+        /* A canary mismatch means guest memory was written out of bounds. The
+         * two candidates are worth telling apart, because they point at
+         * completely different culprits:
+         *
+         *   the saved copy changed -> something overwrote the guest's stack,
+         *                             most often a local buffer whose length
+         *                             came from a shim that answered wrongly
+         *   the guard itself changed -> our own host-data storage for
+         *                             __stack_chk_guard was clobbered, which
+         *                             would be a bug in the loader
+         *
+         * The guest's check is `cmp r2, r3` with r2 the value it saved at entry
+         * and r3 the guard read back, so r2 and r3 are exactly those two
+         * numbers at this point. */
+        {
+            uint32_t guard_addr = 0;
+            for (int i = 0; i < g_nimports; i++)
+                if (g_imports[i].is_object &&
+                    strcmp(g_imports[i].name, "__stack_chk_guard") == 0)
+                    guard_addr = g_imports[i].stub;
+            host_log("guest: __stack_chk_fail -- stack canary mismatch\n"
+                     "  saved canary (r2)   : %08x\n"
+                     "  guard read  (r3)    : %08x\n"
+                     "  __stack_chk_guard @ : %08x = %08x\n"
+                     "  return address      : %08x\n"
+                     "  stack pointer       : %08x\n",
+                     a2, a3, guard_addr,
+                     guard_addr ? LD32(guard_addr) : 0, R[14], R[13]);
+            if (a2 != a3 && guard_addr && LD32(guard_addr) == a3)
+                host_log("  => the guard is intact, so the SAVED copy was "
+                         "overwritten: something wrote past a local buffer on "
+                         "the guest stack.\n");
+            else if (guard_addr && LD32(guard_addr) != a3)
+                host_log("  => the guard itself moved: the loader's storage for "
+                         "__stack_chk_guard was written by something else.\n");
+        }
+        g_cpu.r[0] = 0;
         break;
     case IMPL_assert2:
         host_log("guest assert: %s:%d: %s\n", guest_str(a1, 256), (int)a2,
@@ -685,6 +774,7 @@ void host_import_call(guest_import *im)
         s.n = 0;
         format(&s, fmt, &args[1], n + 4);
         sink_ch(&s, 0);
+        watch_check(im->name, a0, (uint32_t)s.n);
         R[0] = (uint32_t)s.n - 1;
         break;
     }
@@ -696,8 +786,30 @@ void host_import_call(guest_import *im)
         s.dst = (char *)(g_mem + a0);
         s.cap = (im->impl == IMPL_vsnprintf) ? a2 : 1u << 30;
         s.n = 0;
-        format(&s, fmt, &args[2], n + 2);
+        (void)n;
+
+        /* A va_list here is a plain pointer to the argument list in the
+         * caller's frame -- NOT the `struct { void *__ap; }` the AAPCS
+         * describes, and emphatically not the flat r0-r3-then-stack array the
+         * other formatting entry points take.
+         *
+         * Passing &args[2] made the va_list's own *pointer* the first
+         * argument, shifting every conversion by one. `%s` then read a string
+         * from whatever integer happened to be there and copied it until it
+         * hit a NUL, which is how a call meant to produce "1.3.2" wrote 14
+         * bytes over a 12-byte stack buffer and tripped the guest's stack
+         * canary -- thousands of instructions after the actual mistake.
+         *
+         * Settled by reading the guest's own frames: for
+         * `"Android Wrapper v%s #%d"`, [va_list] held a pointer to a valid
+         * string, which is only true if the arguments start *at* va_list. */
+        uint32_t va_args[24];
+        for (int i = 0; i < 24; i++)
+            va_args[i] = LD32(a2 + (uint32_t)i * 4u);
+
+        format(&s, fmt, va_args, 24);
         sink_ch(&s, 0);
+        watch_check_fmt(im->name, a0, (uint32_t)s.n, fmt);
         R[0] = (uint32_t)s.n - 1;
         break;
     }

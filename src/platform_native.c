@@ -17,6 +17,9 @@
 #include "compat.h"
 #include "platform.h"
 #include "cpu.h"
+#include "imports.h"
+#include "jni.h"
+#include "gl.h"
 
 #include <stdio.h>
 #include <stdlib.h>
@@ -66,6 +69,16 @@ static void segv_handler(int sig, siginfo_t *info, void *uctx)
                 i, g_cpu.r[i], i + 1, g_cpu.r[i + 1],
                 i + 2, g_cpu.r[i + 2], i + 3, g_cpu.r[i + 3]);
     cpu_dump_trace();
+
+    /* What the guest had called before it died. Without this the report never
+     * runs -- _exit() below skips it -- and the most useful question at a crash
+     * ("which host function did it last lean on?") has no answer. In practice
+     * the answer is usually an import that returns 0 because it is not
+     * implemented, and the guest then treats that 0 as a pointer. */
+    imports_report(12);
+    jni_report(8);
+    gl_report(8);
+
     /* The instruction trace is buffered inside stdio and _exit() does not
      * flush, so a crash would otherwise truncate it to nothing -- and the
      * instructions right before the fault are exactly the interesting ones. */

@@ -100,6 +100,9 @@ void host_fatal(const char *fmt, ...);
  * draws on, so JNI-allocated strings and arrays are ordinary guest memory. */
 uint32_t guest_heap_alloc(uint32_t n);
 
+/* Debug: log every host-side write covering this guest address. 0 = off. */
+extern uint32_t g_watch_addr;
+
 /* ---- per-instruction trace, for differential testing ---------------------
  *
  * Emitted *after* an instruction has executed, keyed by the PC of the

@@ -26,6 +26,7 @@
 #include "compat.h"
 #include "platform.h"
 #include "jni.h"
+#include "gl.h"
 
 #ifndef WASM_FREESTANDING
 #include <stdio.h>
@@ -256,6 +257,8 @@ int main(int argc, char **argv)
             trace = 1;
         else if (strcmp(argv[i], "--jni-verbose") == 0)
             g_jni_verbose = 1;
+        else if (strncmp(argv[i], "--watch=", 8) == 0)
+            g_watch_addr = (uint32_t)strtoul(argv[i] + 8, NULL, 16);
         else if (strcmp(argv[i], "--oracle") == 0)
             g_oracle_mode = 1;
         else if (strncmp(argv[i], "--dump-guest=", 13) == 0)
@@ -304,6 +307,7 @@ int main(int argc, char **argv)
     /* Must follow elf_load: it registers the JNI table entries as imports and
      * re-stamps the stub page. */
     jni_guest_init();
+    gl_state_init();
 
     cpu_init(&g_img);
     cpu_set_profile(do_profile);
@@ -495,6 +499,7 @@ int main(int argc, char **argv)
         report_profile(20);
     imports_report(20);
     jni_report(15);
+    gl_report(12);
 
     uint32_t at = 0;
     const char *near = elf_nearest_sym(&g_img, g_cpu.r[15], &at);

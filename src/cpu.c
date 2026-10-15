@@ -456,13 +456,32 @@ int cpu_run(uint32_t entry, uint32_t sp, uint64_t budget)
                 break;
 
             case 0x6: case 0x7: case 0x8: case 0x9: {
-                /* formats 9/10/11: load/store with immediate offset */
+                /* formats 9/10/11: load/store with immediate offset.
+                 *
+                 * Format 11 (SP-relative) is the odd one out in two ways, and
+                 * both are easy to miss because formats 9 and 10 sit in the
+                 * same case:
+                 *
+                 *   1001 L Rd  imm8      <- format 11: Rd is bits[10:8]
+                 *   0111 B L imm5 Rn Rd  <- format 9:  Rd is bits[2:0]
+                 *   1000 L    imm5 Rn Rd <- format 10: Rd is bits[2:0]
+                 *
+                 * Taking Rd from bits[2:0] for all of them makes
+                 * `ldr r1, [sp, #20]` (0x9905) write r5 instead of r1. Since
+                 * r5 held the GOT base, the failure surfaces thousands of
+                 * instructions later as a load through a garbage address --
+                 * and the offending instruction looks perfectly innocent in a
+                 * trace that only prints PCs. */
                 uint32_t grp = ins >> 12;
                 uint32_t isload = (ins & 0x0800) != 0;
                 uint32_t base, scale, imms;
-                rd = ins & 7;
-                if (grp == 0x9) { base = R[13]; scale = 2; imms = ins & 0xff; }
-                else {
+                if (grp == 0x9) {
+                    rd = (ins >> 8) & 7;
+                    base = R[13];
+                    scale = 2;
+                    imms = ins & 0xff;
+                } else {
+                    rd = ins & 7;
                     base = R[(ins >> 3) & 7];
                     imms = (ins >> 6) & 0x1f;
                     scale = (grp == 0x7) ? 0 : (grp == 0x6 ? 2 : 1);
@@ -981,14 +1000,27 @@ int cpu_run(uint32_t entry, uint32_t sp, uint64_t budget)
                 continue;
             }
 
-            /* ---- branch / branch with link ---- */
+            /* ---- branch / branch with link ----
+             *
+             * The target is PC + 8 + offset, where PC is the branch's own
+             * address -- ARM's PC reads as the instruction plus 8, and the
+             * encoding's imm24 is relative to that. `next` is pc + 4 and is
+             * only right for the *link* value, which is the address of the
+             * following instruction.
+             *
+             * Using next for both puts every ARM branch 4 bytes short. That is
+             * small enough to land inside a neighbouring instruction rather
+             * than fault, so it presents as a control-flow divergence the
+             * oracle finds immediately and a human reads as "the loop never
+             * terminates": it was the whole reason __divsf3 spun for 49.8M
+             * instructions. */
             if (op1 == 5) {
                 int32_t off = (int32_t)(ins & 0xffffff);
-                off = (off << 8) >> 6;
+                off = (off << 8) >> 6;   /* sign-extend imm24, then << 2 */
                 if (ins & 0x01000000) {
                     R[14] = next | (g_thumb ? 1u : 0u);
                 }
-                pc = (uint32_t)((int32_t)next + off);
+                pc = (uint32_t)((int32_t)R[15] + off);   /* R[15] == pc + 8 */
                 R[15] = pc;
                 prof_transfer(pc);
                 continue;
