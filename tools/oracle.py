@@ -44,7 +44,9 @@ GUEST_MEM_SIZE      = 0x09000000
 TEXT_LO             = 0x01000000
 TEXT_HI             = 0x0113dac4
 GUEST_INIT_ARRAY    = GUEST_IMAGE_BASE + 0x13ecfc
-RETURN_SENTINEL     = 1
+# Must match RETURN_SENTINEL in src/main.c. Not 0: a guest that
+# branches through a null function pointer also lands on 0.
+RETURN_SENTINEL     = 0x0BADF00D
 
 
 def load_dump(path):
