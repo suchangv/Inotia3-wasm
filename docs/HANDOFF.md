@@ -161,53 +161,85 @@ watchpoint, and the oracle.
 Not started: **VFPv2**, the GLES1→WebGL2 renderer, audio, assets, the browser
 host.
 
-## The immediate next task
+## Achieved: the engine runs
 
-**`startClet()` never runs, so the engine's timer table stays empty and
-`nativeRender` does nothing.**
+The game executes its real per-frame logic. Measured over 30 frames on the
+boot path, native build (this is the number the spike existed to produce):
+
+| | per frame |
+|---|---|
+| instructions retired | **~8,963** |
+| draw calls | **2-4** (88 over 30 frames) |
+| host crossings | **~293**, of which **memcpy is 71.6%** |
+| native time | ~0.06 ms |
+
+**The finding that changes the plan: host crossings are dominated by `memcpy`,
+not by GL.** GL is 2-4 draws plus a few dozen state calls per frame; `memcpy`
+alone is ~257 calls per frame. At the ~50-200 ns a browser charges per crossing
+that is 13-51 us/frame -- real, survivable, and fixable by batching small copies
+host-side. It is not an argument for anything architectural, and it is the kind
+of thing the earlier estimates could only have guessed at.
+
+Two caveats on those numbers: this is the init/menu path, not a busy combat
+scene, and it is the native build. Instructions per frame is the
+platform-independent figure; the browser's will be the same work at the wasm
+interpreter's throughput.
+
+## What it took, and what is next
+
+Four things stood between "boots cleanly" and "runs", each presenting as a
+different symptom. All four are in the parent repository's history too, which is
+why `PORTING_PLAN.md` and `patch.c` are worth reading before chasing anything
+here.
+
+1. **Anti-tamper.** `nativeInit` only bootstraps the game when `excuteDirectly()`
+   and `jIsCracked()` both return 0. Both run `system("ps > <file>")` and scan
+   the process list; with no shell the file is never created, so both answer
+   "tampered" and `startClet()` is **silently skipped**. The game booted
+   perfectly and idled forever. Now patched in `src/patches.c`.
+2. **Lazily-populated JavaVM caches.** `CS_UserAgreeSetCallback` reads its own
+   `.bss` copy of the JavaVM, which a missing subsystem init was to fill via
+   `GetJavaVM`, and dereferences it. `patches.c` finds every such copy by
+   scanning for the idiom rather than hardcoding addresses -- the parent
+   repository's list of seven is tied to one APK build.
+3. **The Java-side timer table** (`src/timers.c`). The loop is timer-driven:
+   `SetTimer(id, firetime, interval)` out, `nativeRender(id)` back. The id is
+   **opaque, not an index** -- this build passes `&g_MainTimer`.
+4. **`UserAgreeCallback(0)`** after `nativeInit`. `STATE_Set(0)`'s only call
+   site in the whole `.so` is inside it, and on Android a Java module calls back
+   into it.
+
+## The immediate next task
 
 `nativeRender` returns cleanly in 33 instructions with 0 draw calls and 0 host
 crossings. That is not a crash and not a bug in the interpreter — the engine's
 per-frame work is dispatched from its timer table, and nothing has registered a
 timer.
 
-The evidence, all from a real boot:
+**Deepen what runs, then take it to wasm.**
 
-* The Java-method worklist (see `jni_report`) lists nine `WrapperJinterface`
-  methods and **no `SetTimer`**.
-* `startClet` (guest `0x06e799`, 180 bytes) never appears in the profile at all.
-  Neither does `StartCletProcess` (`0x06e6a9`) nor `DelegateCall_startClet`
-  (`0x06e751`).
-* `g_StartCletCnt` (`0x14e184`) and `startClet_count` (`0x14e180`) are exported
-  counters, which suggests `startClet` is meant to be called repeatedly, not
-  once — consistent with it being driven rather than called inline.
+The engine executes its per-frame logic; what it does not yet do is render
+anything, because the GL layer only keeps state (see `gl.h`). In rough order of
+value:
 
-The Vita port's `patch.c` (Corrida 33) records that `startClet` runs *inside*
-`nativeInit` and registers a UserAgree callback, and that nothing else in the
-port would ever fire that callback — so the port fires it manually via
-`patch_fire_user_agree_callback()`. Here `nativeInit` completes without
-`startClet` being reached at all, so the first question is **what is supposed to
-call it**, and why that path is not taken.
+1. **Run the boot further.** Only the init path has been exercised. Quantity to
+   aim at: drive enough frames that the game reaches its title screen and the
+   profile shows the state machine advancing rather than idling.
+2. **Build for wasm32 and measure the ratio.** `tools/build.sh wasm` produces
+   `build/spike.wasm`; the synthetic benchmark said the interpreter runs at 58%
+   of native, and instructions per frame is now known, so the browser number is
+   one multiplication away. `platform_wasm.c` does not exist yet -- it is the
+   only file missing for that build.
+3. **VFPv2.** Still unimplemented and still not needed on this path. It will be
+   needed the moment the engine does float maths, and it traps with its encoding
+   recorded when it is.
+4. **The remaining file I/O**: `stat`, `statfs`, `fsync`, `raise`. Small.
+5. **The GL renderer.** The 6-10 week item. `gl4es` and emscripten's
+   `LEGACY_GL_EMULATION` are the reference implementations worth reading first.
 
-Cheapest things to check, in order:
-
-1. Look for callers of `startClet` / `StartCletProcess` in the binary and see
-   which one `nativeInit` is supposed to reach. `DelegateCall_startClet` is a
-   delegate trampoline — find what invokes it.
-2. Check whether the path goes through a Java method that our JNI layer answers
-   with a zero. `jni_report` lists every method the guest calls with its count;
-   a method returning 0 where the engine expects non-zero is exactly how a
-   branch gets silently not taken.
-3. `--watch=ADDR` on `g_StartCletCnt` (`0x0114e184`) would show whether anything
-   even writes it.
-4. `nativeInit` runs 188339 instructions and the profile attributes them; look
-   at what it *does* reach near the end and compare against the Vita port's
-   Corrida log, which documents this same region of the boot.
-
-Once a timer is registered, `nativeRender` starts doing real work and the two
-numbers this spike exists for become measurable: instructions retired per frame,
-draw calls per frame, and host crossings per frame. `--frames=N` reports all
-three, reset per frame.
+A measurement worth repeating as the work goes on: **`memcpy` is 71.6% of host
+crossings.** Anything that reduces crossing count should be checked against that
+number, because it is the one that costs browser time.
 
 ## A map of the bugs found so far
 
@@ -254,6 +286,24 @@ Worth reading as a list of *classes*, because they recur. All are in
 14. The `jni/env/` prefix was not stripped, so no `JNINativeInterface` entry was
     ever routed — while the report blamed the functions rather than the
     dispatcher.
+
+**Bring-up, continued**
+
+20. **The binary contains its own anti-tamper, and it fails closed.** Two
+    functions shell out to `ps`, find no file (no shell), and answer "tampered"
+    -- which silently skips `startClet()`. The failure mode is a clean boot and
+    an idle engine, which is the most expensive kind: everything looks right.
+    See `patches.c`.
+21. **Subsystems cache the JavaVM in `.bss` and expect a Java-side init to fill
+    it.** Nothing here calls those inits, so the cache reads as 0 and the first
+    dereference is a null. `patches.c` finds every copy by scanning for the
+    idiom; hardcoded address lists rot across APK builds.
+22. **`SetTimer`'s "timer id" is an opaque handle, not a table index.** This
+    build passes the address of the guest's own timer object. Indexing by it
+    discards every registration.
+23. **The engine's own state machine is entered from a callback nothing fires.**
+    `STATE_Set(0)`'s only call site is inside `UserAgreeCallback`, which a Java
+    module calls back into on Android.
 
 **Instruction-set semantics, continued**
 
@@ -341,7 +391,8 @@ Do not re-litigate these without new evidence; the reasoning is in
 |---|---|---|
 | **VFPv2** | 1–2 weeks | not started; needed as soon as the engine does float maths |
 | Deepen oracle coverage | 1 week | currently only the prologue path |
-| `nativeInit` → first frame | 1–2 weeks | **produces the two numbers** |
+| ~~`nativeInit` → first frame~~ | **done** | the numbers are in the section above |
+| wasm32 build of the runner | 2–3 days | `platform_wasm.c` is the only missing file |
 | JNI semantics (`WrapperJinterface`, fonts, Sound) | 2–4 weeks | `source/java.c` in the Vita repo has the logic |
 | **GLES1 → WebGL2 fixed function** | **6–10 weeks** | the big one; 58 entry points, no reuse from this repo. Consider `gl4es` or emscripten's `LEGACY_GL_EMULATION` before writing it |
 | Audio (WebAudio + OGG) | 1–3 weeks | |
