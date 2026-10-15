@@ -171,19 +171,46 @@ boot path, native build (this is the number the spike existed to produce):
 | instructions retired | **~8,963** |
 | draw calls | **2-4** (88 over 30 frames) |
 | host crossings | **~293**, of which **memcpy is 71.6%** |
-| native time | ~0.06 ms |
+| native time | **0.059 ms** |
+| **wasm time** | **0.115 ms** |
 
-**The finding that changes the plan: host crossings are dominated by `memcpy`,
-not by GL.** GL is 2-4 draws plus a few dozen state calls per frame; `memcpy`
-alone is ~257 calls per frame. At the ~50-200 ns a browser charges per crossing
-that is 13-51 us/frame -- real, survivable, and fixable by batching small copies
-host-side. It is not an argument for anything architectural, and it is the kind
-of thing the earlier estimates could only have guessed at.
+And the number the spike was built for:
 
-Two caveats on those numbers: this is the init/menu path, not a busy combat
-scene, and it is the native build. Instructions per frame is the
-platform-independent figure; the browser's will be the same work at the wasm
-interpreter's throughput.
+```
+native   151.9 MIPS
+wasm      77.7 MIPS      = 51% of native
+```
+
+The synthetic benchmark predicted 58%; the real binary is a little worse, as it
+should be. Runnable with `tools/build.sh wasm && node tools/run_wasm.mjs`; the
+instruction counts are identical between the two builds (8,963), which is what
+makes the comparison a measurement of the interpreter rather than of two
+different programs.
+
+### What this means for the plan
+
+**The interpreter is a correctness oracle and a demo, not the shipping path.**
+The Vita port measured ~125 ms/frame in a busy combat scene at 444 MHz, which is
+roughly 28M guest instructions. At 77.7 MIPS that is 360 ms/frame -- under 3 FPS
+-- and even a low estimate of 15M gives about 5 FPS. So the assessment's
+conclusion stands, now with a measured number behind it: **a static translation
+to WebAssembly is what makes this playable, and the interpreter is what proves
+the translated version correct.**
+
+(That busy-frame figure is an extrapolation from the Vita's profiling, not a
+measurement here. The idle figure is measured.)
+
+**One earlier worry was misplaced, in the port's favour.** The assessment assumed
+50-200 ns per host crossing -- the cost of a wasm-to-JS boundary call. But the
+shims are compiled *into* the module: a guest `memcpy` goes BKPT -> interpreter
+-> `import_dispatch` -> C function, entirely inside wasm. There is no JS
+boundary, and ~301 crossings/frame cost almost nothing. That matters because
+`memcpy` alone is 71.6% of them; had they been JS calls the same frame would be
+roughly a third slower.
+
+The remaining caveat: this is the init/menu path, not a busy scene. The profile
+shows real graphics work (`GRP_FillRect`, the `GRP_Filter*` family) and each
+frame makes 2-4 draw calls, so it is not idle -- but it is not combat either.
 
 ## What it took, and what is next
 
@@ -225,11 +252,9 @@ value:
 1. **Run the boot further.** Only the init path has been exercised. Quantity to
    aim at: drive enough frames that the game reaches its title screen and the
    profile shows the state machine advancing rather than idling.
-2. **Build for wasm32 and measure the ratio.** `tools/build.sh wasm` produces
-   `build/spike.wasm`; the synthetic benchmark said the interpreter runs at 58%
-   of native, and instructions per frame is now known, so the browser number is
-   one multiplication away. `platform_wasm.c` does not exist yet -- it is the
-   only file missing for that build.
+2. **Drive a heavier scene.** The measurement above is the init path. Getting
+   the engine into combat would replace the extrapolation with a measurement,
+   and would say directly whether the translated build is worth its cost.
 3. **VFPv2.** Still unimplemented and still not needed on this path. It will be
    needed the moment the engine does float maths, and it traps with its encoding
    recorded when it is.
@@ -392,7 +417,7 @@ Do not re-litigate these without new evidence; the reasoning is in
 | **VFPv2** | 1–2 weeks | not started; needed as soon as the engine does float maths |
 | Deepen oracle coverage | 1 week | currently only the prologue path |
 | ~~`nativeInit` → first frame~~ | **done** | the numbers are in the section above |
-| wasm32 build of the runner | 2–3 days | `platform_wasm.c` is the only missing file |
+| ~~wasm32 build of the runner~~ | **done** | `tools/build.sh wasm && node tools/run_wasm.mjs` |
 | JNI semantics (`WrapperJinterface`, fonts, Sound) | 2–4 weeks | `source/java.c` in the Vita repo has the logic |
 | **GLES1 → WebGL2 fixed function** | **6–10 weeks** | the big one; 58 entry points, no reuse from this repo. Consider `gl4es` or emscripten's `LEGACY_GL_EMULATION` before writing it |
 | Audio (WebAudio + OGG) | 1–3 weeks | |
