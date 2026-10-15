@@ -138,58 +138,76 @@ ctor[0]                entry=010b6a09    227 instrs  -> returned to caller
 ctor[1]                entry=010d03c5     24 instrs  -> returned to caller
 ctor[2]                entry=010d0b3d     46 instrs  -> returned to caller
 ctor[3]                entry=010ea589     79 instrs  -> returned to caller
+ctor[4]                (null entry, skipped)
 JNI_OnLoad             entry=010d9bad     99 instrs  -> returned to caller
     JNI_OnLoad returned 65542 (JNI_VERSION_1_6)          <-- correct
-nativePreInit          entry=010db621     57 instrs  -> PC left the loaded image
-    module globals at 0115a36c: vm=08d00400 env=08d00000 <-- both correct
+nativePreInit          entry=010db621     57 instrs  -> returned to caller
+nativeInit             entry=010dc411 188339 instrs  -> returned to caller
+nativeResume           entry=010db55d     12 instrs  -> returned to caller
+nativeResumeClet       entry=010db529     12 instrs  -> returned to caller
+nativeRender           entry=...          33 instrs  -> returned to caller
+    draw calls 0, host crossings 0                       <-- see below
 ```
 
-Working: ELF load and relocation (3139 relocations, 0 unhandled, 7713 symbols
-indexed), the full 183-symbol import table with interworking stubs, the guest
-heap, the Thumb-1 decoder, an ARM subset decoder, the JNI environment (229 + 5
-table entries, all 12 calls the boot makes are implemented), per-function
-profiling, crash triage that translates a host `SIGSEGV` back into a guest
-address and register dump, and the oracle.
+**The whole boot sequence completes.** Working: ELF load and relocation (3139
+relocations, 0 unhandled, 7713 symbols indexed), the full 183-symbol import
+table with interworking stubs, the guest heap, the Thumb-1 decoder, an ARM
+subset decoder, the JNI environment (229 + 5 table entries), a GLES1 **state**
+layer (texture IDs, bindings, enable bits, queries — not a renderer), the
+Java-method worklist, per-function profiling, crash triage that translates a
+host `SIGSEGV` back into a guest address and register dump, a host-write
+watchpoint, and the oracle.
 
-Not started: **VFPv2**, the browser host, GLES1, audio, assets.
+Not started: **VFPv2**, the GLES1→WebGL2 renderer, audio, assets, the browser
+host.
 
 ## The immediate next task
 
-**`nativePreInit` returns through its own epilogue but to a corrupted return
-address.**
+**`startClet()` never runs, so the engine's timer table stays empty and
+`nativeRender` does nothing.**
 
-Its trace ends:
+`nativeRender` returns cleanly in 33 instructions with 0 draw calls and 0 host
+crossings. That is not a crash and not a bug in the interpreter — the engine's
+per-frame work is dispatched from its timer table, and nothing has registered a
+timer.
 
-```
-010db66c  47b0   nativePreInit+0x4c    BLX r3  -> stub 088005d4
-088005d4  be00                          (import stub)
-010db66e  bdf8   nativePreInit+0x4e    POP {r3,r4,r5,r6,r7,pc}
-```
+The evidence, all from a real boot:
 
-`bdf8` pops PC from the frame, and the value popped is 0 (or 1) rather than the
-return sentinel `0x0BADF00D` that `main.c` put in LR. So either the frame was
-corrupted, or the function never pushed LR, or the import it called last
-clobbered the guest stack.
+* The Java-method worklist (see `jni_report`) lists nine `WrapperJinterface`
+  methods and **no `SetTimer`**.
+* `startClet` (guest `0x06e799`, 180 bytes) never appears in the profile at all.
+  Neither does `StartCletProcess` (`0x06e6a9`) nor `DelegateCall_startClet`
+  (`0x06e751`).
+* `g_StartCletCnt` (`0x14e184`) and `startClet_count` (`0x14e180`) are exported
+  counters, which suggests `startClet` is meant to be called repeatedly, not
+  once — consistent with it being driven rather than called inline.
 
-Things worth checking, cheapest first:
+The Vita port's `patch.c` (Corrida 33) records that `startClet` runs *inside*
+`nativeInit` and registers a UserAgree callback, and that nothing else in the
+port would ever fire that callback — so the port fires it manually via
+`patch_fire_user_agree_callback()`. Here `nativeInit` completes without
+`startClet` being reached at all, so the first question is **what is supposed to
+call it**, and why that path is not taken.
 
-1. **`host_import_call` reads 24 words from the guest stack** (`extra[24]`) for
-   every import, regardless of the callee's arity. It only reads, so it cannot
-   corrupt anything — but confirm that is still true.
-2. `--trace` the few instructions before the `POP`. The ring holds 96 and the
-   function is only 57 instructions long, so the whole run is there.
-3. Check whether the last import (`088005d4`, index 373) is a JNI entry and
-   whether its implementation writes anywhere it should not. `jni_host_call`
-   writes into guest memory for `GetIntArrayElements`-style calls.
-4. Derive the PUSH at the function's entry (mirror of `bdf8`: `b5f8`) and check
-   the prologue actually ran, and that SP at the `POP` equals SP at the `PUSH`.
-   `cpu_dump_state()` prints the register file; the crash handler prints it
-   automatically on a real fault.
+Cheapest things to check, in order:
 
-Once `nativePreInit` returns cleanly, the next milestones are `nativeInit`
-(seven arguments, one of them a `float*` — watch for VFPv2 being needed the
-moment the engine touches floating point) and then the first `nativeRender`
-tick, which is where the two numbers get measured.
+1. Look for callers of `startClet` / `StartCletProcess` in the binary and see
+   which one `nativeInit` is supposed to reach. `DelegateCall_startClet` is a
+   delegate trampoline — find what invokes it.
+2. Check whether the path goes through a Java method that our JNI layer answers
+   with a zero. `jni_report` lists every method the guest calls with its count;
+   a method returning 0 where the engine expects non-zero is exactly how a
+   branch gets silently not taken.
+3. `--watch=ADDR` on `g_StartCletCnt` (`0x0114e184`) would show whether anything
+   even writes it.
+4. `nativeInit` runs 188339 instructions and the profile attributes them; look
+   at what it *does* reach near the end and compare against the Vita port's
+   Corrida log, which documents this same region of the boot.
+
+Once a timer is registered, `nativeRender` starts doing real work and the two
+numbers this spike exists for become measurable: instructions retired per frame,
+draw calls per frame, and host crossings per frame. `--frames=N` reports all
+three, reset per frame.
 
 ## A map of the bugs found so far
 
@@ -237,6 +255,31 @@ Worth reading as a list of *classes*, because they recur. All are in
     ever routed — while the report blamed the functions rather than the
     dispatcher.
 
+**Instruction-set semantics, continued**
+
+17. Thumb format 11 (SP-relative load/store) takes Rd from **bits[10:8]**, not
+    bits[2:0] like formats 9 and 10 which share its `case`. So
+    `ldr r1, [sp, #20]` (0x9905) wrote r5 — and r5 held the GOT base, so the
+    failure surfaced thousands of instructions later as a load through a
+    garbage address. Found by diffing every change of r5 in a full register
+    trace, which is the only way to see it: the instruction looks innocent in
+    any trace that prints PCs alone.
+18. The ARM branch target is **PC + 8** + offset, not PC + 4 + offset. `next` is
+    the *link* value; using it for both puts every ARM branch 4 bytes short —
+    small enough to land inside a neighbouring instruction rather than fault.
+    It presented as `__divsf3` spinning for 49.8M instructions, 99.66% of the
+    profile. The oracle found it in one diff.
+19. A `va_list` is a **plain pointer to the argument list**, not the
+    `struct { void *__ap; }` AAPCS describes and not the flat
+    r0-r3-then-stack array the other formatting entry points take. Passing
+    `&args[2]` made the va_list's own pointer the first argument, shifting every
+    conversion by one; `%s` then copied from whatever integer was there until it
+    hit a NUL. That is how a call meant to produce "1.3.2" wrote 14 bytes over a
+    12-byte stack buffer and tripped the guest's stack canary, thousands of
+    instructions after the mistake. Settled by reading the guest's own frames:
+    for `"Android Wrapper v%s #%d"`, `[va_list]` held a pointer to a valid
+    string, which is only true if the arguments start *at* va_list.
+
 **Harness** (the ones that cost the most time, because they lie)
 
 15. The "returned to caller" sentinel was 0, which is also where a guest lands
@@ -257,7 +300,14 @@ Worth preserving; they are load-bearing for the next person.
   count rather than returning a plausible zero; `trap()` records the raw
   encoding. The worklist is generated by running, never guessed.
 * **Let the trap report drive the work.** Do not implement a whole instruction
-  class speculatively — run, read what actually traps, implement that.
+  class speculatively — run, read what actually traps, implement that. The same
+  applies one level up: `jni_report`'s Java-method list is the worklist for the
+  Java semantics, and it is generated by running, never guessed.
+* **When guest memory is corrupted and no guest instruction did it, suspect a
+  shim.** Guest stores are visible in the instruction trace; a shim's writes are
+  not, because the shim is host C the interpreter never sees. `--watch=ADDR`
+  logs host-side writes covering an address, which is how the canary corruption
+  was placed in one run after the instruction trace had ruled the guest out.
 * **Verify against the oracle immediately** after any decoder change.
 * **No premature abstraction.** The interpreter is a switch statement on
   purpose; the guest address space is one flat buffer with unchecked access
