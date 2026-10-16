@@ -434,9 +434,29 @@ int gl4es_dispatch(const char *name, const uint32_t *args, int nargs,
         if (logged < 4) {
             logged++;
             host_log("  [gl] glTexSubImage2D nargs=%d target=%04x level=%d "
-                     "x=%d y=%d w=%d h=%d format=%04x type=%04x px=%08x\n",
+                     "x=%d y=%d w=%d h=%d format=%04x type=%04x px=%08x "
+                     "caller=%08x\n",
                      nargs, a0, (int)a1, (int)a2, (int)a3, (int)a4,
-                     (int)a5, a6, a7, a8);
+                     (int)a5, a6, a7, a8, g_cpu.r[14]);
+        }
+        /* SGL_FrameBufferToScreen calls this twice: once with the real format
+         * and type (GL_RGB / GL_UNSIGNED_SHORT_5_6_5, matching the 384x256
+         * surface it just uploaded) and once with both set to -1, from the same
+         * code path and with the same pixel pointer. gl4es rejects -1 with
+         * "unsupported pixel format" and aborts the conversion, which kills the
+         * run. Nothing in GLES1 defines -1 as meaningful here, so the likeliest
+         * reading is "no format, nothing to upload" -- a path Android never
+         * takes. Treating it as a no-op is a probe, not a conclusion: if the
+         * screen comes up, it was right; if it stays black, the upload mattered
+         * and the format has to be recovered from the preceding call. */
+        if (a6 == 0xFFFFFFFFu || a7 == 0xFFFFFFFFu) {
+            static int warned;
+            if (!warned) {
+                warned = 1;
+                host_log("  [gl] glTexSubImage2D with format/type = -1 from "
+                         "%08x -- treating as a no-op\n", g_cpu.r[14]);
+            }
+            return 1;
         }
         gl4es_glTexSubImage2D(a0, (int32_t)a1, (int32_t)a2, (int32_t)a3,
                               (int32_t)a4, (int32_t)a5, a6, a7, G(a8));

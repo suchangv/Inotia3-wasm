@@ -19,6 +19,13 @@
 #include "jni.h"
 #include "gl.h"
 
+#ifndef WASM_FREESTANDING
+/* The file I/O shims below are real stdio. The freestanding wasm build -- the
+ * throughput measurement -- has no filesystem and does not need one; the
+ * browser and desktop builds both do. */
+#include <stdio.h>
+#endif
+
 /* ========================================================================== */
 /* Guest heap: first-fit free list with forward coalescing.                    */
 /* ========================================================================== */
@@ -347,6 +354,74 @@ static int count_args(const char *fmt)
     }
     return n;
 }
+
+/* ========================================================================== */
+/* File I/O                                                                    */
+/* ========================================================================== */
+#ifndef WASM_FREESTANDING
+
+/* The guest's FILE* is a 32-bit value it treats as opaque, so it gets a small
+ * handle table rather than a host pointer. The host side is real stdio: under
+ * emscripten the engine's files are preloaded into MEMFS, so fopen finds them
+ * as ordinary files, and on the desktop build they are ordinary files.
+ *
+ * This matters more than it looks. Without it the engine boots, runs its state
+ * machine and draws -- with nothing to draw, because every asset it asks for
+ * comes back NULL. A black screen is the *correct* output of a working engine
+ * with no data, which is exactly why it has to be told apart from a broken
+ * renderer before chasing the renderer.
+ */
+#define FIOMAX 64
+static FILE *g_files[FIOMAX];
+static char  g_file_path[FIOMAX][256];
+static char  g_path_buf[512];
+
+static void guest_path(uint32_t addr, char *out, size_t cap)
+{
+    size_t i = 0;
+    out[0] = 0;
+    if (!addr || addr >= GUEST_MEM_SIZE) return;
+    if (cap > GUEST_MEM_SIZE - addr) cap = GUEST_MEM_SIZE - addr;
+    for (; i + 1 < cap; i++) {
+        char c = (char)g_mem[addr + i];
+        out[i] = c;
+        if (!c) return;
+    }
+    out[cap - 1] = 0;
+}
+
+static uint32_t file_handle(FILE *f, const char *path)
+{
+    for (int i = 1; i < FIOMAX; i++) {
+        if (!g_files[i]) {
+            g_files[i] = f;
+            size_t n = strlen(path);
+            if (n > 255) n = 255;
+            memcpy(g_file_path[i], path, n);
+            g_file_path[i][n] = 0;
+            return (uint32_t)i;
+        }
+    }
+    return 0;
+}
+
+static FILE *file_of(uint32_t h)
+{
+    return (h > 0 && h < FIOMAX) ? g_files[h] : NULL;
+}
+
+/* Log the first few opens so the worklist is the engine's own, not a guess --
+ * the same principle as the import and Java-method reports. */
+static void note_open(const char *path, int ok)
+{
+    static int logged;
+    if (logged < 40) {
+        logged++;
+        host_log("  [io] open %-52s %s\n", path, ok ? "ok" : "FAILED");
+    }
+}
+
+#endif /* !WASM_FREESTANDING */
 
 /* ========================================================================== */
 /* Guest-write watchpoint                                                      */
@@ -756,12 +831,78 @@ void host_import_call(guest_import *im)
     case IMPL_mmap:   R[0] = host_guest_mmap(a1); break;
     case IMPL_munmap: R[0] = 0; break;
 
-    /* ---- file I/O: the asset path ----
-     * This is where the game reads its 926 asset files, so it is required to
-     * reach a title screen -- but it is not required to measure the boot path,
-     * and the browser host will answer it from fetch()/IDBFS rather than from
-     * a filesystem. Left on the worklist deliberately.
-     */
+    /* ---- file I/O ---- */
+#ifndef WASM_FREESTANDING
+    case IMPL_fopen: {
+        guest_path(a0, g_path_buf, sizeof(g_path_buf));
+        const char *mode = a1 ? (const char *)g_mem + a1 : "rb";
+        FILE *f = fopen(g_path_buf, mode);
+        note_open(g_path_buf, f != NULL);
+        R[0] = f ? file_handle(f, g_path_buf) : 0;
+        break;
+    }
+    case IMPL_fclose: {
+        FILE *f = file_of(a0);
+        if (f) { fclose(f); g_files[a0] = NULL; }
+        R[0] = 0;
+        break;
+    }
+    case IMPL_fread: {
+        /* fread(void *ptr, size_t size, size_t nmemb, FILE *stream) */
+        FILE *f = file_of(a3);
+        R[0] = (f && a0) ? (uint32_t)fread(g_mem + a0, a1, a2, f) : 0;
+        break;
+    }
+    case IMPL_fwrite: {
+        FILE *f = file_of(a3);
+        R[0] = (f && a0) ? (uint32_t)fwrite(g_mem + a0, a1, a2, f) : 0;
+        break;
+    }
+    case IMPL_fseek: {
+        FILE *f = file_of(a0);
+        R[0] = f ? (uint32_t)fseek(f, (long)(int32_t)a1, (int)a2) : (uint32_t)-1;
+        break;
+    }
+    case IMPL_open: {
+        guest_path(a0, g_path_buf, sizeof(g_path_buf));
+        /* Host and guest both speak stdio; O_RDONLY etc. are compatible
+         * enough that "open for read" is all this needs to decide. */
+        FILE *f = fopen(g_path_buf, "rb");
+        note_open(g_path_buf, f != NULL);
+        /* Returns 0 on failure, not -1. That is wrong for open(2) -- 0 is a
+         * valid descriptor -- but it is what this port did before there was a
+         * file layer at all, and the engine's boot depends on it: with a
+         * correct -1 the engine takes its "file missing" branch and dies
+         * calling through a data address. Left as 0 deliberately, and flagged,
+         * until that branch is understood. */
+        R[0] = f ? file_handle(f, g_path_buf) : 0;
+        break;
+    }
+    case IMPL_close: {
+        FILE *f = file_of(a0);
+        if (f) { fclose(f); g_files[a0] = NULL; }
+        R[0] = 0;
+        break;
+    }
+    case IMPL_read: {
+        FILE *f = file_of(a0);
+        R[0] = (f && a1) ? (uint32_t)fread(g_mem + a1, 1, a2, f) : (uint32_t)-1;
+        break;
+    }
+    case IMPL_write: {
+        FILE *f = file_of(a0);
+        R[0] = (f && a1) ? (uint32_t)fwrite(g_mem + a1, 1, a2, f) : (uint32_t)-1;
+        break;
+    }
+    case IMPL_lseek: {
+        FILE *f = file_of(a0);
+        if (!f) { R[0] = (uint32_t)-1; break; }
+        int whence = (a2 == 0) ? SEEK_SET : (a2 == 1) ? SEEK_CUR : SEEK_END;
+        if (fseek(f, (long)(int32_t)a1, whence) != 0) { R[0] = (uint32_t)-1; break; }
+        R[0] = (uint32_t)ftell(f);
+        break;
+    }
+#endif
 
     /* ---- formatting ---- */
     case IMPL_snprintf:

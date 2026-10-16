@@ -367,8 +367,20 @@ int main(int argc, char **argv)
 #if defined(WASM_FREESTANDING) || defined(__EMSCRIPTEN__)
     (void)argc; (void)argv;
     do_boot = 1;
+    /* Enough for the state machine to get somewhere. It is timer-driven at
+     * ~66 ms, so 30 frames is under a second of game time -- barely past the
+     * first tick. The browser build reads the real frame count from a global
+     * the page can set, so a screenshot run can ask for more without a
+     * rebuild. */
     if (frames < 2)
-        frames = 30;
+        frames = 600;
+#ifdef __EMSCRIPTEN__
+    {
+        extern int g_browser_frames;
+        if (g_browser_frames > 0)
+            frames = g_browser_frames;
+    }
+#endif
 #ifdef __EMSCRIPTEN__
     /* The browser build reads the image from its own filesystem. */
     if (!path)
@@ -444,6 +456,8 @@ int main(int argc, char **argv)
     /* The browser build has a real renderer. The context has to exist before
      * gl4es initialises -- with NOEGL nothing else can tell it the surface
      * size -- and gl4es has to be up before any guest GL call arrives. */
+    host_browser_set_size(SCREEN_W, SCREEN_H);
+    host_browser_read_frames();
     host_browser_gl_setup();
     gl4es_bridge_init(SCREEN_W, SCREEN_H);
 #endif

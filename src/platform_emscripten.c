@@ -105,6 +105,22 @@ void host_install_crash_handler(void) { }
  * JS task ends, so there is no swap call anywhere -- rendering during a
  * requestAnimationFrame callback is the whole protocol.
  */
+static int g_fb_w = 960, g_fb_h = 544;
+
+/* How many frames to run, overridable from the page (Module.spikeFrames).
+ * Reading it needs a value in wasm memory the JS side can write, since
+ * exported globals are not directly addressable from the shell. */
+int g_browser_frames;
+EM_JS(void, spike_read_frames_js, (void), {
+    if (typeof Module !== 'undefined' && Module.spikeFrames)
+        _spike_set_frames(Module.spikeFrames | 0);
+});
+void spike_set_frames(int n) { g_browser_frames = n; }
+
+void host_browser_read_frames(void) { spike_read_frames_js(); }
+
+void host_browser_set_size(int w, int h) { g_fb_w = w; g_fb_h = h; }
+
 int host_browser_gl_setup(void)
 {
     EmscriptenWebGLContextAttributes attr;
@@ -128,8 +144,15 @@ int host_browser_gl_setup(void)
         host_log("gl: could not create a WebGL context (%d)\n", (int)ctx);
         return 0;
     }
+    /* The canvas must be the size the engine thinks the screen is. Emscripten's
+     * generated shell sizes it to a default (a few hundred pixels), while
+     * WrapperJinterface.GetRealScreenWidth/Height tell the engine 960x544 --
+     * so glViewport(0, 0, 960, 544) would draw almost entirely outside the
+     * canvas and the page would stay black however correct the rendering is. */
+    emscripten_set_canvas_element_size("#canvas", g_fb_w, g_fb_h);
+
     emscripten_webgl_make_context_current(ctx);
-    host_log("gl: WebGL context ready\n");
+    host_log("gl: WebGL context ready, canvas %dx%d\n", g_fb_w, g_fb_h);
     return 1;
 }
 

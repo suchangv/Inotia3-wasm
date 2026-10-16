@@ -23,6 +23,13 @@ void host_install_crash_handler(void);
  * Returns 0 if the context could not be created. */
 int host_browser_gl_setup(void);
 
+/* Tell the browser build what size the engine believes the screen is, before
+ * the canvas is created. */
+void host_browser_set_size(int w, int h);
+
+/* Browser build only: let the page choose the frame count. */
+void host_browser_read_frames(void);
+
 /* Per-instruction trace sink, written from inside the interpreter loop.
  * Format is a contract with tools/oracle.py. */
 void host_trace_open(const char *path);
