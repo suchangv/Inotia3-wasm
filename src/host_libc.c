@@ -209,10 +209,25 @@ static char *scratch_next(void)
 static const char *guest_str(uint32_t addr, size_t max)
 {
     char *out = scratch_next();
-    if (!addr)
-        return "(null)";
+    if (!addr || addr >= GUEST_MEM_SIZE) {
+        out[0] = 0;
+        return addr ? "(bad ptr)" : "(null)";
+    }
+
+    /* The scan is bounded by the *buffer*, not by the caller's `max`: an
+     * address near the top of the guest space plus an offset would otherwise
+     * read past the end of linear memory. A host fault outside the guest space
+     * is what that looks like, several frames away from the call that caused
+     * it -- `strncmp` alone is 700 crossings a run and every one of them comes
+     * through here. */
+    size_t lim = GUEST_MEM_SIZE - addr;
+    if (lim > max)
+        lim = max;
+    if (lim > SCRATCH_SZ - 1)
+        lim = SCRATCH_SZ - 1;
+
     size_t i = 0;
-    for (; i < max - 1 && i < GUEST_MEM_SIZE; i++) {
+    for (; i + 1 < lim; i++) {
         char c = (char)g_mem[addr + i];
         out[i] = c;
         if (!c)
@@ -463,7 +478,7 @@ static FILE *file_of(uint32_t h)
 static void note_open(const char *path, int ok)
 {
     static int logged;
-    if (logged < 40) {
+    if (logged < 400) {
         logged++;
         host_log("  [io] open %-52s %s\n", path, ok ? "ok" : "FAILED");
     }
@@ -537,6 +552,14 @@ void host_import_call(guest_import *im)
     R[0] = 0;
     R[1] = 0;
 
+    /* Name every crossing, so a host fault inside one has a location. The same
+     * reason the browser build traces GL entry points by name: a SIGSEGV in a
+     * shim reports the guest PC of the *call*, not which import was running. */
+    {
+        static int n;
+        if (n < 4000) { n++; host_log("  [imp] %s\n", im->name); }
+    }
+
     /* JNI table entries arrive through the same mechanism as everything else:
      * the guest branched to a BKPT stub and the interpreter derived its index
      * from the stub address. Nothing here needs to know that. */
@@ -597,7 +620,21 @@ void host_import_call(guest_import *im)
     case IMPL_strlen:  R[0] = guest_str_ok(a0, GUEST_MEM_SIZE - a0, "strlen")
             ? (uint32_t)strlen((const char *)(g_mem + a0)) : 0; break;
     case IMPL_strcmp:  R[0] = (uint32_t)(int32_t)strcmp(guest_str(a0, 4096), guest_str(a1, 4096)); break;
-    case IMPL_strncmp: R[0] = (uint32_t)(int32_t)memcmp(guest_str(a0, a2 + 1), guest_str(a1, a2 + 1), a2); break;
+    case IMPL_strncmp: {
+        /* Stopping at the first difference or NUL is strncmp's whole contract,
+         * and it is also what keeps this in bounds: memcmp'ing a caller-supplied
+         * n over two 8 KB scratch buffers reads straight past them for any n
+         * above 8192. The engine passes sizes like 0x0a0f6a here. */
+        const char *x = guest_str(a0, a2 + 1);
+        const char *y = guest_str(a1, a2 + 1);
+        size_t n = a2, i = 0;
+        R[0] = 0;
+        for (; i < n; i++) {
+            if (x[i] != y[i]) { R[0] = (uint32_t)(int32_t)((uint8_t)x[i] - (uint8_t)y[i]); break; }
+            if (!x[i]) break;
+        }
+        break;
+    }
     case IMPL_strcpy: {
         const char *s = guest_str(a1, 4096);
         size_t n = strlen(s) + 1;
@@ -611,7 +648,8 @@ void host_import_call(guest_import *im)
         size_t n = strlen(s);
         if (n > a2) n = a2;
         watch_check("strncpy", a0, a2);
-        if (a0) { memcpy(g_mem + a0, s, n); memset(g_mem + a0 + n, 0, a2 - n); }
+        if (a0 && guest_ok(a0, a2, "strncpy"))
+            { memcpy(g_mem + a0, s, n); memset(g_mem + a0 + n, 0, a2 - n); }
         R[0] = a0;
         break;
     }
@@ -972,6 +1010,12 @@ void host_import_call(guest_import *im)
     case IMPL_fread: {
         /* fread(void *ptr, size_t size, size_t nmemb, FILE *stream) */
         FILE *f = file_of(a3);
+        static int n;
+        if (n < 10) {
+            n++;
+            host_log("  [io] fread ptr=%08x size=%u nmemb=%u -> %s\n",
+                     a0, a1, a2, f ? "ok" : "BAD HANDLE");
+        }
         R[0] = (f && a0) ? (uint32_t)fread(g_mem + a0, a1, a2, f) : 0;
         break;
     }
@@ -1008,6 +1052,12 @@ void host_import_call(guest_import *im)
     }
     case IMPL_read: {
         FILE *f = file_of(a0);
+        static int n;
+        if (n < 10) {
+            n++;
+            host_log("  [io] read fd=%u buf=%08x len=%u -> %s\n", a0, a1, a2,
+                     f ? "ok" : "BAD FD");
+        }
         R[0] = (f && a1) ? (uint32_t)fread(g_mem + a1, 1, a2, f) : (uint32_t)-1;
         break;
     }

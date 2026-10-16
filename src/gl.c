@@ -17,6 +17,10 @@
 #include "cpu.h"
 #include "compat.h"
 
+#ifndef WASM_FREESTANDING
+#include <stdio.h>   /* the framebuffer dump below is a debugging aid */
+#endif
+
 uint64_t g_gl_draw_calls;
 uint64_t g_gl_textures_created;
 uint64_t g_gl_tex_uploads;
@@ -261,6 +265,59 @@ void gl_host_call(const char *name, const uint32_t *args, int nargs,
                      is_sub ? args[8] : args[8]);
         }
     }
+    /* Dump the first full-surface upload to a raw file.
+     *
+     * The engine composites its 2D scene itself and hands the result to GL as a
+     * 384x256 texture. "It is drawing" and "it is drawing something" are
+     * different claims, and this is what separates them: the pixels are in guest
+     * memory right here, so they can be looked at without a working renderer, a
+     * browser, or a GL stack at all. */
+#ifndef WASM_FREESTANDING
+    /* Only for the two upload entry points. This block used to run for every GL
+     * call, reading args[8] as a pixel pointer and args[3]/args[4] as dimensions
+     * -- which for, say, glTexCoordPointer(2, GL_FIXED, 0, ptr) means reading
+     * guest memory at whatever happens to be in that stack slot. That is a host
+     * fault several frames later, indistinguishable from an engine bug. */
+    if (strcmp(name, "glTexImage2D") == 0 ||
+        strcmp(name, "glTexSubImage2D") == 0) {
+        static int dumped;
+        int is_sub = strcmp(name, "glTexSubImage2D") == 0;
+        int w = (int)(is_sub ? args[4] : args[3]);
+        int h = (int)(is_sub ? args[5] : args[4]);
+        uint32_t px = args[8];
+        /* Every upload, with its size and how much of it is non-zero. The
+         * question this answers: does the asset pipeline deliver real pixels to
+         * GL at all? If the PNG-derived textures are non-black and the 384x256
+         * surface is not, the renderer is fine and the compositing is not. */
+        if (px && w > 0 && h > 0 && w <= 2048 && h <= 2048 && dumped < 24) {
+            const uint16_t *q = (const uint16_t *)(g_mem + px);
+            uint32_t nz = 0;
+            long n = (long)w * h;
+            for (long i = 0; i < n; i++)
+                if (q[i]) nz++;
+            host_log("  [tex] %-18s %4dx%-4d %s caller=%08x  nonblack=%u/%ld\n",
+                     name, w, h, is_sub ? "sub" : "full",
+                     g_cpu.r[14], nz, n);
+        }
+        if (dumped < 12 && px && w >= 256 && h >= 192) {
+            dumped++;
+            char path[64];
+            snprintf(path, sizeof(path), "fb%03d.raw", dumped);
+            FILE *f = fopen(path, "wb");
+            if (f) {
+                fwrite(g_mem + px, 1, (size_t)w * h * 2, f);
+                fclose(f);
+                uint32_t nz = 0;
+                const uint16_t *q = (const uint16_t *)(g_mem + px);
+                for (int i = 0; i < w * h; i++)
+                    if (q[i]) nz++;
+                host_log("dumped %s %dx%d, %u/%d non-black\n",
+                         path, w, h, nz, w * h);
+            }
+        }
+    }
+#endif
+
     if (strcmp(name, "glTexImage2D") == 0 ||
         strcmp(name, "glTexSubImage2D") == 0 ||
         strcmp(name, "glCompressedTexImage2D") == 0 ||

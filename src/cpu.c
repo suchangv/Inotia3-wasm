@@ -700,6 +700,19 @@ int cpu_run(uint32_t entry, uint32_t sp, uint64_t budget)
 
         /* ================= ARM =================
          *
+         * Running ARM code inside the import stub page means something reached
+         * a stub without the interworking bit: `ldr pc, [ip]` takes the
+         * instruction set from bit 0 of the loaded value, so a slot written
+         * without |1 lands here in ARM state, where the BKPT marker is not a
+         * BKPT and the decoder executes stub padding as instructions. */
+        if (pc >= GUEST_STUB_BASE && pc < GUEST_STUB_BASE + IMPORT_MAX * 4u) {
+            static int n;
+            if (n++ < 4)
+                host_log("cpu: ARM state at stub page %08x (lr=%08x) -- a GOT "
+                         "slot is missing the interworking bit\n", pc, g_cpu.r[14]);
+            return trap(pc, pc, 4);
+        }
+        /*
          * ARM is 3.8% of the code bytes but cannot be skipped, for a reason
          * that has nothing to do with that ratio: libgame.so's .plt is ARM
          * code. Every imported function -- all 178 of them -- is reached by a

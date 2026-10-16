@@ -617,9 +617,9 @@ int jni_host_call(const char *name, uint32_t *args, int nargs, uint32_t *ret_lo,
                     static int logged;
                     if (logged < 20) {
                         logged++;
-                        host_log("  [assets] %-40s %s%s\n", entry,
+                        host_log("  [assets] %-40s %s%s caller=%08x\n", entry,
                                  found ? "NOT FOUND" : "offset",
-                                 found ? "" : "");
+                                 found ? "" : "", g_cpu.r[14]);
                         if (!found)
                             host_log("           offset=%u length=%u\n",
                                      asset_off, asset_len);

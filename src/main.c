@@ -782,7 +782,7 @@ int main(int argc, char **argv)
 
     /* ---- report ---- */
     if (do_profile)
-        report_profile(20);
+        report_profile(60);
     timers_report();
     imports_report(20);
     jni_report(15);
