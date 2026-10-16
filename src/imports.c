@@ -102,6 +102,11 @@ static const known_import g_known[] = {
     { "cos",                   IMPL_cos,          0, 0 },
     { "pow",                   IMPL_pow,          0, 0 },
     { "__isinf",               IMPL_isinf,        0, 0 },
+    /* libpng's error path is built on these; without them png_error() returns
+     * to its caller instead of unwinding, and the engine spins in png_error
+     * forever. See host_setjmp() in host_libc.c. */
+    { "setjmp",                IMPL_setjmp,       0, 0 },
+    { "longjmp",               IMPL_longjmp,      0, 0 },
 
     /* --- threads: real on native, cooperative in the browser (see docs) --- */
     { "pthread_mutex_init",        IMPL_pthread_mutex_init,    0, 0 },

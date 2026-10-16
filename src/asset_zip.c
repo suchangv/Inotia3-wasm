@@ -50,6 +50,12 @@ int asset_zip_find(FILE *f, const char *entry_name, uint32_t *out_offset,
     (void)f; (void)entry_name; (void)out_offset; (void)out_length;
     return 1;
 }
+
+const char *host_apk_path(void)
+{
+    /* No filesystem here; the path is only ever formatted, never opened. */
+    return ASSET_ARCHIVE;
+}
 #else
 
 /* --- little-endian readers over a byte buffer ----------------------------- */
@@ -171,6 +177,28 @@ int asset_zip_find(FILE *f, const char *entry_name, uint32_t *out_offset,
     if (result)
         host_log("assets: %s not found in the archive\n", entry_name);
     return result;
+}
+
+/* The archive's location: the engine asks for "assets.apk" bare, which is a
+ * CWD-relative name that only resolves when the process runs where the archive
+ * happens to sit. Probed here -- once per call, cheap -- so that GetApkFilePath
+ * and the GetFullPathName hook hand down a path the *next* fopen in the chain
+ * (after ParseOffsetAndLengthAndPath has reduced "@off|len|<path>" to just
+ * <path>) can actually open. The cost is the same three probes the callers
+ * used to do, now in exactly one place. */
+const char *host_apk_path(void)
+{
+    static const char *k_archive[] = {
+        ASSET_ARCHIVE, "game/" ASSET_ARCHIVE, "/" ASSET_ARCHIVE, 0
+    };
+    for (int i = 0; k_archive[i]; i++) {
+        FILE *f = fopen(k_archive[i], "rb");
+        if (f) {
+            fclose(f);
+            return k_archive[i];
+        }
+    }
+    return k_archive[0];
 }
 
 #endif /* !WASM_FREESTANDING */

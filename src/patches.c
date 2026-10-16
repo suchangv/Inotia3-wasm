@@ -221,6 +221,16 @@ void patches_apply(const guest_image *img)
                                 "host/File::GetFullPathName");
     patches_replace_with_import(img, "_ZN4File15GetFullPathNameEPKcPcm",
                                 "host/File::GetFullPathName");
+
+    /* --- ParseOffsetAndLengthAndPath -------------------------------------
+     *
+     * File::Open calls this to split "@<offset>|<length>|<path>" and rewrite
+     * the buffer to the bare path. The guest's own implementation in this
+     * build does not do that correctly (it leaves "@assets.ap" from
+     * "@6490388|148229|assets.apk"), so the host owns it, exactly as it owns
+     * GetFullPathName above. See host_libc.c. */
+    patches_replace_with_import(img, "_Z27ParseOffsetAndLengthAndPathPiPci",
+                                "host/ParseOffsetAndLengthAndPath");
 }
 
 /* Separate from patches_apply() because it depends on jni_guest_init(), which

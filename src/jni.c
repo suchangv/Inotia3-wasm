@@ -32,11 +32,9 @@
 #include "timers.h"
 #include "asset_zip.h"
 
-/* The archive the engine reads its assets out of, and where inside it they
- * live. The engine's own resource code decides the sub-path and appends the
- * extension (see asset_zip.c), so these three constants are the whole of this
- * port's opinion about the layout. */
-#define ASSET_ARCHIVE "assets.apk"
+/* The archive the engine reads its assets out of, and where inside them they
+ * live. The archive's *path* comes from host_apk_path() -- see asset_zip.c --
+ * because which of the candidate locations exists varies by build. */
 #define ASSET_PREFIX  "assets/common/game_res/"
 #define ASSET_SUFFIX  ".jpg"
 
@@ -552,11 +550,16 @@ int jni_host_call(const char *name, uint32_t *args, int nargs, uint32_t *ret_lo,
                     strcmp(n, "GetBundlePath") == 0 ||
                     strcmp(n, "GetResourcePath") == 0) {
                     /* The engine reads its assets out of this file at byte
-                     * offsets (mode 2's "@offset|length|path"), so it has to be
-                     * the real archive, not a directory. One constant path for
-                     * every asset is exactly what Android does and what makes
-                     * jGetApkFilePath's own caching harmless. */
-                    *ret_lo = jni_host_new_string(ASSET_ARCHIVE);
+                     * offsets (mode 2's "@offset|length|path"), so it has to
+                     * be the real archive, not a directory. One constant path
+                     * for every asset is exactly what Android does and what
+                     * makes jGetApkFilePath's own caching harmless. The path
+                     * must also be one this host can open: File::Open's next
+                     * fopen is on the bare path, after
+                     * ParseOffsetAndLengthAndPath has stripped the "@off|len|"
+                     * prefix, so an openable path here is what makes that
+                     * fopen succeed. */
+                    *ret_lo = jni_host_new_string(host_apk_path());
                     st->implemented = 1; return 1;
                 }
                 if (strcmp(n, "GetFileDescriptor") == 0) {
@@ -603,16 +606,8 @@ int jni_host_call(const char *name, uint32_t *args, int nargs, uint32_t *ret_lo,
                     uint32_t asset_off = 0, asset_len = 0;
 #else
                     uint32_t asset_off = 0, asset_len = 0;
-                    /* The archive's location differs by build: the browser has
-                     * it preloaded at the filesystem root, the desktop build
-                     * keeps it beside the .so. Trying the candidates is simpler
-                     * than threading a build-time path through. */
-                    static const char *k_archive[] = {
-                        ASSET_ARCHIVE, "game/" ASSET_ARCHIVE, "/" ASSET_ARCHIVE, 0
-                    };
-                    FILE *apk = NULL;
-                    for (int i = 0; k_archive[i] && !apk; i++)
-                        apk = fopen(k_archive[i], "rb");
+                    /* One place decides where the archive is; see asset_zip.c. */
+                    FILE *apk = fopen(host_apk_path(), "rb");
                     int found = apk ? asset_zip_find(apk, entry, &asset_off,
                                                      &asset_len) : 1;
                     if (apk)

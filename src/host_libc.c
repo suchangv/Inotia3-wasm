@@ -25,6 +25,7 @@
  * throughput measurement -- has no filesystem and does not need one; the
  * browser and desktop builds both do. */
 #include <stdio.h>
+#include <stdlib.h>
 #include <sys/stat.h>
 #include <sys/types.h>
 #endif
@@ -128,6 +129,73 @@ static void heap_free(uint32_t ptr)
 
 uint32_t guest_heap_alloc(uint32_t n) { return heap_alloc(n); }
 
+/* ========================================================================== */
+/* setjmp / longjmp                                                            */
+/* ========================================================================== */
+
+/*
+ * These are imported by the guest, so the guest calls them through the PLT
+ * like any bionic function. The interpreter already hands a normal import call
+ * back to the caller through R[14], and that is all longjmp needs: rewrite the
+ * callee-saved registers, SP and R[14], and the existing return path resumes
+ * at the setjmp call site with R[0] holding the value.
+ *
+ * What it pins down: the C library's setjmp/longjmp are the only way libpng
+ * can unwind out of png_error(). With them stubbed to "return 0" the error
+ * handler returned into png_error(), which called longjmp() again, forever --
+ * three billion instructions inside a 300-byte function. The saved contexts
+ * live on the host, not in the guest's jmp_buf: the guest only ever passes the
+ * buffer's address around, and bionic's private layout is not something this
+ * port needs to reproduce.
+ */
+#define JMP_MAX 64
+typedef struct {
+    uint32_t buf;
+    uint32_t r[8];      /* r4-r11, the AAPCS callee-saved set */
+    uint32_t sp;
+    uint32_t lr;        /* return address, thumb bit included */
+} jmp_ctx;
+static jmp_ctx g_jmp[JMP_MAX];
+static int     g_jmp_n;
+
+static uint32_t host_setjmp(uint32_t buf)
+{
+    if (g_jmp_n >= JMP_MAX) {
+        /* Losing a frame here would be a silent unwind into the wrong place,
+         * so say so instead of overwriting the oldest one. */
+        host_fatal("setjmp: %d nested contexts, cannot save another\n", JMP_MAX);
+        return 0;
+    }
+    jmp_ctx *c = &g_jmp[g_jmp_n++];
+    c->buf = buf;
+    for (int i = 0; i < 8; i++)
+        c->r[i] = g_cpu.r[4 + i];
+    c->sp = g_cpu.r[13];
+    c->lr = g_cpu.r[14];
+    return 0;
+}
+
+static void host_longjmp(uint32_t buf, uint32_t value)
+{
+    int i;
+    for (i = g_jmp_n - 1; i >= 0; i--)
+        if (g_jmp[i].buf == buf)
+            break;
+    if (i < 0)
+        host_fatal("longjmp: no setjmp for buffer %08x\n", buf);
+    jmp_ctx *c = &g_jmp[i];
+    for (int k = 0; k < 8; k++)
+        g_cpu.r[4 + k] = c->r[k];
+    g_cpu.r[13] = c->sp;
+    /* The return path in cpu.c takes the next PC from R[14], so restoring it
+     * is what makes longjmp land back at the setjmp call site. */
+    g_cpu.r[14] = c->lr;
+    g_cpu.r[0] = value ? value : 1;
+    /* The context is consumed: everything newer than it was abandoned by the
+     * unwind. */
+    g_jmp_n = i;
+}
+
 static uint32_t heap_usable(uint32_t ptr)
 {
     if (!ptr)
@@ -140,6 +208,7 @@ static uint32_t heap_usable(uint32_t ptr)
  * its definition. See the comment there. */
 void host_file_get_full_path_name(uint32_t name_ptr, uint32_t out_ptr,
                                   uint32_t out_size, uint32_t mode);
+void host_parse_offset_len_path(uint32_t out_ptr, uint32_t buf_ptr, uint32_t len);
 
 /* ========================================================================== */
 /* Guest pointer validation                                                    */
@@ -571,6 +640,10 @@ void host_import_call(guest_import *im)
         host_file_get_full_path_name(a0, a1, a2, extra_arg(4));
         return;
     }
+    if (strcmp(im->name, "host/ParseOffsetAndLengthAndPath") == 0) {
+        host_parse_offset_len_path(a0, a1, a2);
+        return;
+    }
 
     /* JNI table entries arrive through the same mechanism as everything else:
      * the guest branched to a BKPT stub and the interpreter derived its index
@@ -891,6 +964,8 @@ void host_import_call(guest_import *im)
         R[0] = (e == 0xff && !(x.u & 0x7fffff)) ? 1u : 0u;
         break;
     }
+    case IMPL_setjmp:  R[0] = host_setjmp(a0); break;
+    case IMPL_longjmp: host_longjmp(a0, a1); break;
 
     /* ---- threads ---- */
     /* Single-threaded for now: mutexes succeed and do nothing, and a thread
@@ -1112,13 +1187,22 @@ void host_import_call(guest_import *im)
     /* ---- formatting ---- */
     case IMPL_snprintf:
     case IMPL_sprintf: {
-        const char *fmt = guest_str(a1, 4096);
+        /* The two are not the same shape. snprintf takes a size between the
+         * buffer and the format -- snprintf(buf, size, fmt, ...) -- while
+         * sprintf has no size: sprintf(buf, fmt, ...). Reading the format
+         * from a1 for both fed snprintf's *size* (a small integer) to
+         * guest_str() as if it were a pointer, so every snprintf came back
+         * empty; then the path builders that glue those fragments together
+         * produced names like "/sdcard/Android/data/%s/files/%s" with the
+         * conversions never applied. */
+        int is_sn = (im->impl == IMPL_snprintf);
+        const char *fmt = guest_str(is_sn ? a2 : a1, 4096);
         int n = count_args(fmt);
         sink s;
-        s.dst = (im->impl == IMPL_snprintf) ? (char *)(g_mem + a0) : (char *)(g_mem + a0);
-        s.cap = (im->impl == IMPL_snprintf) ? a2 : 1u << 30;
+        s.dst = (char *)(g_mem + a0);
+        s.cap = is_sn ? a2 : 1u << 30;
         s.n = 0;
-        format(&s, fmt, &args[1], n + 4);
+        format(&s, fmt, &args[is_sn ? 3 : 2], n + 4);
         sink_ch(&s, 0);
         watch_check(im->name, a0, (uint32_t)s.n);
         R[0] = (uint32_t)s.n - 1;
@@ -1126,13 +1210,17 @@ void host_import_call(guest_import *im)
     }
     case IMPL_vsnprintf:
     case IMPL_vsprintf: {
-        const char *fmt = guest_str(a1, 4096);
+        /* Same split as snprintf/sprintf above: vsnprintf carries a size,
+         * vsprintf does not. */
+        int is_vsn = (im->impl == IMPL_vsnprintf);
+        const char *fmt = guest_str(is_vsn ? a2 : a1, 4096);
         int n = count_args(fmt);
         sink s;
         s.dst = (char *)(g_mem + a0);
-        s.cap = (im->impl == IMPL_vsnprintf) ? a2 : 1u << 30;
+        s.cap = is_vsn ? a1 : 1u << 30;
         s.n = 0;
         (void)n;
+        uint32_t ap = is_vsn ? a3 : a2;
 
         /* A va_list here is a plain pointer to the argument list in the
          * caller's frame -- NOT the `struct { void *__ap; }` the AAPCS
@@ -1151,7 +1239,7 @@ void host_import_call(guest_import *im)
          * string, which is only true if the arguments start *at* va_list. */
         uint32_t va_args[24];
         for (int i = 0; i < 24; i++)
-            va_args[i] = LD32(a2 + (uint32_t)i * 4u);
+            va_args[i] = LD32(ap + (uint32_t)i * 4u);
 
         format(&s, fmt, va_args, 24);
         sink_ch(&s, 0);
@@ -1166,7 +1254,11 @@ void host_import_call(guest_import *im)
         s.dst = NULL;   /* straight to the host log */
         s.cap = 0;
         s.n = 0;
-        format(&s, fmt, &args[1], n + 4);
+        /* The stream is argument 0 and the format is argument 1, so the
+         * conversions begin at argument 2. Starting at &args[1] fed the
+         * format pointer itself to the first `%…`, so a diagnostic like
+         * "libpng error: %s" printed the literal "%s" instead of the message. */
+        format(&s, fmt, &args[2], n + 4);
         break;
     }
 
@@ -1179,6 +1271,87 @@ void host_import_call(guest_import *im)
 }
 
 #ifndef WASM_FREESTANDING
+/* Offset and stored length of a logical asset name inside the archive. The
+ * engine names resources without the ".jpg" the archive stores them under
+ * ("MainMenu.png" -> "assets/common/game_res/MainMenu.png.jpg"), so both are
+ * tried. Returns 0 on success. The archive's location is host_apk_path() in
+ * asset_zip.c -- one place decides it, so the path handed back to the engine
+ * in the "@offset|length|path" form names the same file the lookup opened. */
+static int asset_lookup(const char *name, uint32_t *out_offset, uint32_t *out_length)
+{
+    FILE *f = fopen(host_apk_path(), "rb");
+    if (!f)
+        return 1;
+    char entry[256];
+    int r;
+    snprintf(entry, sizeof(entry), "assets/common/game_res/%s.jpg", name);
+    r = asset_zip_find(f, entry, out_offset, out_length);
+    if (r) {
+        snprintf(entry, sizeof(entry), "assets/common/game_res/%s", name);
+        r = asset_zip_find(f, entry, out_offset, out_length);
+    }
+    fclose(f);
+    return r;
+}
+
+/*
+ * ParseOffsetAndLengthAndPath(int *out, char *buf, int len) -- the host's
+ * replacement.
+ *
+ * File::Open calls this on a resolved "@<offset>|<length>|<path>" path. Its
+ * job is to read the two numbers and rewrite `buf` in place to hold only the
+ * path, which File::Open then open()s and mmaps at <offset> for <length>
+ * bytes. The guest implementation does exactly that on Android -- and this
+ * port needs it to, because those offset/length fields are the only reason
+ * the path is wrapped in the "@" form at all.
+ *
+ * The guest's own copy in this build does not: given
+ * "@6490388|148229|assets.apk" it leaves "@assets.ap" (verified from the open
+ * call), so the engine opens the wrong name and the mmap has no file. Since
+ * the guest function is exercised on every resource load and the transform is
+ * three lines, the host owns it here, the same way File::GetFullPathName
+ * above is owned.
+ *
+ * The log is bounded like every other diagnostic: this runs once per resource.
+ */
+void host_parse_offset_len_path(uint32_t out_ptr, uint32_t buf_ptr, uint32_t len)
+{
+    (void)len;
+    long off = 0, ln = 0;
+    char path[512];
+    path[0] = 0;
+
+    if (buf_ptr && buf_ptr < GUEST_MEM_SIZE) {
+        const char *s = (const char *)(g_mem + buf_ptr);
+        if (s[0] == '@') {
+            char *end;
+            off = strtol(s + 1, &end, 10);
+            if (*end == '|') {
+                ln = strtol(end + 1, &end, 10);
+                if (*end == '|') {
+                    size_t n = strlen(end + 1);
+                    if (n >= sizeof(path)) n = sizeof(path) - 1;
+                    memcpy(path, end + 1, n);
+                    path[n] = 0;
+                }
+            }
+        }
+    }
+
+    static int logged;
+    if (logged < 64) {
+        logged++;
+        host_log("  [parse] @%ld|%ld -> open \"%s\"\n", off, ln, path);
+    }
+
+    if (out_ptr) { ST32(out_ptr, (uint32_t)off); ST32(out_ptr + 4, (uint32_t)ln); }
+    if (buf_ptr && path[0]) {
+        size_t n = strlen(path);
+        memcpy(g_mem + buf_ptr, path, n + 1);
+    }
+    g_cpu.r[0] = path[0] ? 1 : 0;
+}
+
 /*
  * File::GetFullPathName(const char *name, char *out, unsigned out_size,
  *                       int mode) -- the host's replacement.
@@ -1215,27 +1388,31 @@ void host_file_get_full_path_name(uint32_t name_ptr, uint32_t out_ptr,
     char buf[1024];
     buf[0] = 0;
 
-    if (name[0] == '/' || strchr(name, ':') != NULL) {
-        /* Already resolved -- one of our own stubs' paths. It still has to
-         * carry the "@" form, or File::Open will not fill in its offset and
-         * length. The parent repository's Corrida 34 is exactly this fix. */
+    const char *apk = host_apk_path();
+
+    if (name[0] == '/' || strchr(name, ':') != NULL ||
+        (apk && apk[0] && strcmp(name, apk) == 0)) {
+        /* Already resolved -- one of our own stubs' paths, or the archive
+         * path the preceding ParseOffsetAndLengthAndPath left in the buffer
+         * for MMappedFile::Open to re-resolve. That second case is the one
+         * that bites: the resolved archive path is relative and has no ':',
+         * so without this test it falls through to the mode branches, which
+         * rebuild a path (<userdir>/game/assets.apk) that does not exist, and
+         * the mmap that follows has no file behind it -- libpng then decodes
+         * a buffer that was never filled and every texture comes out blank.
+         * It still has to carry the "@" form, or File::Open will not fill in
+         * its offset and length. The parent repository's Corrida 34 is this
+         * fix. */
         FILE *f = fopen(name, "rb");
         long len = 0;
         if (f) { fseek(f, 0, SEEK_END); len = ftell(f); fclose(f); }
         snprintf(buf, sizeof(buf), "@0|%ld|%s", len, name);
     } else if (mode == 2) {
-        char entry[256];
-        snprintf(entry, sizeof(entry), "assets/common/game_res/%s.jpg", name);
         uint32_t off = 0, len = 0;
-        FILE *apk = fopen("assets.apk", "rb");
-        if (!apk) apk = fopen("game/assets.apk", "rb");
-        if (!apk) apk = fopen("/assets.apk", "rb");
-        int found = apk ? asset_zip_find(apk, entry, &off, &len) : 1;
-        if (apk) fclose(apk);
-        if (found)
-            snprintf(buf, sizeof(buf), "@0|0|assets.apk");
+        if (asset_lookup(name, &off, &len) == 0)
+            snprintf(buf, sizeof(buf), "@%u|%u|%s", off, len, apk ? apk : "");
         else
-            snprintf(buf, sizeof(buf), "@%u|%u|assets.apk", off, len);
+            snprintf(buf, sizeof(buf), "@0|0|%s", apk ? apk : "");
     } else if (mode == 3) {
         snprintf(buf, sizeof(buf),
                  "/sdcard/Android/data/%s/files/%s",
@@ -1257,27 +1434,19 @@ void host_file_get_full_path_name(uint32_t name_ptr, uint32_t out_ptr,
      *
      * It has to produce the "@" form regardless of which branch got here: that
      * is the only thing that makes File::Open write its offset and length
-     * fields, and those are what the mmap that follows reads. */
+     * fields, and those are what the mmap that follows reads. And the path in
+     * that form is what File::Open then open()s, so it has to name a file the
+     * host can actually find -- the resolved archive path, not a bare
+     * "assets.apk" that only exists when the working directory happens to be
+     * the game directory. */
     if (!strchr(buf, '@')) {
         FILE *probe = fopen(buf, "rb");
         if (probe) {
             fclose(probe);
         } else {
-            char entry[256];
-            snprintf(entry, sizeof(entry), "assets/common/game_res/%s.jpg", name);
             uint32_t off = 0, len = 0;
-            FILE *apk = fopen("assets.apk", "rb");
-            if (!apk) apk = fopen("game/assets.apk", "rb");
-            if (!apk) apk = fopen("/assets.apk", "rb");
-            if (apk) {
-                /* EXPERIMENT: the engine turned "@6490388|148229|assets.apk"
-                 * into "@assets.ap" -- 10 characters, exactly what an 11-byte
-                 * destination buffer holds. Trying the bare path to see what
-                 * it opens then. */
-                if (asset_zip_find(apk, entry, &off, &len) == 0)
-                    snprintf(buf, sizeof(buf), "@%u|%u|assets.apk", off, len);
-                fclose(apk);
-            }
+            if (apk && asset_lookup(name, &off, &len) == 0)
+                snprintf(buf, sizeof(buf), "@%u|%u|%s", off, len, apk);
         }
     }
 

@@ -20,4 +20,15 @@ typedef struct _IO_FILE FILE;
 int asset_zip_find(FILE *f, const char *entry_name, uint32_t *out_offset,
                    uint32_t *out_length);
 
+/* The one archive every asset lives in. Defined in asset_zip.c; the JNI layer
+ * and the File::GetFullPathName hook both need it. */
+#define ASSET_ARCHIVE "assets.apk"
+
+/* Where that archive actually is on disk this run. Candidates differ by build
+ * (browser preloads at the filesystem root, the desktop build keeps it beside
+ * the .so), so the first candidate that opens wins -- and the same answer is
+ * what GetApkFilePath hands the engine, so every step of the
+ * @offset|length|path chain opens the file it names. Never NULL. */
+const char *host_apk_path(void);
+
 #endif /* ASSET_ZIP_H */

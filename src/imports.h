@@ -43,6 +43,7 @@ enum {
     IMPL_cxa_atexit, IMPL_aeabi_atexit, IMPL_cxa_finalize,
     IMPL_gettimeofday, IMPL_time, IMPL_nanosleep, IMPL_usleep, IMPL_sleep,
     IMPL_sin, IMPL_cos, IMPL_pow, IMPL_isinf,
+    IMPL_setjmp, IMPL_longjmp,
     IMPL_pthread_mutex_init, IMPL_pthread_mutex_lock, IMPL_pthread_mutex_unlock,
     IMPL_pthread_mutex_trylock, IMPL_pthread_mutex_destroy,
     IMPL_pthread_mutexattr_init, IMPL_pthread_mutexattr_settype,

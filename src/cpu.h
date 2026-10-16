@@ -29,6 +29,7 @@ enum {
     HALT_TRAP,         /* a valid instruction we deliberately do not emulate */
     HALT_BAD_PC,       /* PC left the loaded image */
     HALT_IMPORT,       /* stopped at a host crossing (oracle mode) */
+    HALT_BAD_MEM,      /* GUEST_CHECK only: an access left the guest space */
 };
 
 const char *cpu_halt_str(int reason);

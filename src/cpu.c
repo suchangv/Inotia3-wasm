@@ -31,6 +31,14 @@ uint32_t  g_fault_insn;
 int       g_fault_width;
 uint32_t  g_fault_r[16];
 
+/* Set by util.c's guest_* accessors when GUEST_CHECK catches an access outside
+ * the guest address space. The loop below turns it into a clean halt, so the
+ * report names the offending instruction instead of the host signal handler
+ * naming whatever address the raw load happened to touch. */
+#ifdef GUEST_CHECK
+int g_guest_check_fault;
+#endif
+
 static const guest_image *g_img;
 static int      g_thumb = 1;          /* the guest starts in Thumb state */
 static uint64_t g_budget;
@@ -276,6 +284,10 @@ int cpu_run(uint32_t entry, uint32_t sp, uint64_t budget)
     for (;;) {
         if (g_insn_count >= g_budget)
             return HALT_BUDGET;
+#ifdef GUEST_CHECK
+        if (g_guest_check_fault)
+            return HALT_BAD_MEM;
+#endif
 
         /* Emit the previous instruction now that its effects are in R.
          * Clearing g_have_prev here is what keeps cpu_trace_final() from
@@ -349,7 +361,11 @@ int cpu_run(uint32_t entry, uint32_t sp, uint64_t budget)
                 case 0: R[rd] = imm; set_nz(imm); break;
                 case 1: sub_c(R[rd], imm, 1); break;
                 case 2: R[rd] = add_c(R[rd], imm, 0); break;
-                default: sub_c(R[rd], imm, 1); break;
+                /* SUB immediate writes Rd -- unlike CMP it is not a compare.
+                 * Dropping the writeback here left `subs r3, #1` in a loop
+                 * counter doing nothing, so the loop ran to the end of the
+                 * guest address space before it faulted. */
+                default: R[rd] = sub_c(R[rd], imm, 1); break;
                 }
                 break;
 
@@ -403,7 +419,12 @@ int cpu_run(uint32_t entry, uint32_t sp, uint64_t budget)
                     uint32_t src = (rm == 15) ? (pc + 4) : R[rm];
                     switch ((ins >> 8) & 3) {
                     case 0: R[rd] += src; break;                /* ADD, no flags */
-                    case 1: R[rd] = sub_c(R[rd], src, 1); break;/* CMP, flags */
+                    /* CMP compares and discards: it must not write Rd. Rd is
+                     * the *high* register here (bit 7), so writing it clobbers
+                     * a live value -- `cmp r9, r4` zeroed r9 whenever the two
+                     * were equal, and the very next Use of r9 (the map header)
+                     * dereferenced NULL. sub_c already sets the flags. */
+                    case 1: sub_c(R[rd], src, 1); break;        /* CMP, flags */
                     case 2: R[rd] = src; break;                 /* MOV, no flags */
                     default: {                                  /* BX / BLX */
                         /* Bit 7 tells them apart, and the difference is LR:
@@ -755,9 +776,20 @@ int cpu_run(uint32_t entry, uint32_t sp, uint64_t budget)
                     /* MUL/MLA (bit22=0) and UMULL/UMLAL/SMULL/SMLAL (bit22=1) */
                     uint32_t acc = (ins >> 21) & 1, set = (ins >> 20) & 1;
                     if (!((ins >> 22) & 1)) {
+                        /* MUL/MLA. The destination lives in bits[19:16] -- the
+                         * data-processing Rn field -- while bits[15:12] is the
+                         * MLA accumulator (and zero for MUL). Reusing the
+                         * data-processing Rd (bits[15:12]) here wrote the
+                         * product into whatever register that field named
+                         * (almost always r0) and left the real destination
+                         * stale: __aeabi_uidivmod's `mul r3, r2, r0` clobbered
+                         * the quotient in r0 with the dividend, so the
+                         * remainder it returned was nonsense and zlib rejected
+                         * the perfectly valid PNG zlib header "78 da". */
+                        uint32_t rdm = rn;         /* bits[19:16] */
                         uint32_t r = R[rm] * R[rs];
-                        if (acc) r += R[rn];
-                        R[rd] = r;
+                        if (acc) r += R[rd];       /* bits[15:12] */
+                        R[rdm] = r;
                         if (set) set_nz(r);
                     } else {
                         uint64_t r;
@@ -826,6 +858,25 @@ int cpu_run(uint32_t entry, uint32_t sp, uint64_t budget)
                 continue;
             }
 
+            /* ---- CLZ (bits[27:20] = 0001 0110, rn = 1111, bits[11:4] = 0001) ----
+             *
+             * Encoded inside the data-processing space, so without this test it
+             * decodes as CMN r15, Rm: a compare whose result is thrown away and
+             * whose operands the next instruction then reads as if clz had
+             * written.  __udivsi3 is the caller that matters -- the compiler
+             * emits it for every `unsigned / unsigned` in the image, not just
+             * zlib's, and png_zalloc's overflow guard turns a bogus quotient of
+             * 0 into a silent NULL.  It is a one-line count, not a guess. */
+            if (op1 == 0 && ((ins >> 20) & 0xff) == 0x16 &&
+                rn == 15 && ((ins >> 4) & 0xff) == 0xf1) {
+                uint32_t v = R[ins & 0xf];
+                uint32_t n = 32;
+                while (v) { n--; v >>= 1; }
+                R[rd] = n;
+                pc = next;
+                continue;
+            }
+
             /* ---- data processing ---- */
             if (op1 == 0 || op1 == 1) {
                 uint32_t opcode = (ins >> 21) & 0xf;
@@ -862,37 +913,47 @@ int cpu_run(uint32_t entry, uint32_t sp, uint64_t budget)
                         return trap(pc, ins, 4);
                 }
 
-                /* add_c()/sub_c() write all four flags unconditionally -- they
-                 * are the flag-setting primitives. ARM's data-processing
-                 * instructions only write flags when S is set, so the incoming
-                 * flags are captured here and put back for the common case.
-                 * Without this, `add ip, pc, #0` in the PLT -- which has no S
-                 * bit -- silently clears the condition flags, and any later
-                 * conditional branch in the caller reads garbage. */
+                /* The carry that S=1 writes depends on the class of operation,
+                 * and it is not always shc. For the logical ones -- AND, EOR,
+                 * TST, TEQ, ORR, MOV, BIC, MVN -- C is the carry out of the
+                 * barrel shifter; for the arithmetic ones -- SUB, RSB, ADD,
+                 * ADC, SBC, RSC, CMP, CMN -- it is the carry out of the ALU,
+                 * which add_c()/sub_c() have already written into the CPSR.
+                 *
+                 * Blindly overwriting F_C with shc (the *incoming* carry for
+                 * the common no-shift operand) instead left `subs r2, r1, #1`
+                 * with the wrong carry, so __udivsi3's very first `blo` fired
+                 * and every unsigned division returned 0. */
                 uint32_t flags_in = g_cpu.cpsr & (F_N | F_Z | F_C | F_V);
                 uint32_t a = R[rn], res;
+                int logical = 0;
                 switch (opcode) {
-                case 0x0: res = a & op2; break;                       /* AND */
-                case 0x1: res = a ^ op2; break;                       /* EOR */
+                case 0x0: res = a & op2; logical = 1; break;          /* AND */
+                case 0x1: res = a ^ op2; logical = 1; break;          /* EOR */
                 case 0x2: res = sub_c(a, op2, 1); break;              /* SUB */
                 case 0x3: res = sub_c(op2, a, 1); break;              /* RSB */
                 case 0x4: res = add_c(a, op2, 0); break;              /* ADD */
                 case 0x5: res = add_c(a, op2, (g_cpu.cpsr & F_C) ? 1 : 0); break;
                 case 0x6: res = sub_c(a, op2, (g_cpu.cpsr & F_C) ? 1 : 0); break;
                 case 0x7: res = sub_c(op2, a, (g_cpu.cpsr & F_C) ? 1 : 0); break;
-                case 0x8: set_nz(a & op2); pc = next; continue;       /* TST */
-                case 0x9: set_nz(a ^ op2); pc = next; continue;       /* TEQ */
+                case 0x8: set_nz(a & op2);                            /* TST */
+                          g_cpu.cpsr = (g_cpu.cpsr & ~F_C) | shc;
+                          pc = next; continue;
+                case 0x9: set_nz(a ^ op2);                            /* TEQ */
+                          g_cpu.cpsr = (g_cpu.cpsr & ~F_C) | shc;
+                          pc = next; continue;
                 case 0xa: sub_c(a, op2, 1); pc = next; continue;      /* CMP */
                 case 0xb: add_c(a, op2, 0); pc = next; continue;      /* CMN */
-                case 0xc: res = a | op2; break;                       /* ORR */
-                case 0xd: res = op2; break;                           /* MOV */
-                case 0xe: res = a & ~op2; break;                      /* BIC */
-                default:  res = ~op2; break;                          /* MVN */
+                case 0xc: res = a | op2; logical = 1; break;          /* ORR */
+                case 0xd: res = op2; logical = 1; break;              /* MOV */
+                case 0xe: res = a & ~op2; logical = 1; break;         /* BIC */
+                default:  res = ~op2; logical = 1; break;             /* MVN */
                 }
                 R[rd] = res;
                 if (S) {
                     set_nz(res);
-                    g_cpu.cpsr = (g_cpu.cpsr & ~F_C) | shc;
+                    if (logical)
+                        g_cpu.cpsr = (g_cpu.cpsr & ~F_C) | shc;
                 } else {
                     g_cpu.cpsr = (g_cpu.cpsr & ~(F_N | F_Z | F_C | F_V)) | flags_in;
                 }
@@ -1053,6 +1114,7 @@ const char *cpu_halt_str(int reason)
     case HALT_TRAP:      return "unimplemented instruction (valid, not emulated)";
     case HALT_BAD_PC:    return "PC left the loaded image";
     case HALT_IMPORT:    return "stopped at host crossing (oracle mode)";
+    case HALT_BAD_MEM:   return "guest accessed outside its address space";
     default:             return "?";
     }
 }

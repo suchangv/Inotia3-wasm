@@ -34,7 +34,9 @@ diffed against this one instruction by instruction.
 | GLES1 renderer → WebGL2 | **not started** — the 6-10 week item |
 | Differential oracle | **working** — `tools/difftest.sh`, all entries identical |
 | Boot sequence | **completes** — ctors, JNI_OnLoad, nativePreInit, nativeInit, both resumes, nativeRender |
-| First real frame | **blocked** — startClet never runs, so no timer is registered |
+| Assets | **working** — offsets delivered, `File::Open` opens the archive, bytes are mmapped |
+| PNG decode | **in progress** — zlib header validated; `inflate` fails in the Huffman body |
+| First real frame | **blocked** — on PNG `inflate`, see below |
 | Browser host | not started |
 
 `ctor[3]` now reaches the import stubs and the host crossings count is
@@ -276,3 +278,66 @@ Measured on this machine with a hand-written Thumb-1 interpreter and a synthetic
 compiled workload (`wasm32` under V8/node 24): **279 MIPS**, i.e. **58% of the
 same code native**. The synthetic workload is friendlier than real game code
 (more LDR/STR, calls, VFP and PLT stubs), so expect the real figure to be lower.
+
+---
+
+## Session log — 2026-10-16, the PNG decode push
+
+The engine now gets all the way to decompressing a PNG. Getting there fixed a
+batch of small, high-consequence bugs; recorded here because the *shape* of each
+repeats.
+
+**Path / archive**
+
+- The guest's `ParseOffsetAndLengthAndPath` leaves the wrong buffer contents in
+  this build (`@6490388|148229|assets.apk` → `@assets.ap`), so the host replaces
+  it and returns the bare, openable path. `File::GetFullPathName` returns the
+  *resolved* archive path and must recognise that path on the second re-resolve,
+  or it rebuilds a path under `<userdir>` that does not exist. Result:
+  `[path] MainMenu.png -> @6490388|148229|game/assets.apk`, then
+  `[io] open game/assets.apk ok`.
+- `setjmp`/`longjmp` were stubbed to no-ops; libpng's `png_error` path then spun
+  forever. Now implemented host-side.
+
+**Decode**
+
+- **ARM `CLZ`**: not decoded; fell through to `CMN r15,Rm`. `__udivsi3` is built
+  on it, so unsigned division was broken.
+- **ARM `S`-flag carry**: logical ops take the shifter carry, arithmetic ops take
+  the ALU carry. Overwriting `C` with the shifter carry broke `subs` and thus
+  `__udivsi3`'s first `blo`.
+- **ARM `MUL`/`MLA` destination**: bits[19:16], not the data-processing
+  `Rd` (bits[15:12]). Because that field is zero for `MUL`, every product went to
+  `r0`. `__aeabi_uidivmod`'s `mul r3,r2,r0` then clobbered the quotient, so the
+  remainder of `0x78da % 31` was wrong and zlib rejected the valid header.
+  Long-multiply forms were already correct (`RdLo`/`RdHi` *are* bits[15:12] and
+  [19:16]), which is why this hid.
+
+**Formatting**
+
+- `snprintf`/`sprintf` and `vsnprintf`/`vsprintf` do not share an argument
+  layout: the `n`-suffixed forms carry a size before the format. Reading the
+  format from `a1` for all four meant `snprintf` treated its size as a pointer.
+  Built paths came out with literal `%s`.
+- `fprintf`'s first vararg is argument 2, not 1; the old index made the format
+  pointer the first conversion, hiding libpng's error text.
+
+**Harness**
+
+- `tools/difftest.sh` was green throughout because it exercises four constructors
+  totalling ~130 instructions and none of them use `MUL`. **Coverage, not the
+  oracle, is the gap.**
+- A temporary `inflate` probe dereferenced `next_in` from a NULL `z_stream` and
+  faulted *itself*; the resulting `SIGSEGV at pc=0110378e` was an artefact.
+  `-DGUEST_CHECK` would have labelled it immediately (`guest: load8 at bad
+  address …`). All probes are now removed.
+
+### Where it stops now
+
+`inflate` (runtime `0x01103774`, Thumb) passes the zlib header check and then
+fails building the dynamic Huffman tables: `libpng error: invalid bit length
+repeat`. The message is one of two sites in zlib 1.2.3's `CODELENS` loop. The
+check site is `0x01103d6c`–`0x01103d7e`; the next step is either a bounded probe
+there, or — better — teaching `tools/oracle.py` to perform `memcpy`/`memset`/
+`memcmp` so the differential compares *inside* `inflate` instead of stopping at
+its first host crossing.

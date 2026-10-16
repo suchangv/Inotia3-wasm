@@ -290,6 +290,7 @@ static void report_run(const run_result *r)
 static const struct { uint32_t addr, size; } k_dump_regions[] = {
     { GUEST_IMAGE_BASE, 0x00E00000u },  /* relocated .so, .data, .bss */
     { GUEST_STUB_BASE,  0x00500000u },  /* import stubs + host data   */
+    { GUEST_HEAP_BASE,  0x04000000u },  /* the heap: RB-tree nodes live here */
 };
 
 static void dump_guest(const char *path)
@@ -472,8 +473,6 @@ int main(int argc, char **argv)
     cpu_set_profile(do_profile);
     cpu_enable_trace(trace);
 
-    if (dump_path)
-        dump_guest(dump_path);
     if (trace_path) {
         host_trace_open(trace_path);
         g_trace_insn_on = 1;
@@ -779,6 +778,8 @@ int main(int argc, char **argv)
         host_trace_close();
         host_log("\ninstruction trace written to %s\n", trace_path);
     }
+    if (dump_path)
+        dump_guest(dump_path);   /* after the run, so it shows the end state */
 
     /* ---- report ---- */
     if (do_profile)

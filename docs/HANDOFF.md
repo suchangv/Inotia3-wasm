@@ -3,9 +3,33 @@
 Everything needed to continue this work. Read this first; `docs/SPIKE.md` has the
 running engineering log and `docs/REUSE.md` the dependency research.
 
-**State as of 2026-10-16: the engine boots, loads its assets, runs 200 frames of
-its own logic and draws — but the first frame has not been seen yet.** The
-remaining obstacle is one specific string format, described below.
+**State as of 2026-10-16 (later): the engine boots, finds its assets, opens the
+archive, and the PNG decoder now gets *into* `inflate` and past the zlib header
+check — but decompression still fails, currently with `libpng error: invalid bit
+length repeat`.** The first real frame has not been seen yet. The blocker is now
+a decode divergence inside zlib's `inflate`, described below.
+
+### Progress since the previous handoff
+
+- **`@assets.ap` is fixed.** The guest's own `ParseOffsetAndLengthAndPath`
+  mangles the path, so the host replaces it (`host/ParseOffsetAndLengthAndPath`,
+  see `patches.c` / `host_libc.c`). `File::GetFullPathName` also returns the
+  *resolved* archive path, so the `mmap` that follows finds the file. The log now
+  reads `[path] mode=0 MainMenu.png -> @6490388|148229|game/assets.apk`, then
+  `[io] open game/assets.apk ok`, then the archive bytes at that offset.
+- **Three decoder bugs fixed** (all required `tools/difftest.sh` to stay green):
+  `ARCHIVE-PATH`, ARM `CLZ`, ARM data-processing S-flag carry. See the bug list.
+- **`MUL`/`MLA` destination-register bug fixed** — this was the one blocking the
+  zlib header check. See the bug list; it is the most instructive of the set.
+- **`snprintf`/`sprintf`/`vsnprintf`/`vsprintf` argument conventions fixed** (the
+  format is at a different argument for the `n`-suffixed forms) and `fprintf`'s
+  first-vararg off-by-one fixed. These were silently producing literal `%s` in
+  built paths and hiding error text.
+- `setjmp`/`longjmp` are now implemented host-side so libpng can unwind out of
+  `png_error` instead of spinning.
+
+The previous handoff's "immediate next task" (the `@assets.ap` parse) is **done**;
+its text is kept below only for the history of how it was found.
 
 ---
 
@@ -122,18 +146,61 @@ finding things.
 - `GUEST_CHECK=1 tools/build.sh browser` turns the interpreter's memory access
   into checked accessors that report the address and the instruction.
 
-**Two debugging aids have caused more work than they found.** The texture-dump
+**Three debugging aids have caused more work than they found.** The texture-dump
 block in `gl.c` ran for *every* GL entry point and read `args[8]` as a pixel
 pointer — for `glTexCoordPointer(2, GL_FIXED, 0, ptr)` that is a stack word,
-and the resulting host fault looked exactly like an engine bug. Both are now
-bounded to the calls they are about. **When adding one, ask what conditions it
-runs under, not what conditions you meant it to run under.**
+and the resulting host fault looked exactly like an engine bug. A third, an
+`inflate` probe in `cpu.c`, dereferenced `next_in` out of a NULL `z_stream` and
+produced a phantom `SIGSEGV` that looked like a real fault (see the note on
+probes below). The first two are now bounded to the calls they are about; the
+third is deleted. **When adding one, ask what conditions it runs under, not what
+conditions you meant it to run under.**
 
 ---
 
 ## The immediate next task
 
-**The engine receives `@6490388|148229|assets.apk` and opens `@assets.ap`.**
+**`inflate` fails with `libpng error: invalid bit length repeat`.**
+
+The chain is now: `File::Open` → `MMappedFile::Open` → `mmap` (reads the archive
+at the offset) → PNG decode → `inflate`. The header check passes (`0x78da % 31 ==
+0`, verified from the division helper's trace), so the failure is in the
+Huffman/deflate body of `inflate`, not the wrapper. The error string is one of
+zlib 1.2.3's `strm->msg` assignments; `invalid bit length repeat` has two sites,
+both in the `CODELENS` loop of `inflate.c` (the `state->have == 0` case for a
+repeat code 16, and the `state->have + copy > nlen + ndist` overflow case).
+
+Method that found the last bug, and the one to repeat:
+
+1. `inflate` is **Thumb** and lives at runtime `0x01103774` (verified from
+   `.dynsym`; `tools/callers.py`-style lookups are in `/tmp/opencode/funcdis.py`).
+   The failing check site is at `0x01103d6c`–`0x01103d7e` (it computes
+   `(BITS(8)<<8)+(hold>>8)`, calls `__aeabi_uidivmod` at `0x010d1bd4`, and tests
+   the remainder in `r1`).
+2. **Add a bounded register-only probe at the suspect PC** in `cpu.c`'s
+   interpreter loop. Never dereference a guest pointer from a probe without a
+   range check — that is exactly what produced the phantom SIGSEGV (see the
+   cautionary note in the state section). Print registers, then remove the probe.
+3. The zlib sources are in `/tmp/opencode/zlib_inflate.c` (1.2.3) and
+   `/tmp/opencode/pngread124.c` (libpng 1.2.24) if the scratch dir survives.
+
+The likely shape is another wrong-bitfield / wrong-format decode, given `MUL`
+was. **The differential oracle would find it in one step if it could run past
+the first import** — `inflate` calls `memcpy`/`memset`, and the oracle stops at
+the first host crossing (oracle.py's `on_code`). Extending the oracle to
+implement `memcpy`/`memset`/`memcmp`/`strlen`/`strncpy` faithfully (a handful of
+lines over `uc.mem_read`/`uc.mem_write`) is the highest-leverage change here; it
+turns every decoder question from "probe and guess" into "diff and point".
+
+Also worth fixing: **`tools/difftest.sh` coverage is four constructors running
+9–102 instructions.** `MUL` was wrong the whole time and never exercised. A
+synthetic difftest entry that runs each decoded instruction family once (or the
+`inflate` prologue, whose memory image can be captured) would have caught it.
+
+### Superseded: the `@assets.ap` parse (fixed)
+
+Kept for the history of how it was found. The engine used to receive
+`@6490388|148229|assets.apk` and open `@assets.ap`.
 
 Everything upstream of it works. From a run:
 
@@ -178,13 +245,26 @@ was already sitting in that stack slot"). Corridas 34, 35, 37 are all this area.
 
 ### What happens once it works
 
-The chain from there: `File::Open` → `MMappedFile::Open` (absent from the
-profile today, which is how the break was localised) → `mmap` (implemented, reads
-the archive at the offset) → PNG decode → `glTexImage2D` with real pixels.
+The chain from there: `File::Open` → `MMappedFile::Open` → `mmap` (implemented
+and reads the archive at the offset) → PNG decode → `glTexImage2D` with real
+pixels. Only the PNG decode is left.
 
 Verify with the framebuffer dump in `gl.c`: it writes the engine's 384×256
 RGB565 surface to `fbNNN.raw`. Today those are 0/98304 or a single flat colour;
-**a dump with many distinct colours is the first frame.**
+**a dump with many distinct colours is the first frame.** (`fb001.raw` is now
+dumped from the resume path, so there is a file to watch; it is still
+`0/98304`.)
+
+### A cautionary note on probes
+
+A temporary probe added to find the zlib failure dereferenced `next_in` read out
+of the `z_stream`, and when `inflate` was entered with `strm == NULL` that
+pointer was garbage — so the **probe itself** faulted, and the reported
+`SIGSEGV at pc=0110378e` was an artefact of the diagnostic, not the emulator.
+Building with `-DGUEST_CHECK` turned the wild read into a clean `guest: load8 at
+bad address …` and made that obvious. Lesson: a guest-pointer read inside a
+diagnostic needs the same range check a shim does, and `-DGUEST_CHECK` is the
+fast way to tell a probe artefact from a real fault.
 
 ---
 
@@ -197,16 +277,18 @@ Working:
 | ELF load + relocation | 3139 relocations, 0 unhandled, 7713 symbols |
 | Import table | 183 ELF + 234 JNI entries, interworking stubs |
 | Thumb-1 decoder | full coverage, oracle-verified |
-| ARM decoder | verified against Unicorn |
+| ARM decoder | verified against Unicorn (plus the new MUL/MLA and carry fixes) |
 | Oracle | `tools/difftest.sh`, all four constructors instruction-identical |
-| Boot sequence | ctors → JNI_OnLoad → nativePreInit → nativeInit(605K instrs) → UserAgreeCallback → resumes → frames |
+| Boot sequence | ctors → JNI_OnLoad → nativePreInit → nativeInit → UserAgreeCallback → resumes → frames |
 | Timer table | engine clock unified with `GetSystemCurrentTime` |
-| Assets | found in the .apk, offsets delivered, archive opens |
+| Assets | found in the .apk, offsets delivered, the archive **opens** and its bytes are mmapped |
+| PNG header | zlib wrapper (`78 da`) decoded and validated |
 | GL | gl4es linked and live in the browser; GL_FIXED converted by hand |
 | Browser build | boots in Chrome, frames run, traps in `gl4es_glLoadIdentity` |
 
-Not started: **VFPv2** · the browser host proper (canvas loop, input, audio,
-saves) · AOT translation · threads.
+Not working yet: **PNG `inflate` body** (`invalid bit length repeat`) · VFPv2 ·
+the browser host proper (canvas loop, input, audio, saves) · AOT translation ·
+threads.
 
 ### Known break: the freestanding wasm target
 
@@ -247,43 +329,92 @@ Fifteen-plus bugs, all found by running. Grouped by what they teach.
 9. The ARM branch target is **PC + 8**, not PC + 4.
 10. A `va_list` is a plain pointer to the argument list — not the AAPCS struct,
     and not the flat array the other formatting entry points take.
+11. **ARM `MUL`/`MLA`: the destination is bits[19:16], not the data-processing
+    `Rd` (bits[15:12]).** bits[15:12] is the MLA *accumulator*, and zero for
+    `MUL`. Because the field is almost always zero in compiler output, the old
+    code wrote every product into `r0` and left the real destination stale.
+    This went unseen until `__aeabi_uidivmod` (`mul r3,r2,r0`) computed the
+    remainder: `r0` was clobbered with the dividend, so `0x78da % 31` returned
+    `0x78d6` instead of `0`, and zlib rejected the valid PNG header. Fixing this
+    is what moved the failure from "incorrect header check" to the real deflate
+    error. **The long forms (`UMULL` etc.) were already correct** — there
+    bits[15:12] *is* `RdLo` — which is why the bug was easy to miss.
+12. **ARM `CLZ` was not decoded at all** — it shares the data-processing space
+    and fell through to `CMN r15,Rm`, a silent no-op. `__udivsi3` is built on it,
+    so every unsigned division was wrong. Now matched explicitly
+    (bits[27:20]=0x16, rn=15, bits[11:4]=0xf1).
+13. **ARM `S`-flag carry.** For data processing with `S=1`, `C` is the *shifter*
+    carry for the logical ops (AND/EOR/TST/TEQ/ORR/MOV/BIC/MVN) but the *ALU*
+    carry for the arithmetic ops (SUB/RSB/ADD/ADC/SBC/RSC/CMP/CMN). The old code
+    overwrote `C` with the shifter carry unconditionally, so `subs r2,r1,#1`
+    carried wrong and `__udivsi3`'s first `blo` fired.
+14. **`snprintf`/`sprintf`/`vsnprintf`/`vsprintf` do not share an argument
+    layout.** The `n`-suffixed forms carry a size between the buffer and the
+    format (`snprintf(buf, size, fmt, …)`), the others do not. Treating them as
+    one shape meant `snprintf` read its *size* (`0x400`) as the format pointer,
+    so the format resolved to an empty string and path builders produced literal
+    `%s` in file names like `/sdcard/Android/data/%s/files/%s`.
+15. **`fprintf`'s first vararg is argument 2**, not 1 (the stream is 0, the
+    format is 1). Passing `&args[1]` fed the *format pointer* to the first
+    conversion, so `"libpng error: %s"` printed a literal `%s` and hid the real
+    message for a whole debugging session.
 
 **The boundary between guest and host** (this is the fertile ground)
 
-11. **A `jstring` is a handle, not a pointer.** *And the same mistake was made
+16. **A `jstring` is a handle, not a pointer.** *And the same mistake was made
     twice more with a `jintArray`.* A handle is `0x400000xx`, above
     `GUEST_MEM_SIZE`, so a range check silently rejects it and nothing is
     written. The engine then reads zeros and the whole path reports success.
-12. **`__errno` is a function**, not a variable — and the test is where the
+17. **`__errno` is a function**, not a variable — and the test is where the
     symbol is reached from: `.rel.plt` (called) vs `.rel.dyn` (addressed).
-13. **A stub that returns success and does nothing is worse than one that
+18. **A stub that returns success and does nothing is worse than one that
     fails.** `fstat` was that, and it hid the asset chain completely.
-14. **Imported variables need storage, not stubs** — `__sF`, `__stack_chk_guard`.
-15. `mmap` has to actually read the file; and its arena check has to be
+19. **Imported variables need storage, not stubs** — `__sF`, `__stack_chk_guard`.
+20. `mmap` has to actually read the file; and its arena check has to be
     overflow-safe, or a size near 4 GB wraps past it.
+21. **The path hook must return a path the host can actually `open`, and it must
+    carry the `"@offset|length|path"` form** or `File::Open` never fills in its
+    offset/length fields. `File::GetFullPathName` now also treats the *resolved*
+    archive path as "already resolved" (the second re-resolve that
+    `ParseOffsetAndLengthAndPath` triggers), or it rebuilds a
+    `<userdir>/game/assets.apk` that does not exist.
+22. **`setjmp`/`longjmp` are load-bearing for libpng.** Stubbed to "return 0",
+    `png_error` returned to its caller which called `longjmp` again, forever.
+    Implemented host-side (save r4-r11/sp/lr, restore and land back at the
+    `setjmp` call site). See `host_setjmp`/`host_longjmp`.
 
 **Patches and hooks**
 
-16. The engine contains anti-tamper that fails closed. `excuteDirectly()` and
+23. The engine contains anti-tamper that fails closed. `excuteDirectly()` and
     `jIsCracked()` shell out to `ps`, find nothing, and answer "tampered" — which
     **silently skips `startClet()`** and leaves the game booting perfectly and
     doing nothing. See `patches.c`.
-17. Subsystems cache the JavaVM in `.bss` and expect a Java-side init to fill it.
+24. Subsystems cache the JavaVM in `.bss` and expect a Java-side init to fill it.
     `patches.c` *finds* the copies by scanning for the idiom rather than
     hardcoding addresses.
-18. `SetTimer`'s "timer id" is an **opaque handle** (this build passes
+25. `SetTimer`'s "timer id" is an **opaque handle** (this build passes
     `&g_MainTimer`), not a table index.
-19. The engine's state machine is entered from a callback nothing fires.
+26. The engine's state machine is entered from a callback nothing fires.
+27. **The guest's `ParseOffsetAndLengthAndPath` is broken in this build** (leaves
+    `@assets.ap` from `@6490388|148229|assets.apk`), so the host owns it, the
+    same way it owns `File::GetFullPathName`. `patches_replace_with_import`.
 
 **Harness defects — the ones that lie**
 
-20. The return sentinel was 0, which is also where a guest lands after branching
+28. The return sentinel was 0, which is also where a guest lands after branching
     through a null pointer.
-21. The instruction trace ring did not reset per entry.
-22. **Two debugging aids read guest memory they had no business reading.** See
-    above.
-23. A comment was left unterminated by an edit, so the build failed and runs used
+29. The instruction trace ring did not reset per entry.
+30. **Three debugging aids read guest memory they had no business reading.** Two
+    in `gl.c`, one in `cpu.c` (an `inflate` probe dereferenced `next_in` from a
+    NULL `strm`). The resulting SIGSEGV looked exactly like an emulator bug. See
+    the cautionary note above.
+31. A comment was left unterminated by an edit, so the build failed and runs used
     a stale binary — which made two real fixes look ineffective.
+
+**Test coverage** — `tools/difftest.sh` runs four constructors totalling ~130
+instructions. `MUL` was wrong from the start and none of them touch it. Widen it
+(a synthetic entry per instruction family, or a captured `inflate` prologue)
+before trusting any decoder change.
 
 ---
 
