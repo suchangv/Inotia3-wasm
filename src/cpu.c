@@ -26,6 +26,7 @@
 
 cpu_state g_cpu;
 uint64_t  g_insn_count;
+uint32_t  g_stop_at;
 uint32_t  g_fault_pc;
 uint32_t  g_fault_insn;
 int       g_fault_width;
@@ -298,6 +299,26 @@ int cpu_run(uint32_t entry, uint32_t sp, uint64_t budget)
             g_have_prev = 0;
         }
 
+        /* One-shot snapshot point: the runner dumps memory and registers here
+         * and opens the instruction trace, so the differential can start with
+         * the engine's real state at a chosen address instead of at a function
+         * entry with no arguments. */
+        if (g_stop_at && pc == g_stop_at) {
+            /* Return rather than call out: a dump taken from inside the
+             * interpreter loop reads the register file at a moment the caller
+             * cannot see, and this port has already spent time on one
+             * diagnostic that reported a state it was not actually in. The
+             * runner dumps and resumes from here, where the state is
+             * unambiguous. */
+            g_stop_at = 0;      /* one shot, or the resume stops here again */
+            g_cpu.r[15] = pc;
+            /* The instruction before the stop must not be the first line of a
+             * trace that resumes here: it belongs to the segment the caller
+             * discarded. */
+            g_have_prev = 0;
+            return HALT_STOPPED;
+        }
+
         /* Executable ranges are .text and the import stub page. The stubs have
          * to be allowed through here or the range check fires before the BKPT
          * is ever decoded, and every host crossing silently becomes a
@@ -379,10 +400,10 @@ int cpu_run(uint32_t entry, uint32_t sp, uint64_t budget)
                     case 0x2: R[rd] = sh_lsl(R[rd], R[rm] & 0xff, &c);
                               g_cpu.cpsr = (g_cpu.cpsr & ~(F_N|F_Z|F_C)) | c |
                                            (R[rd] & 0x80000000u ? F_N : 0) | (R[rd] == 0 ? F_Z : 0); break;
-                    case 0x3: R[rd] = sh_lsr(R[rd], (R[rm] & 0xff) ? (R[rm] & 0xff) : 32, &c);
+                    case 0x3: R[rd] = sh_lsr(R[rd], R[rm] & 0xff, &c);
                               g_cpu.cpsr = (g_cpu.cpsr & ~(F_N|F_Z|F_C)) | c |
                                            (R[rd] & 0x80000000u ? F_N : 0) | (R[rd] == 0 ? F_Z : 0); break;
-                    case 0x4: R[rd] = sh_asr(R[rd], (R[rm] & 0xff) ? (R[rm] & 0xff) : 32, &c);
+                    case 0x4: R[rd] = sh_asr(R[rd], R[rm] & 0xff, &c);
                               g_cpu.cpsr = (g_cpu.cpsr & ~(F_N|F_Z|F_C)) | c |
                                            (R[rd] & 0x80000000u ? F_N : 0) | (R[rd] == 0 ? F_Z : 0); break;
                     case 0x5: R[rd] = add_c(R[rd], R[rm], (g_cpu.cpsr & F_C) ? 1 : 0); break;
@@ -1114,6 +1135,7 @@ const char *cpu_halt_str(int reason)
     case HALT_TRAP:      return "unimplemented instruction (valid, not emulated)";
     case HALT_BAD_PC:    return "PC left the loaded image";
     case HALT_IMPORT:    return "stopped at host crossing (oracle mode)";
+    case HALT_STOPPED:   return "reached the requested stop address";
     case HALT_BAD_MEM:   return "guest accessed outside its address space";
     default:             return "?";
     }

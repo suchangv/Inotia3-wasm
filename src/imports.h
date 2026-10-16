@@ -124,9 +124,20 @@ static inline int import_index_of_stub(uint32_t addr)
  * explanation for a difference in the traces. */
 int import_dispatch(int idx);
 
-/* When set, host implementations are not called at all and the guest stops at
- * its first import. Used by the differential test. */
+/* When set, the interpreter only runs imports that the oracle can reproduce
+ * exactly, and stops at any other. Used by the differential test. */
 extern int g_oracle_mode;
+
+/* Imports whose behaviour is fully determined by their arguments and guest
+ * memory -- so both sides can perform them and the comparison can continue
+ * *through* the crossing instead of ending at it.
+ *
+ * This list is the difference between a differential that can see inside
+ * inflate and one that stops at its first memcpy, which is the difference
+ * between finding a Huffman-decoding bug and never reaching it. Anything whose
+ * result depends on the host (malloc, file I/O, time, JNI) stays out: the two
+ * sides would disagree for reasons that are not the decoder. */
+int import_is_reproducible(const char *name);
 
 /* The implementation switch, in host_libc.c. Kept separate from the stub and
  * bookkeeping machinery above so that "what the guest can call" and "how the

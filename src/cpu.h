@@ -20,6 +20,15 @@ typedef struct {
 
 extern cpu_state g_cpu;
 extern uint64_t   g_insn_count;
+/* When non-zero, cpu_run returns HALT_STOPPED on reaching this address. Used to
+ * take a dump with the engine's real state at a chosen point. */
+extern uint32_t   g_stop_at;
+
+/* g_stop_at makes cpu_run return HALT_STOPPED, with r15 set to the stop
+ * address. The runner dumps memory and registers there and resumes from the
+ * same instruction, so the dump describes the engine's real state at a chosen
+ * point rather than at a function entry with no arguments. */
+
 
 /* Why cpu_run() came back. */
 enum {
@@ -30,6 +39,7 @@ enum {
     HALT_BAD_PC,       /* PC left the loaded image */
     HALT_IMPORT,       /* stopped at a host crossing (oracle mode) */
     HALT_BAD_MEM,      /* GUEST_CHECK only: an access left the guest space */
+    HALT_STOPPED,      /* reached g_stop_at */
 };
 
 const char *cpu_halt_str(int reason);

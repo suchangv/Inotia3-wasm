@@ -250,28 +250,36 @@ void imports_build_stubs(void)
 
 int g_oracle_mode;
 
+int import_is_reproducible(const char *name)
+{
+    static const char *const k[] = {
+        "memcpy", "memmove", "memset", "memcmp",
+        "strlen", "strcmp", "strncmp", "strcpy", "strncpy",
+        0
+    };
+    for (int i = 0; k[i]; i++)
+        if (strcmp(name, k[i]) == 0)
+            return 1;
+    return 0;
+}
+
 int import_dispatch(int idx)
 {
     guest_import *im = &g_imports[idx];
     im->calls++;
     if (g_oracle_mode) {
-        /* Deterministic no-op returning 0, matching the oracle's stub exactly.
-         * Two different shim implementations would make any later divergence
-         * ambiguous -- was it the CPU or the shim? -- so in this mode neither
-         * side implements anything, and the comparison stays about the
-         * decoder. The guest will usually walk into a NULL return soon after,
-         * but it does so identically on both sides, which is the point.
-         *
-         * r0/r1 are cleared here rather than left to host_import_call(): that
-         * function is skipped entirely in this mode, and the oracle does clear
-         * them, so leaving them alone shows up as a phantom divergence. */
+        if (import_is_reproducible(im->name)) {
+            /* Both sides perform this one. The oracle has the same fifteen
+             * lines of Python, and the comparison continues past the crossing
+             * -- which is the only way it can ever see inside inflate. */
+            g_cpu.r[0] = 0;
+            g_cpu.r[1] = 0;
+            host_import_call(im);
+            return 0;
+        }
+        /* Anything else stops the run, on both sides, at the same instruction. */
         g_cpu.r[0] = 0;
         g_cpu.r[1] = 0;
-        /* Stop at the first crossing. Carrying on with every import stubbed
-         * to NULL is possible but the traces stop being symmetric about the
-         * stub itself, and the comparison is worth more clean than deep: what
-         * is being tested here is the decoder, and the run to the first import
-         * already exercises the whole PLT path. */
         return 1;
     }
     host_import_call(im);

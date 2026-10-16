@@ -39,6 +39,18 @@ GUEST_STACK_SIZE    = 0x00800000
 GUEST_STUB_BASE     = 0x08800000
 GUEST_STUB_SIZE     = 0x00400000
 GUEST_MEM_SIZE      = 0x09000000
+# Must match GUEST_STUB_BASE and IMPORT_MAX in src/. A stub address encodes its
+# import's index, which is how a crossing is named here.
+GUEST_STUB_BASE     = 0x08800000
+IMPORT_MAX          = 1024
+
+# The imports both sides perform identically. Must match import_is_reproducible()
+# in src/imports.c -- a name on one list and not the other is a divergence that
+# is the harness's fault, not the decoder's.
+REPRODUCIBLE = {
+    "memcpy", "memmove", "memset", "memcmp",
+    "strlen", "strcmp", "strncmp", "strcpy", "strncpy",
+}
 # The executable range of the image; src/elf_loader.c derives the same bounds
 # from the PT_LOAD marked PF_X. Printed by the C spike at load time.
 TEXT_LO             = 0x01000000
@@ -50,7 +62,14 @@ RETURN_SENTINEL     = 0x0BADF00D
 
 
 def load_dump(path):
-    """Read the GIMG dump: a header of (addr, size) pairs then the bytes."""
+    """Read the GIMG dump: (addr, size) pairs and their bytes, then the import
+    name table the C side appends under its own magic.
+
+    The names are what let a stub address be resolved to something meaningful.
+    Without them the only options are to stop at the first crossing or to
+    reproduce every import blind -- and the second is how a differential starts
+    reporting divergences that are the harness's fault.
+    """
     with open(path, "rb") as f:
         blob = f.read()
     if blob[:4] != b"GIMG":
@@ -66,7 +85,103 @@ def load_dump(path):
     for addr, size in regions:
         out.append((addr, blob[off:off + size]))
         off += size
-    return out
+
+    regs = None
+    if blob[off:off + 4] == b"REGS":
+        off += 4
+        regs = list(struct.unpack_from("<16I", blob, off))
+        off += 64
+        regs.append(struct.unpack_from("<I", blob, off)[0])   # cpsr
+        off += 4
+
+    names = []
+    if blob[off:off + 4] == b"INAM":
+        off += 4
+        ni = struct.unpack_from("<I", blob, off)[0]
+        off += 4
+        for _ in range(ni):
+            ln = struct.unpack_from("<I", blob, off)[0]
+            off += 4
+            names.append(blob[off:off + ln].decode("latin1"))
+            off += ln
+    return out, names, regs
+
+
+def do_reproducible(uc, name, r):
+    """Perform one of the imports both sides implement, and return the value for
+    r0 -- or None if this name is not one of them.
+
+    These must match src/host_libc.c byte for byte. A difference here is a
+    divergence the harness caused, which is worse than not running the import at
+    all: it would be chased as a decoder bug.
+    """
+    def mem(a, n):
+        return bytes(uc.mem_read(a, n))
+
+    if name == "memcpy" or name == "memmove":
+        dst, src, n = r[0], r[1], r[2]
+        if dst and src and n:
+            uc.mem_write(dst, mem(src, n))
+        return dst
+    if name == "memset":
+        dst, c, n = r[0], r[1], r[2]
+        if dst and n:
+            uc.mem_write(dst, bytes([c & 0xFF]) * n)
+        return dst
+    if name == "memcmp":
+        a, b, n = r[0], r[1], r[2]
+        if not (a and b) or not n:
+            return 0
+        x, y = mem(a, n), mem(b, n)
+        d = 0
+        for i in range(n):
+            if x[i] != y[i]:
+                d = x[i] - y[i]
+                break
+        return d & 0xFFFFFFFF
+    if name in ("strlen", "strcmp", "strncmp", "strcpy", "strncpy"):
+        def cstr(a, cap=1 << 20):
+            out = bytearray()
+            while len(out) < cap:
+                c = uc.mem_read(a + len(out), 1)[0]
+                if c == 0:
+                    break
+                out.append(c)
+            return bytes(out)
+        if name == "strlen":
+            return len(cstr(r[0])) if r[0] else 0
+        if name == "strcmp":
+            x, y = cstr(r[0]), cstr(r[1])
+            n = min(len(x), len(y))
+            for i in range(n):
+                if x[i] != y[i]:
+                    return (x[i] - y[i]) & 0xFFFFFFFF
+            return (len(x) - len(y)) & 0xFFFFFFFF
+        if name == "strncmp":
+            x, y, n = cstr(r[0]), cstr(r[1]), r[2]
+            i = 0
+            while i < n:
+                xa = x[i] if i < len(x) else 0
+                ya = y[i] if i < len(y) else 0
+                if xa != ya:
+                    return (xa - ya) & 0xFFFFFFFF
+                if xa == 0:
+                    break
+                i += 1
+            return 0
+        if name == "strcpy" or name == "strncpy":
+            dst, src = r[0], r[1]
+            s = cstr(src)
+            if name == "strcpy":
+                if dst:
+                    uc.mem_write(dst, s + b"\x00")
+            else:
+                n = r[2]
+                if dst:
+                    body = s[:n] + b"\x00" * max(0, n - len(s))
+                    uc.mem_write(dst, body[:n])
+            return dst
+    return None
 
 
 def main():
@@ -76,7 +191,7 @@ def main():
     entry = int(sys.argv[3], 16) if len(sys.argv) > 3 else None
     budget = int(sys.argv[4]) if len(sys.argv) > 4 else 20_000_000
 
-    regions = load_dump(dump_path)
+    regions, import_names, snap = load_dump(dump_path)
 
     uc = Uc(UC_ARCH_ARM, UC_MODE_ARM)
 
@@ -94,6 +209,15 @@ def main():
     if entry is None:
         raw = uc.mem_read(GUEST_INIT_ARRAY, 4)
         entry = struct.unpack("<I", bytes(raw))[0] | 1
+
+    # A dump taken at a chosen address carries the engine's real state there.
+    # Starting from it is the only way to diff a deep function: inflate entered
+    # with no arguments decides nothing about whether inflate is correct, and
+    # reconstructing a z_stream by hand would be a harness that could be wrong
+    # in the same direction as the thing under test.
+    if snap is not None:
+        entry = snap[15] | 1
+        print("oracle: resuming from a snapshot at %08x" % (entry & ~1))
 
     out = open(trace_path, "w", buffering=1 << 20)
     state = {"prev": None, "stopped": False, "count": 0}
@@ -119,7 +243,9 @@ def main():
             out.write("%08x %s %08x\n" % (
                 prev, " ".join("%08x" % v for v in r), uc_.reg_read(UC_ARM_REG_CPSR)))
 
-        if pc < TEXT_LO or pc >= TEXT_HI:
+        in_text = TEXT_LO <= pc < TEXT_HI
+        in_stub = GUEST_STUB_BASE <= pc < GUEST_STUB_BASE + 0x1000
+        if not in_text and not in_stub:
             # Match the interpreter's HALT_BAD_PC, which fires when PC leaves
             # the loaded image. Both endings are real: the return sentinel
             # (LR=1, so a returning guest lands on 0) and a guest that walked
@@ -129,19 +255,43 @@ def main():
             # would disagree about where the run ended rather than about what
             # the CPU did.
             state["stopped"] = True
+            state["stop_name"] = "PC left the image at %08x" % pc
             uc_.emu_stop()
             return
 
         if GUEST_STUB_BASE <= pc < GUEST_STUB_BASE + GUEST_STUB_SIZE:
-            # A host crossing. Mirror what the interpreter does in oracle mode:
-            # return 0 and carry on, so the comparison covers the whole run
-            # rather than only the prologue before the first import.
-            #
-            # The stub is reached from the ARM PLT, so the state has to be put
-            # back the way a `bx lr` would leave it -- T bit from LR's bit 0 --
-            # or the return lands in the wrong instruction set. The core
-            # reaches the same conclusion through R[14] & 1.
+            # A host crossing. The stub address encodes its index, and the dump
+            # carries the names, so this can decide what the crossing *is*.
+            idx = (pc - GUEST_STUB_BASE) // 4
+            nm = import_names[idx] if 0 <= idx < len(import_names) else None
+
+            if nm in REPRODUCIBLE:
+                # Both sides perform this one, so the comparison continues
+                # through it. Returning to LR the way the interpreter does --
+                # T bit from LR's bit 0 -- or the return lands in the wrong
+                # instruction set.
+                val = do_reproducible(uc_, nm, read_regs())
+                if val is not None:
+                    uc_.reg_write(UC_ARM_REG_R0, val)
+                    lr = uc_.reg_read(UC_ARM_REG_R14)
+                    cpsr = uc_.reg_read(UC_ARM_REG_CPSR)
+                    cpsr = (cpsr | 0x20) if (lr & 1) else (cpsr & ~0x20)
+                    uc_.reg_write(UC_ARM_REG_CPSR, cpsr)
+                    # The stub is real guest-visible execution on both sides --
+                    # the interpreter emits a line for it at its next loop top --
+                    # so record it as the previous instruction and let the next
+                    # hook call write it. Without this the traces are one line
+                    # out of step after every crossing.
+                    state["prev"] = pc
+                    uc_.reg_write(UC_ARM_REG_R15, lr & ~1)
+                    return
+
+            # Not something both sides can perform: stop here, on both sides,
+            # at the same instruction. Naming it is the whole value -- it is the
+            # worklist for extending coverage.
             state["stopped"] = True
+            state["stop_name"] = nm if nm else "index %d" % idx
+            state["stop_name"] = nm
             uc_.emu_stop()
         state["prev"] = pc
         state["count"] += 1
@@ -149,6 +299,23 @@ def main():
     uc.hook_add(UC_HOOK_CODE, on_code)
     uc.reg_write(UC_ARM_REG_R13, GUEST_STACK_TOP - 0x1000)
     uc.reg_write(UC_ARM_REG_R14, RETURN_SENTINEL)
+
+    # A snapshot is applied *after* those defaults, not before: setting SP and
+    # LR from it and then overwriting them with the harness's own values leaves
+    # the oracle running from a stack the interpreter is not on, which shows up
+    # as a register divergence at instruction 0 of a comparison that was
+    # supposed to be about the decoder.
+    if snap is not None:
+        for i in range(13):
+            uc.reg_write(UC_ARM_REG_R0 + i, snap[i])
+        uc.reg_write(UC_ARM_REG_R13, snap[13])
+        uc.reg_write(UC_ARM_REG_R14, snap[14])
+        # Only the condition flags come from the snapshot; the mode and T bits
+        # belong to Unicorn and writing the interpreter's whole word would clear
+        # the Thumb bit and make it decode Thumb code as ARM.
+        cpsr = uc.reg_read(UC_ARM_REG_CPSR)
+        uc.reg_write(UC_ARM_REG_CPSR,
+                     (cpsr & ~0xF0000000) | (snap[16] & 0xF0000000))
     # Match src/main.c's run_entry(), which starts with the flags clear.
     # Unicorn's power-on CPSR has Z set, so a guest branching on a flag before
     # setting one would diverge for a reason unrelated to the decoder.
@@ -157,7 +324,12 @@ def main():
     # Unicorn set them. Writing a whole literal CPSR here silently clears the
     # Thumb bit and makes Unicorn decode the guest's Thumb code as ARM, which
     # fails on the first push rather than at anything interesting.
-    uc.reg_write(UC_ARM_REG_CPSR, uc.reg_read(UC_ARM_REG_CPSR) & ~0xF0000000)
+    # Only when there is no snapshot: that line exists so a guest branching on
+    # a flag before setting one does not diverge for a reason unrelated to the
+    # decoder, but with a snapshot the flags are part of the state being
+    # compared and clearing them throws away the answer.
+    if snap is None:
+        uc.reg_write(UC_ARM_REG_CPSR, uc.reg_read(UC_ARM_REG_CPSR) & ~0xF0000000)
 
     print("oracle: entry=%08x budget=%d" % (entry, budget))
     try:
@@ -167,6 +339,9 @@ def main():
               % (e, state["count"]))
     else:
         print("oracle: ran %d instructions" % state["count"])
+    if state.get("stop_name"):
+        print("oracle: stopped at import %r -- not reproducible on both sides"
+              % state["stop_name"])
 
     # Emit the final instruction's state too, matching nothing on the C side
     # only if it stopped cleanly; the diff will show it as a trailing line.

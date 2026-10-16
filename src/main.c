@@ -164,6 +164,21 @@ typedef struct {
     double      seconds;
 } run_result;
 
+/* Defined below; the snapshot path needs them here. */
+static void dump_guest(const char *path);
+static const char *g_snapshot_dump_path;
+static const char *g_snapshot_trace_path;
+static int g_stop_at_resume;
+
+/* Take the snapshot if cpu_run stopped at the requested address, then carry on
+ * from the same instruction with the trace running. Shared by every cpu_run
+ * call site -- nativeInit is driven directly rather than through
+ * run_entry_arg, and a snapshot that only worked on some of them would be a
+ * tool that quietly does nothing.
+ *
+ * Returns the reason to report. */
+static int spike_resume_if_stopped(int reason, uint64_t budget);
+
 /* `arg0` is placed in r0 before the entry runs -- JNI_OnLoad expects the
  * JavaVM* there, and the native* entry points expect a JNIEnv*. */
 static run_result run_entry_arg(const char *what, uint32_t entry, uint32_t arg0,
@@ -194,6 +209,9 @@ static run_result run_entry_arg(const char *what, uint32_t entry, uint32_t arg0,
     double t0 = host_now();
     r.reason = cpu_run(entry, g_cpu.r[13], g_insn_count + budget);
     cpu_trace_final();
+
+    r.reason = spike_resume_if_stopped(r.reason, budget);
+
     r.seconds = host_now() - t0;
     r.insns = g_insn_count - before;
     return r;
@@ -291,6 +309,11 @@ static const struct { uint32_t addr, size; } k_dump_regions[] = {
     { GUEST_IMAGE_BASE, 0x00E00000u },  /* relocated .so, .data, .bss */
     { GUEST_STUB_BASE,  0x00500000u },  /* import stubs + host data   */
     { GUEST_HEAP_BASE,  0x04000000u },  /* the heap: RB-tree nodes live here */
+    /* The stack. Without it the oracle starts with a zeroed frame and the
+     * divergence it reports is a load of the caller's saved registers --
+     * 157,000 instructions of matching execution, then a difference that is
+     * the harness's fault, not the decoder's. */
+    { GUEST_STACK_TOP - GUEST_STACK_SIZE, GUEST_STACK_SIZE },
 };
 
 static void dump_guest(const char *path)
@@ -309,12 +332,72 @@ static void dump_guest(const char *path)
     for (uint32_t i = 0; i < n; i++)
         fwrite(g_mem + k_dump_regions[i].addr, 1, k_dump_regions[i].size, f);
 
+    /* The import table by index, then name. The oracle needs it to know *what*
+     * a stub address means: it is the only way to let the differential run
+     * through the crossings both sides can implement identically, instead of
+     * stopping at the first one and never seeing inside inflate.
+     *
+     * Its own magic rather than a count, so a reader that predates it fails
+     * cleanly instead of misreading region data. */
+    /* Registers as of the dump, so the oracle can start *here* rather than at a
+     * function entry with no arguments. Diffing a deep function means reaching
+     * it with the state the engine actually had, and neither side can
+     * reconstruct that on its own. */
+    host_log("  dump: pc=%08x lr=%08x sp=%08x\n", g_cpu.r[15], g_cpu.r[14], g_cpu.r[13]);
+    host_log("  dump regs: r13=%08x r14=%08x r15=%08x\n", g_cpu.r[13], g_cpu.r[14], g_cpu.r[15]);
+    fwrite("REGS", 1, 4, f);
+    fwrite(&g_cpu.r[0], 4, 16, f);
+    fwrite(&g_cpu.cpsr, 4, 1, f);
+
+    fwrite("INAM", 1, 4, f);
+    uint32_t ni = (uint32_t)g_nimports;
+    fwrite(&ni, 4, 1, f);
+    for (uint32_t i = 0; i < ni; i++) {
+        uint32_t len = (uint32_t)strlen(g_imports[i].name);
+        fwrite(&len, 4, 1, f);
+        fwrite(g_imports[i].name, 1, len, f);
+    }
+
     fclose(f);
     host_log("guest memory dumped to %s (%u regions)\n", path, n);
 }
 #else
 static void dump_guest(const char *path) { (void)path; }
 #endif
+
+static int spike_resume_if_stopped(int reason, uint64_t budget)
+{
+    if (reason != HALT_STOPPED || !g_stop_at_resume)
+        return reason;
+
+    host_log("\n=== snapshot at %08x ===\n", g_cpu.r[15]);
+    if (g_snapshot_dump_path)
+        dump_guest(g_snapshot_dump_path);
+    if (g_snapshot_trace_path) {
+        host_trace_open(g_snapshot_trace_path);
+        g_trace_insn_on = 1;
+    }
+
+    uint64_t before = g_insn_count;
+    int r = cpu_run(g_cpu.r[15] | 1u, g_cpu.r[13], g_insn_count + budget);
+    cpu_trace_final();
+    host_log("  snapshot: ran %llu more instructions -> %s\n",
+             (unsigned long long)(g_insn_count - before), cpu_halt_str(r));
+    return r;
+}
+
+/* ---- snapshot at a chosen address ----------------------------------------
+ *
+ * Dumping the whole run's memory is what the oracle needs to start anywhere;
+ * dumping it *at* the point the engine first reaches a chosen function is what
+ * lets the differential see inside that function. inflate entered with no
+ * arguments decides nothing; inflate entered with the z_stream the engine
+ * actually built does.
+ *
+ * The trace is opened here rather than before the run so that it covers only
+ * the segment after the snapshot -- both sides then compare from the same
+ * instruction with the same state.
+ */
 
 /* ---- entry --------------------------------------------------------------- */
 
@@ -356,6 +439,8 @@ int main(int argc, char **argv)
             frames = (int)strtol(argv[i] + 9, NULL, 10);
         else if (strncmp(argv[i], "--timer=", 8) == 0)
             timer_id = (int)strtol(argv[i] + 8, NULL, 10);
+        else if (strncmp(argv[i], "--stop-at=", 10) == 0)
+            g_stop_at = (uint32_t)strtoul(argv[i] + 10, NULL, 16);
         else if (strncmp(argv[i], "--watch=", 8) == 0)
             g_watch_addr = (uint32_t)strtoul(argv[i] + 8, NULL, 16);
         else if (strcmp(argv[i], "--oracle") == 0)
@@ -473,7 +558,17 @@ int main(int argc, char **argv)
     cpu_set_profile(do_profile);
     cpu_enable_trace(trace);
 
-    if (trace_path) {
+    if (g_stop_at) {
+        /* A snapshot describes the engine's state at a chosen point, so both
+         * the dump and the trace have to start *there* rather than before the
+         * run. Deferred to run_entry_arg, which takes the dump when it reaches
+         * the address and starts the trace from that instruction. */
+        g_snapshot_dump_path = dump_path;
+        g_snapshot_trace_path = trace_path;
+        g_stop_at_resume = 1;
+        dump_path = NULL;
+        trace_path = NULL;
+    } else if (trace_path) {
         host_trace_open(trace_path);
         g_trace_insn_on = 1;
     }
@@ -541,7 +636,8 @@ int main(int argc, char **argv)
             run_result rp;
             rp.what = "nativePreInit";
             rp.entry = pre;
-            rp.reason = cpu_run(pre, g_cpu.r[13], g_insn_count + budget);
+            rp.reason = spike_resume_if_stopped(
+                cpu_run(pre, g_cpu.r[13], g_insn_count + budget), budget);
             cpu_trace_final();
             rp.insns = g_insn_count - before;
             rp.seconds = host_now() - t0;
@@ -596,7 +692,8 @@ int main(int argc, char **argv)
             run_result ri;
             ri.what = "nativeInit";
             ri.entry = init;
-            ri.reason = cpu_run(init, g_cpu.r[13], g_insn_count + budget);
+            ri.reason = spike_resume_if_stopped(
+                cpu_run(init, g_cpu.r[13], g_insn_count + budget), budget);
             cpu_trace_final();
             ri.insns = g_insn_count - ibefore;
             ri.seconds = host_now() - it0;
