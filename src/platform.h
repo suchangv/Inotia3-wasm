@@ -29,6 +29,10 @@ void host_browser_set_size(int w, int h);
 
 /* Browser build only: let the page choose the frame count. */
 void host_browser_read_frames(void);
+void host_browser_read_dump(void);
+void host_browser_read_gl_trace(void);
+extern int g_browser_dump_screen;
+extern int g_browser_gl_trace;
 
 /* Per-instruction trace sink, written from inside the interpreter loop.
  * Format is a contract with tools/oracle.py. */

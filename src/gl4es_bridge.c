@@ -31,6 +31,7 @@
  */
 
 #include "gl.h"
+#include <stdio.h>
 #include "guest.h"
 #include "cpu.h"
 #include "compat.h"
@@ -63,6 +64,12 @@ extern void set_getprocaddress(void *(*fn)(const char *));
  * out-of-range one is checked rather than followed. Without the check a bad
  * pointer is read by gl4es at host level -- an opaque wasm trap with no PC --
  * while with it the address and the calling GL entry point are named. */
+/* The engine's own screen surface, remembered so a run can dump it. See
+ * gl4es_dump_last_screen() -- it is the ground truth for "did the engine draw
+ * anything", which a black canvas cannot answer on its own. */
+uint32_t g_last_screen_ptr, g_last_screen_w, g_last_screen_h;
+uint32_t g_last_screen_fmt, g_last_screen_type;
+
 static inline const void *G(uint32_t guest_addr)
 {
     if (!guest_addr)
@@ -155,27 +162,43 @@ static const float *fixed_matrix(const void *src)
  * and WebGL does not. So the conversion belongs here: record the array when it
  * is set, and convert it at draw time, because GLES1 client arrays are read
  * when the draw happens, not when the pointer is set.
+ *
+ * Two consequences of "read at draw time" that this got wrong at first, both
+ * of which produce a black screen with no error anywhere:
+ *
+ *   - The record must survive the draw. Clearing it after converting means
+ *     only the first draw of a run sees the engine's data; the engine sets the
+ *     pointer once, rewrites the buffer before every quad (SGL_grpFillRect
+ *     stores eight words and draws), and every later draw reads whatever the
+ *     first one left behind.
+ *
+ *   - Each array needs its OWN conversion buffer. One shared scratch buffer is
+ *     aliased by all three pointers -- glVertexPointer, glTexCoordPointer and
+ *     glColorPointer all end up naming it -- and since gl4es reads the arrays
+ *     at draw time, the vertex array contains the colour data by then. That
+ *     draws geometry made of colour values.
  */
 #define GL_FIXED_ 0x140C
 
 typedef struct {
-    int      active;
+    int      active;      /* the engine set this array as GL_FIXED */
     int      size;
     uint32_t stride;      /* bytes; 0 means tightly packed */
     uint32_t ptr;         /* guest address */
     int      logged;
+    float   *conv;        /* this array's own float copy, host memory */
+    size_t   conv_cap;
 } fixed_array;
 
 static fixed_array g_fx_vertex, g_fx_texcoord, g_fx_color;
 
-static float  *g_conv;
-static size_t  g_conv_cap;
-
-/* Convert `count` vertices starting at `first` and install the result as a
- * float array, then clear the record so the next call re-records. */
+/* Convert `count` vertices starting at `first` into this array's own float
+ * buffer and hand that to gl4es. Called before every draw, because that is
+ * when a GLES1 client array is read -- the record is deliberately not cleared
+ * here; only glVertexPointer/glTexCoordPointer/glColorPointer clear it. */
 static void fixed_install(const char *what, fixed_array *fx, int first, int count)
 {
-    if (!fx->active)
+    if (!fx->active || count <= 0)
         return;
     int size = fx->size > 0 && fx->size <= 4 ? fx->size : 4;
     uint32_t stride = fx->stride ? fx->stride : (uint32_t)size * 4u;
@@ -188,9 +211,9 @@ static void fixed_install(const char *what, fixed_array *fx, int first, int coun
     }
 
     size_t need = (size_t)(first + count) * (size_t)size * sizeof(float);
-    if (need > g_conv_cap) {
-        g_conv = (float *)host_alloc(need);
-        g_conv_cap = need;
+    if (need > fx->conv_cap) {
+        fx->conv = (float *)host_alloc(need);
+        fx->conv_cap = need;
     }
     /* Check the WHOLE range, not just its start: G() validates one address, and
      * the loop below reads `count` vertices of `size` words each, so an array
@@ -207,26 +230,21 @@ static void fixed_install(const char *what, fixed_array *fx, int first, int coun
             host_log("gl: GL_FIXED array %08x+%u exceeds guest memory (%u MB) "
                      "-- skipping the draw\n", start, span, GUEST_MEM_SIZE >> 20);
         }
-        fx->active = 0;
         return;
     }
     const uint32_t *src = (const uint32_t *)(g_mem + start);
     size_t n = (size_t)count * (size_t)size;
     for (size_t i = 0; i < n; i++)
-        g_conv[i] = (float)(int32_t)src[i] / 65536.0f;
+        fx->conv[i] = (float)(int32_t)src[i] / 65536.0f;
 
     /* Host memory, not guest: the float copy lives in this process, and gl4es
      * hands the pointer straight to the driver. */
-    if (strcmp(what, "glVertexPointer") == 0) {
-        gl4es_glVertexPointer(size, 0x1406 /* GL_FLOAT */, size * 4, g_conv);
-        fx->active = 0;
-    } else if (strcmp(what, "glTexCoordPointer") == 0) {
-        gl4es_glTexCoordPointer(size, 0x1406, size * 4, g_conv);
-        fx->active = 0;
-    } else if (strcmp(what, "glColorPointer") == 0) {
-        gl4es_glColorPointer(size, 0x1406, size * 4, g_conv);
-        fx->active = 0;
-    }
+    if (strcmp(what, "glVertexPointer") == 0)
+        gl4es_glVertexPointer(size, 0x1406 /* GL_FLOAT */, size * 4, fx->conv);
+    else if (strcmp(what, "glTexCoordPointer") == 0)
+        gl4es_glTexCoordPointer(size, 0x1406, size * 4, fx->conv);
+    else if (strcmp(what, "glColorPointer") == 0)
+        gl4es_glColorPointer(size, 0x1406, size * 4, fx->conv);
 }
 
 /* ---- initialisation ------------------------------------------------------ */
@@ -389,6 +407,24 @@ void gl4es_bridge_init(int fb_w, int fb_h)
     set_getprocaddress(gl4es_get_proc);
 #endif
     initialize_gl4es();
+
+#ifdef __EMSCRIPTEN__
+    /* gl4es allocates its per-context state in NewGLState(), which the EGL
+     * layer calls when a context is created. With NOEGL there is no context
+     * creation, so nothing calls it and `glstate` stays pointing at a
+     * zero-filled default -- every matrix call then dereferences a null
+     * sub-struct inside gl4es and traps at wasm level, with no guest PC and
+     * nothing in the log to say which call it was.
+     *
+     * DEFAULT_STATE is gl4es' marker for "the one default context", so the
+     * state lands in its static rather than a fresh allocation. */
+    {
+        extern void *NewGLState(void *, int);
+        NewGLState((void *)(uintptr_t)~(uintptr_t)0, 0);
+        extern void *glstate;
+        host_log("gl: NewGLState -> glstate = %p\n", glstate);
+    }
+#endif
     g_gl4es_ready = 1;
     gl4es_bridge_attach();
     host_log("gl: gl4es initialised, framebuffer %dx%d\n", fb_w, fb_h);
@@ -476,7 +512,23 @@ int gl4es_dispatch(const char *name, const uint32_t *args, int nargs,
     /* ---- transforms ----
      * These are the calls the engine makes every frame; the matrix stack itself
      * lives in gl4es (gl/matrix.c). */
-    if (strcmp(name, "glMatrixMode") == 0)   { gl4es_glMatrixMode(a0); return 1; }
+    /* gl4es keeps its state in a global that its own init is supposed to fill.
+     * Every matrix call goes through it, and a null one faults inside gl4es
+     * rather than here -- an "out of bounds" with no guest PC. */
+    {
+        extern void *glstate;
+        static int logged;
+        if (!logged) {
+            logged = 1;
+            host_log("gl: gl4es glstate = %p\n", glstate);
+        }
+    }
+
+    if (strcmp(name, "glMatrixMode") == 0) {
+        static int n;
+        if (n < 6) { n++; host_log("  [gl] glMatrixMode(%04x)\n", a0); }
+        gl4es_glMatrixMode(a0); return 1;
+    }
     if (strcmp(name, "glLoadIdentity") == 0) { gl4es_glLoadIdentity(); return 1; }
     if (strcmp(name, "glPushMatrix") == 0)   { gl4es_glPushMatrix(); return 1; }
     if (strcmp(name, "glPopMatrix") == 0)    { gl4es_glPopMatrix(); return 1; }
@@ -554,13 +606,35 @@ int gl4es_dispatch(const char *name, const uint32_t *args, int nargs,
     }
     if (strcmp(name, "glTexSubImage2D") == 0) {
         static int logged;
-        if (logged < 4) {
+        if (logged < 30) {
             logged++;
             host_log("  [gl] glTexSubImage2D nargs=%d target=%04x level=%d "
                      "x=%d y=%d w=%d h=%d format=%04x type=%04x px=%08x "
                      "caller=%08x\n",
                      nargs, a0, (int)a1, (int)a2, (int)a3, (int)a4,
                      (int)a5, a6, a7, a8, g_cpu.r[14]);
+        }
+        /* What the engine is actually handing over. A black screen has two
+         * very different causes -- the engine drew nothing, or it drew
+         * something that never reached the canvas -- and this is the line that
+         * tells them apart without a debugger. */
+        g_last_screen_ptr = a8; g_last_screen_w = (uint32_t)a4;
+        g_last_screen_h = (uint32_t)a5; g_last_screen_fmt = a6;
+        g_last_screen_type = a7;
+        {
+            static int stats;
+            if (stats < 6 && a8 && a8 < GUEST_MEM_SIZE) {
+                stats++;
+                uint32_t nz = 0, n = (uint32_t)a4 * (uint32_t)a5 * 2u;
+                const uint8_t *p = g_mem + a8;
+                if (a8 + n <= GUEST_MEM_SIZE)
+                    for (uint32_t i = 0; i < n; i++)
+                        if (p[i]) nz++;
+                host_log("  [gl]   pixels: %u bytes, %u non-zero (%.1f%%), "
+                         "first 8 = %02x %02x %02x %02x %02x %02x %02x %02x\n",
+                         n, nz, n ? 100.0 * nz / n : 0.0,
+                         p[0], p[1], p[2], p[3], p[4], p[5], p[6], p[7]);
+            }
         }
         /* SGL_FrameBufferToScreen calls this twice: once with the real format
          * and type (GL_RGB / GL_UNSIGNED_SHORT_5_6_5, matching the 384x256
@@ -628,6 +702,7 @@ int gl4es_dispatch(const char *name, const uint32_t *args, int nargs,
             return 1;
         }
         g_fx_vertex.active = 0;
+        g_fx_vertex.size = (int)a0; g_fx_vertex.stride = a2; g_fx_vertex.ptr = a3;
         gl4es_glVertexPointer((int32_t)a0, a1, (int32_t)a2, G(a3)); return 1;
     }
     if (strcmp(name, "glColorPointer") == 0) {
@@ -672,6 +747,47 @@ int gl4es_dispatch(const char *name, const uint32_t *args, int nargs,
      * the calls that will cost the most once the renderer is real, which is why
      * gl_report counts them. */
     if (strcmp(name, "glDrawArrays") == 0) {
+        /* Snapshot before the conversion: fixed_install() clears `active` as
+         * its last act, so anything read afterwards reports "not fixed" for a
+         * buffer that was. */
+        extern int g_gl_trace;
+        if (g_gl_trace > 0) {
+            {
+                char vb[200] = {0};
+                int o = 0;
+                if (g_fx_vertex.active) {
+                    /* GLfixed is 16.16, so the raw words have to be shifted
+                     * back down. Reading them as floats gives ~1e-39, which
+                     * prints as 0.0 and looks exactly like "the engine drew
+                     * nothing" -- it cost an hour. */
+                    const int32_t *v = (const int32_t *)(g_mem + g_fx_vertex.ptr);
+                    int vn = g_fx_vertex.size ? g_fx_vertex.size : 2;
+                    for (int i = 0; i < 4; i++) {
+                        o += snprintf(vb + o, sizeof(vb) - (size_t)o, "(");
+                        for (int k = 0; k < vn; k++)
+                            o += snprintf(vb + o, sizeof(vb) - (size_t)o,
+                                          "%s%.1f", k ? "," : "",
+                                          (double)v[i * vn + k] / 65536.0);
+                        o += snprintf(vb + o, sizeof(vb) - (size_t)o, ") ");
+                    }
+                } else {
+                    const float *v = (const float *)(g_mem + g_fx_vertex.ptr);
+                    int vn = g_fx_vertex.size ? g_fx_vertex.size : 2;
+                    o = 0;
+                    for (int i = 0; i < 4; i++) {
+                        o += snprintf(vb + o, sizeof(vb) - (size_t)o, "(");
+                        for (int k = 0; k < vn; k++)
+                            o += snprintf(vb + o, sizeof(vb) - (size_t)o,
+                                          "%s%.1f", k ? "," : "",
+                                          (double)v[i * vn + k]);
+                        o += snprintf(vb + o, sizeof(vb) - (size_t)o, ") ");
+                    }
+                }
+                host_log("  [draw] mode=%d n=%d fixed=%d ptr=%08x verts %s\n",
+                         (int)a0, (int)a2, g_fx_vertex.active,
+                         g_fx_vertex.ptr, vb);
+            }
+        }
         fixed_install("glVertexPointer", &g_fx_vertex, (int)a1, (int)a2);
         fixed_install("glTexCoordPointer", &g_fx_texcoord, (int)a1, (int)a2);
         fixed_install("glColorPointer", &g_fx_color, (int)a1, (int)a2);

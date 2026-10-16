@@ -15,6 +15,47 @@
 uint8_t *g_mem;
 uint32_t g_mem_size = GUEST_MEM_SIZE;
 
+/* ---- guest backtrace -----------------------------------------------------
+ *
+ * There is no frame-pointer chain to walk: this is Thumb code compiled with
+ * -fomit-frame-pointer, which is why the desktop crash handler can only name
+ * the faulting PC. But the guest stack is contiguous and single-threaded, and
+ * every call leaves a return address in it -- an address into .text with the
+ * Thumb bit set. Scanning for those recovers the call chain well enough to
+ * answer "which subsystem called this", which is the question every fault
+ * actually asks.
+ *
+ * Heuristic, and presented as one: a stale return address from a function that
+ * has already returned is still on the stack and still looks valid, so the
+ * chain can carry extra entries. It never invents one that was not a real
+ * call site, though, which is what makes it worth printing.
+ */
+
+void guest_backtrace(const char *why)
+{
+    uint32_t text_lo = 0, text_hi = 0, sp = g_cpu.r[13];
+    guest_text_bounds(&text_lo, &text_hi);
+    if (sp < GUEST_STACK_TOP - GUEST_STACK_SIZE || sp >= GUEST_STACK_TOP) {
+        host_log("  [bt] (%s) sp %08x is not on the guest stack\n", why, sp);
+        return;
+    }
+    host_log("  [bt] (%s) pc=%08x lr=%08x sp=%08x\n", why, g_cpu.r[15],
+             g_cpu.r[14], sp);
+    int shown = 0;
+    for (uint32_t a = sp; a + 4 <= GUEST_STACK_TOP && shown < 24; a += 4) {
+        uint32_t w = *(uint32_t *)(g_mem + a);
+        if (!(w & 1))
+            continue;                       /* Thumb return addresses are odd */
+        uint32_t t = w & ~1u;
+        if (t < text_lo || t >= text_hi)
+            continue;
+        host_log("  [bt]   [sp+%03x] %08x\n", a - sp, t);
+        shown++;
+    }
+    if (!shown)
+        host_log("  [bt]   no return addresses found on the stack\n");
+}
+
 /* ---- merge sort by an unsigned 32-bit key --------------------------------- */
 
 static void merge_u32(uint8_t *base, uint8_t *tmp, size_t n, size_t esz,

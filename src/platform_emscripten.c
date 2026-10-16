@@ -21,6 +21,7 @@
 #include <string.h>
 #include <emscripten.h>
 #include <emscripten/html5.h>
+#include <GLES2/gl2.h>
 
 /* ---- logging -------------------------------------------------------------
  * Straight to stdout. Emscripten turns that into a console.log line, which the
@@ -127,6 +128,31 @@ void spike_set_frames(int n) { g_browser_frames = n; }
 
 void host_browser_read_frames(void) { spike_read_frames_js(); }
 
+/* Dump the engine's own screen surface to the console, base64, at the end of
+ * the run -- see main.c. Off unless the page asks (Module.spikeDumpScreen).
+ *
+ * It exists because "the canvas is black" is ambiguous: the engine may have
+ * drawn nothing, or drawn correctly into a surface that never reached the
+ * screen, and a wasm build has no debugger to tell them apart. Decoding this
+ * gives the picture the canvas *should* be showing. */
+int g_browser_dump_screen;
+
+/* How many GL entry points to name in the log. Zero by default; a misbehaving
+ * draw is diagnosed by turning it up, not by reading it on every run. */
+int g_browser_gl_trace;
+EM_JS(void, spike_read_gl_trace_js, (void), {
+    if (typeof Module !== 'undefined' && Module.spikeGlTrace)
+        _spike_set_gl_trace(Module.spikeGlTrace | 0);
+});
+void spike_set_gl_trace(int n) { g_browser_gl_trace = n; }
+void host_browser_read_gl_trace(void) { spike_read_gl_trace_js(); }
+EM_JS(void, spike_read_dump_js, (void), {
+    if (typeof Module !== 'undefined' && Module.spikeDumpScreen)
+        _spike_set_dump_screen(1);
+});
+void spike_set_dump_screen(int n) { g_browser_dump_screen = n; }
+void host_browser_read_dump(void) { spike_read_dump_js(); }
+
 void host_browser_set_size(int w, int h) { g_fb_w = w; g_fb_h = h; }
 
 int host_browser_gl_setup(void)
@@ -160,6 +186,22 @@ int host_browser_gl_setup(void)
     emscripten_set_canvas_element_size("#canvas", g_fb_w, g_fb_h);
 
     emscripten_webgl_make_context_current(ctx);
+    /* Ask the context what it actually is. Creating it with majorVersion 2 is
+     * a request, not a guarantee -- and the failure mode when it is not
+     * honoured is silent: gl4es's ES3 shader probe fails, gl4es concludes ES3
+     * is unavailable, and then every fixed-function draw compiles against a
+     * dialect mismatch and produces nothing. The canvas stays black with no
+     * error anywhere near the draw. */
+    {
+        EmscriptenWebGLContextAttributes got;
+        emscripten_webgl_get_context_attributes(ctx, &got);
+        host_log("gl: context is WebGL%d.%d (asked for %d.%d)\n",
+                 got.majorVersion, got.minorVersion,
+                 attr.majorVersion, attr.minorVersion);
+    }
+    host_log("gl: GL_VERSION=%s\n", (const char *)glGetString(GL_VERSION));
+    host_log("gl: GL_SHADING_LANGUAGE_VERSION=%s\n",
+             (const char *)glGetString(GL_SHADING_LANGUAGE_VERSION));
     host_log("gl: WebGL context ready, canvas %dx%d\n", g_fb_w, g_fb_h);
     return 1;
 }

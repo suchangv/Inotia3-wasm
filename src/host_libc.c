@@ -43,6 +43,38 @@ typedef struct {
 #define HDR_SZ   ((uint32_t)((sizeof(blk_hdr) + 7u) & ~7u))
 #define ALIGN8(n) (((n) + 7u) & ~7u)
 
+/* The import currently being serviced. A shim that rejects its arguments has
+ * the caller's LR to report, but that names the guest instruction and not the
+ * API -- and "free() was called with a bad pointer" reads very differently
+ * from "realloc() was". */
+const char *g_current_import = "?";
+
+/* The last few host crossings, as (name, arg0, arg1, caller).
+ *
+ * A rejected pointer is only half a diagnosis: the question is always where it
+ * came from. The value was usually handed to the guest by an import a few
+ * calls earlier -- a JNI string, a file buffer, an allocation -- and the ring
+ * answers that without a debugger, which matters because the browser build has
+ * none. */
+#define RECENT_MAX 24
+static struct {
+    const char *name;
+    uint32_t a0, a1, lr;
+} g_recent[RECENT_MAX];
+static int g_recent_n, g_recent_w;
+
+static void recent_dump(void)
+{
+    int n = g_recent_n < RECENT_MAX ? g_recent_n : RECENT_MAX;
+    host_log("  [heap] last %d host calls before this one:\n", n);
+    for (int i = 0; i < n; i++) {
+        int k = (g_recent_w - n + i + RECENT_MAX * 2) % RECENT_MAX;
+        host_log("  [heap]   %-24s a0=%08x a1=%08x caller=%08x\n",
+                 g_recent[k].name, g_recent[k].a0, g_recent[k].a1,
+                 g_recent[k].lr);
+    }
+}
+
 static uint32_t heap_start;   /* first block header                     */
 static uint32_t heap_break;   /* one past the last address carved out    */
 
@@ -63,28 +95,64 @@ static void heap_init(void)
     heap_break = heap_start + HDR_SZ + sz;
 }
 
+/* A block header is only meaningful inside the arena. `free` on anything else
+ * -- a pointer the guest never got from here, an offset into a struct, a
+ * double free that has already been coalesced -- makes `at = ptr - HDR_SZ`
+ * land outside the buffer and the first read of `h->size` becomes an opaque
+ * wasm trap with no PC. Checking first turns that into a line naming the
+ * pointer and the caller, which is the difference between "the heap is
+ * corrupt" and "this call site passed garbage". */
+static int heap_owns(uint32_t at)
+{
+    return at >= heap_start && at + HDR_SZ <= heap_break;
+}
+
+/* Keep the block after `at` pointing back at it.
+ *
+ * `prev_size` is what makes backward coalescing O(1), and it is only correct
+ * if every write to a size word writes the neighbour's back-pointer too. It
+ * was maintained in the split path only, and there from the *flagged* size
+ * word, which is one byte too large -- so the neighbour's `prev_size` named an
+ * address inside its own payload. A free then walked back into the middle of a
+ * live block, read a garbage size, and (before this was guarded) followed it
+ * off the end of the arena. */
+static void heap_set_next_prev(uint32_t at, uint32_t sz)
+{
+    uint32_t nxt = at + HDR_SZ + sz;
+    if (nxt <= heap_break - HDR_SZ)
+        ((blk_hdr *)(g_mem + nxt))->prev_size = sz;
+}
+
 static uint32_t heap_alloc(uint32_t want)
 {
     heap_init();
     want = ALIGN8(want ? want : 8);
 
     uint32_t at = heap_start;
-    while (at + HDR_SZ <= heap_break) {
+    while (heap_owns(at)) {
         blk_hdr *h = (blk_hdr *)(g_mem + at);
         uint32_t sz = h->size & ~BLK_FREE;
+        /* A block has to fit between its own header and the break, or the
+         * header is not a header and the walk is following garbage. Report it
+         * rather than stepping to whatever address the size word names. */
+        if (sz > heap_break - at - HDR_SZ) {
+            host_log("  [heap] corrupt header at %08x: size %08x (heap "
+                     "%08x..%08x, caller %08x)\n", at, h->size, heap_start,
+                     heap_break, g_cpu.r[14]);
+            break;
+        }
         if ((h->size & BLK_FREE) && sz >= want) {
             /* Split when the remainder can hold a header plus a sane payload;
              * otherwise hand over the whole block to avoid a run of unusable
              * slivers. */
             if (sz >= want + HDR_SZ + 16u) {
+                uint32_t rest_sz = sz - want - HDR_SZ;
                 uint32_t rest = at + HDR_SZ + want;
                 blk_hdr *n = (blk_hdr *)(g_mem + rest);
-                n->size = (sz - want - HDR_SZ) | BLK_FREE;
+                n->size = rest_sz | BLK_FREE;
                 n->prev_size = want;
                 h->size = want;
-                blk_hdr *after = (blk_hdr *)(g_mem + rest + HDR_SZ + n->size);
-                if (rest + HDR_SZ + n->size + HDR_SZ <= heap_break)
-                    after->prev_size = n->size;
+                heap_set_next_prev(rest, rest_sz);
             }
             h->size &= ~BLK_FREE;
             return at + HDR_SZ;
@@ -98,31 +166,75 @@ static uint32_t heap_alloc(uint32_t want)
     return 0;
 }
 
+static void heap_bad_free(uint32_t ptr, const char *why)
+{
+    static int warned;
+    if (warned++ < 20)
+        host_log("  [heap] free(%08x): %s (from %s, caller %08x)\n", ptr, why,
+                 g_current_import, g_cpu.r[14]);
+        if (warned <= 2) {
+            recent_dump();
+            guest_backtrace(why);
+        }
+}
+
 static void heap_free(uint32_t ptr)
 {
     if (!ptr)
         return;
     uint32_t at = ptr - HDR_SZ;
+    if (!heap_owns(at)) {
+        heap_bad_free(ptr, "not a heap address");
+        return;
+    }
     blk_hdr *h = (blk_hdr *)(g_mem + at);
+    if (h->size & BLK_FREE) {
+        /* Freeing twice is harmless to ignore but it does mean the caller's
+         * bookkeeping is off, and the coalescing below would merge a block
+         * into itself. */
+        heap_bad_free(ptr, "already free");
+        return;
+    }
     h->size |= BLK_FREE;
 
-    /* Coalesce forward. */
+    /* Coalesce forward.
+     *
+     * `nxt` is derived from the header's own size word, so a corrupted size --
+     * the guest writing past the end of its block, or a pointer into the
+     * middle of one -- puts it anywhere at all. The check has to be written so
+     * it still holds when the addition wraps: `nxt + HDR_SZ > heap_break` is
+     * false for a `nxt` just under 2^32, and the loop would then dereference
+     * it. Same for walking back with `prev_size`. */
     for (;;) {
-        uint32_t nxt = at + HDR_SZ + (h->size & ~BLK_FREE);
-        if (nxt + HDR_SZ > heap_break)
+        uint32_t sz = h->size & ~BLK_FREE;
+        if (sz > heap_break - at - HDR_SZ)
+            break;
+        uint32_t nxt = at + HDR_SZ + sz;
+        if (!heap_owns(nxt))
             break;
         blk_hdr *n = (blk_hdr *)(g_mem + nxt);
         if (!(n->size & BLK_FREE))
             break;
-        h->size = (h->size & ~BLK_FREE) + HDR_SZ + (n->size & ~BLK_FREE);
-        h->size |= BLK_FREE;
+        h->size = (sz + HDR_SZ + (n->size & ~BLK_FREE)) | BLK_FREE;
     }
+    /* The merge moved this block's end, so the block that follows it now has a
+     * stale back-pointer unless it is told. */
+    heap_set_next_prev(at, h->size & ~BLK_FREE);
+
     /* Coalesce backward using prev_size. */
     if (h->prev_size) {
+        if (h->prev_size > at - HDR_SZ - heap_start) {
+            heap_bad_free(ptr, "prev_size runs off the front of the heap");
+            return;
+        }
         blk_hdr *p = (blk_hdr *)(g_mem + at - HDR_SZ - h->prev_size);
         if (p->size & BLK_FREE) {
-            p->size = (p->size & ~BLK_FREE) + HDR_SZ + (h->size & ~BLK_FREE);
-            p->size |= BLK_FREE;
+            p->size = ((p->size & ~BLK_FREE) + HDR_SZ +
+                       (h->size & ~BLK_FREE)) | BLK_FREE;
+            /* Same again, from the other end: `p` now ends where `h` did, so
+             * the block after `h` points back at `p`'s new size. */
+            heap_set_next_prev(at - HDR_SZ - h->prev_size,
+                               p->size & ~BLK_FREE);
         }
     }
 }
@@ -198,7 +310,7 @@ static void host_longjmp(uint32_t buf, uint32_t value)
 
 static uint32_t heap_usable(uint32_t ptr)
 {
-    if (!ptr)
+    if (!ptr || !heap_owns(ptr - HDR_SZ))
         return 0;
     blk_hdr *h = (blk_hdr *)(g_mem + ptr - HDR_SZ);
     return h->size & ~BLK_FREE;
@@ -608,6 +720,14 @@ static void watch_check(const char *what, uint32_t dst, uint32_t len)
 void host_import_call(guest_import *im)
 {
     uint32_t *R = g_cpu.r;
+    g_current_import = im->name;
+    g_recent[g_recent_w].name = im->name;
+    g_recent[g_recent_w].a0 = R[0];
+    g_recent[g_recent_w].a1 = R[1];
+    g_recent[g_recent_w].lr = R[14];
+    g_recent_w = (g_recent_w + 1) % RECENT_MAX;
+    if (g_recent_n < RECENT_MAX)
+        g_recent_n++;
     uint32_t a0 = R[0], a1 = R[1], a2 = R[2], a3 = R[3];
     /* AAPCS: arguments past the fourth live on the guest stack. */
     uint32_t sp = R[13];

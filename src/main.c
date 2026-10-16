@@ -549,9 +549,14 @@ int main(int argc, char **argv)
      * size -- and gl4es has to be up before any guest GL call arrives. */
     host_browser_set_size(SCREEN_W, SCREEN_H);
     host_browser_read_frames();
+    host_browser_read_dump();
+    host_browser_read_gl_trace();
     host_browser_gl_setup();
     gl4es_bridge_init(SCREEN_W, SCREEN_H);
-    { extern int g_gl_trace; g_gl_trace = 600; }
+    /* Per-call GL tracing is off unless the page asks for it: it is the first
+     * thing to reach for when a draw misbehaves, and 600 lines of noise in
+     * every ordinary run otherwise. */
+    { extern int g_gl_trace; g_gl_trace = g_browser_gl_trace; }
 #endif
 
     cpu_init(&g_img);
@@ -823,6 +828,44 @@ int main(int argc, char **argv)
                 if (ok)
                     host_log("  average over %d frame(s): %llu instructions\n",
                              ok, (unsigned long long)(total / (uint64_t)ok));
+#ifdef __EMSCRIPTEN__
+                /* Dump the engine's own screen surface, base64, in chunks.
+                 *
+                 * A black canvas is ambiguous -- the engine may have drawn
+                 * nothing, or drawn correctly into a buffer that never reached
+                 * the screen -- and there is no debugger here to tell them
+                 * apart. This is the buffer the engine last handed to
+                 * glTexSubImage2D for the screen blit, so it is exactly what
+                 * the canvas *should* be showing. Chunked because a single
+                 * 262 KB console line is truncated. */
+                if (g_browser_dump_screen) {
+                    extern uint32_t g_last_screen_ptr, g_last_screen_w;
+                    extern uint32_t g_last_screen_h;
+                    extern uint32_t g_last_screen_fmt, g_last_screen_type;
+                    host_log("  [dump] screen %ux%u fmt=%04x type=%04x at %08x\n",
+                             g_last_screen_w, g_last_screen_h,
+                             g_last_screen_fmt, g_last_screen_type,
+                             g_last_screen_ptr);
+                    static const char b64[] =
+                        "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz"
+                        "0123456789+/";
+                    uint32_t n = g_last_screen_w * g_last_screen_h * 2u;
+                    const uint8_t *p = g_mem + g_last_screen_ptr;
+                    char line[4097];
+                    uint32_t o = 0;
+                    for (uint32_t i = 0; i + 2 < n; i += 3) {
+                        uint32_t v = ((uint32_t)p[i] << 16) |
+                                     ((uint32_t)p[i + 1] << 8) | p[i + 2];
+                        line[o++] = b64[(v >> 18) & 63];
+                        line[o++] = b64[(v >> 12) & 63];
+                        line[o++] = b64[(v >> 6) & 63];
+                        line[o++] = b64[v & 63];
+                        if (o >= 4096) { line[o] = 0; host_log("[dump] %s\n", line); o = 0; }
+                    }
+                    if (o) { line[o] = 0; host_log("[dump] %s\n", line); }
+                    host_log("[dump] end\n");
+                }
+#endif
             }
         }
     } else if (only_entry) {

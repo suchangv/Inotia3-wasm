@@ -92,6 +92,10 @@ void     guest_st8 (uint32_t a, uint8_t  v);
 
 /* ---- host services every platform must supply ---------------------------- */
 void host_log(const char *fmt, ...);
+
+/* Scans the guest stack for return addresses -- see util.c. Heuristic, and
+ * named as one, but it is the only call chain either wasm build can produce. */
+void guest_backtrace(const char *why);
 void *host_alloc(size_t n);          /* zeroed, in host memory (not guest) */
 double host_now(void);               /* monotonic seconds                  */
 void host_fatal(const char *fmt, ...);

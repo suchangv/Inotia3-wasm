@@ -72,4 +72,6 @@ void cpu_enable_trace(int on);
 void cpu_dump_trace(void);
 void cpu_trace_final(void);
 
+void guest_text_bounds(uint32_t *lo, uint32_t *hi);
+
 #endif /* CPU_H */

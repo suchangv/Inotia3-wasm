@@ -118,10 +118,21 @@ build_browser() {
         if [ -d "$d" ]; then PRELOAD="$PRELOAD --preload-file $d"; fi
     done
 
-    $EMCC -O2 -I src \
+    # -sSTACK_SIZE: emscripten defaults the *host* stack to 64 KB. gl4es and
+    # the shims recurse well past that (the first fault here was "Attempt to
+    # set SP to 0x770a0, with stack limits [0x77f30 - 0x87f30]" -- an overflow
+    # with no guest involvement at all), and the symptom is a trap that looks
+    # like a guest bug. 8 MB, the same as the guest stack.
+    #
+    # --pre-js: a trap prints only "memory access out of bounds". The Error
+    # carries a wasm stack naming the function; tools/trap.js is what prints
+    # it. Debug builds add --profiling-funcs so those frames have names.
+    DBG=""
+    [ -n "$SPIKE_DEBUG" ] && DBG="-g --profiling-funcs -sASSERTIONS=2"
+    $EMCC -O2 -I src $DBG --pre-js tools/trap.js \
         $COMMON_BROWSER src/gl4es_bridge.c src/platform_emscripten.c src/main.c \
         "$GL4ES/libGL.a" \
-        -sFULL_ES2=1 -sALLOW_MEMORY_GROWTH=1 \
+        -sFULL_ES2=1 -sALLOW_MEMORY_GROWTH=1 -sSTACK_SIZE=8388608 \
         -sMIN_WEBGL_VERSION=2 -sMAX_WEBGL_VERSION=2 \
         -sEXIT_RUNTIME=0 \
         -sEXPORTED_RUNTIME_METHODS=ccall,cwrap \

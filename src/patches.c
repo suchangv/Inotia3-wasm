@@ -92,17 +92,36 @@ static int patch_symbol_return(const guest_image *img, const char *name,
  *     ldr  rB, [pc, #lit]     ; PIC offset
  *     add  rB, pc             ; rB = &some_global
  *     ldr  rX, [rB, #0]       ; rX = *some_global
- *     ldr  rY, [rX, #0]       ; dereference it
+ *     ldr  rY, [rX, #0]       ; rY = *rX, the vtable
+ *     ldr  rZ, [rY, #imm]     ; the method
+ *     blx  rZ                 ; and the call through it
  *
  * and every base it yields is a cached JavaVM pointer. That is
  * version-independent, which the hardcoded list is not.
+ *
+ * Every one of those six instructions has to be required, and the first
+ * version of this did not: it stopped after the fourth, so "load a global
+ * pointer, then read a field of the pointed-to struct" counted -- which is not
+ * a JavaVM idiom at all, it is how *any* intrusive linked list is walked.
+ * That matched 844 sites instead of a handful, and of the four whose global
+ * was still NULL at patch time, two were list heads:
+ *
+ *   SGL_clearStringCache   ldr r0, [r3, #0x38] ; ldr r3, [r0] ; ...unlink...
+ *   NM_http ThreadProc     ldr r2, [r3]        ; ldr r2, [r2, #0x14] ; head = head->next
+ *
+ * Writing the JavaVM into the second one is what this cost: the network
+ * worker took its queue head to be a request node, read the JNI struct as
+ * `node->next`, and called CS_knlFree on the JavaVM. The `blx` is what makes
+ * the difference -- a cache exists to be *called through*, a list head is
+ * only ever walked -- and requiring `[rB, #0]` and `[rX, #0]` with no
+ * displacement rules out the field-access forms as well.
  */
 static int patch_vm_caches(const guest_image *img)
 {
     uint32_t lo = img->text_lo, hi = img->text_hi;
     int found = 0, patched = 0;
 
-    for (uint32_t pc = lo; pc + 8 < hi; pc += 2) {
+    for (uint32_t pc = lo; pc + 12 < hi; pc += 2) {
         uint32_t h = LD16(pc);
         if ((h & 0xF800) != 0x4800)          /* ldr rB, [pc, #imm8*4] */
             continue;
@@ -120,20 +139,38 @@ static int patch_vm_caches(const guest_image *img)
                 continue;
 
             uint32_t base = LD32(lit) + pc + k + 4;
-            /* Then it must be read and immediately dereferenced. */
-            uint32_t h3 = LD16(pc + k + 2);
-            if ((h3 & 0xF800) != 0x6800 || ((h3 >> 3) & 7) != b)
-                continue;
-            uint32_t x = h3 & 7;
-            uint32_t h4 = LD16(pc + k + 4);
-            if ((h4 & 0xF800) != 0x6800 || ((h4 >> 3) & 7) != x)
-                continue;
-
             if (base < img->base || base >= img->base + 0x01000000u)
                 continue;
+
+            /* ldr rX, [rB] -- the global's value, no displacement. */
+            uint32_t h3 = LD16(pc + k + 2);
+            if ((h3 & 0xF800) != 0x6800 || ((h3 >> 3) & 7) != b ||
+                ((h3 >> 6) & 0x1f) != 0)
+                continue;
+            uint32_t x = h3 & 7;
+
+            /* ldr rY, [rX] -- the vtable, again with no displacement. */
+            uint32_t h4 = LD16(pc + k + 4);
+            if ((h4 & 0xF800) != 0x6800 || ((h4 >> 3) & 7) != x ||
+                ((h4 >> 6) & 0x1f) != 0)
+                continue;
+            uint32_t y = h4 & 7;
+
+            /* ldr rZ, [rY, #imm] -- a method out of that vtable. */
+            uint32_t h5 = LD16(pc + k + 6);
+            if ((h5 & 0xF800) != 0x6800 || ((h5 >> 3) & 7) != y)
+                continue;
+            uint32_t z = h5 & 7;
+
+            /* blx rZ -- and it has to actually be called. */
+            uint32_t h6 = LD16(pc + k + 8);
+            if ((h6 & 0xFF87) != 0x4780 || ((h6 >> 3) & 0xf) != z)
+                continue;
+
             found++;
             /* Write the JavaVM where the missing init function would have. */
             if (LD32(base) == 0) {
+                host_log("patches: vm cache at %08x (from pc %08x)\n", base, pc);
                 ST32(base, g_javavm_ptr);
                 patched++;
             }

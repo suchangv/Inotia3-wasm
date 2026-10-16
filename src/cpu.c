@@ -41,6 +41,15 @@ int g_guest_check_fault;
 #endif
 
 static const guest_image *g_img;
+
+/* The backtrace in util.c needs to know which addresses are call sites. The
+ * image pointer is private to this file, so it is handed out here rather than
+ * duplicated. */
+void guest_text_bounds(uint32_t *lo, uint32_t *hi)
+{
+    *lo = g_img ? g_img->text_lo : 0;
+    *hi = g_img ? g_img->text_hi : 0;
+}
 static int      g_thumb = 1;          /* the guest starts in Thumb state */
 static uint64_t g_budget;
 
@@ -112,6 +121,7 @@ void cpu_set_profile(int on) { g_prof.on = on; }
 void cpu_init(const guest_image *img)
 {
     g_img = img;
+    (void)0;
     g_prof.cap = img->nsorted;
     g_prof.counts = (uint64_t *)host_alloc(sizeof(uint64_t) * (size_t)(g_prof.cap ? g_prof.cap : 1));
     g_prof.cur = -1;
