@@ -299,7 +299,7 @@ void gl_host_call(const char *name, const uint32_t *args, int nargs,
                      name, w, h, is_sub ? "sub" : "full",
                      g_cpu.r[14], nz, n);
         }
-        if (dumped < 12 && px && w >= 256 && h >= 192) {
+        if (dumped < 80 && px && w >= 256 && h >= 192) {
             dumped++;
             char path[64];
             snprintf(path, sizeof(path), "fb%03d.raw", dumped);
