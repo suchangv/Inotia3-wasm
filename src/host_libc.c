@@ -24,6 +24,8 @@
  * throughput measurement -- has no filesystem and does not need one; the
  * browser and desktop builds both do. */
 #include <stdio.h>
+#include <sys/stat.h>
+#include <sys/types.h>
 #endif
 
 /* ========================================================================== */
@@ -131,6 +133,52 @@ static uint32_t heap_usable(uint32_t ptr)
         return 0;
     blk_hdr *h = (blk_hdr *)(g_mem + ptr - HDR_SZ);
     return h->size & ~BLK_FREE;
+}
+
+/* ========================================================================== */
+/* Guest pointer validation                                                    */
+/* ========================================================================== */
+
+/* Every shim that takes a guest pointer checks it first.
+ *
+ * The interpreter's own accesses are checked in a GUEST_CHECK build (see
+ * util.c), but the shims are ordinary C reading `g_mem + addr` directly -- and
+ * a bad pointer there walks off the end of linear memory, which under wasm is
+ * an opaque "memory access out of bounds" with no PC and no caller. `strlen`
+ * is the worst of them: one bad pointer and it scans until it happens to find
+ * a zero byte or leaves the buffer.
+ *
+ * Failing the call and naming it turns that into a location. */
+static int guest_ok(uint32_t addr, uint32_t len, const char *what)
+{
+    if (!addr)
+        return 0;
+    if (len > GUEST_MEM_SIZE || addr > GUEST_MEM_SIZE - len) {
+        static int warned;
+        if (warned < 20) {
+            warned++;
+            host_log("  [shim] %s: bad guest range %08x+%u (caller %08x)\n",
+                     what, addr, len, g_cpu.r[14]);
+        }
+        return 0;
+    }
+    return 1;
+}
+
+/* For the C-string shims, whose length is unknown up front: the bytes are
+ * scanned here so a missing terminator cannot run past the buffer. */
+static int guest_str_ok(uint32_t addr, uint32_t max, const char *what)
+{
+    if (!guest_ok(addr, 1, what))
+        return 0;
+    uint32_t lim = GUEST_MEM_SIZE - addr;
+    if (lim > max) lim = max;
+    for (uint32_t i = 0; i < lim; i++)
+        if (!g_mem[addr + i])
+            return 1;
+    host_log("  [shim] %s: unterminated string at %08x (caller %08x)\n",
+             what, addr, g_cpu.r[14]);
+    return 0;
 }
 
 /* ========================================================================== */
@@ -464,6 +512,9 @@ static void watch_check(const char *what, uint32_t dst, uint32_t len)
 /* The dispatch                                                               */
 /* ========================================================================== */
 
+/* Arguments past the fourth live in `args[]` (registers then guest stack). */
+#define extra_arg(n) ((n) < nargs ? args[n] : 0)
+
 void host_import_call(guest_import *im)
 {
     uint32_t *R = g_cpu.r;
@@ -530,11 +581,21 @@ void host_import_call(guest_import *im)
     }
 
     /* ---- strings ---- */
-    case IMPL_memcpy:  watch_check("memcpy", a0, a2); if (a0 && a1) memcpy(g_mem + a0, g_mem + a1, a2); R[0] = a0; break;
-    case IMPL_memset:  watch_check("memset", a0, a2); if (a0) memset(g_mem + a0, (int)a1, a2); R[0] = a0; break;
-    case IMPL_memmove: watch_check("memmove", a0, a2); if (a0 && a1) memmove(g_mem + a0, g_mem + a1, a2); R[0] = a0; break;
-    case IMPL_memcmp:  R[0] = a0 && a1 ? (uint32_t)(int32_t)memcmp(g_mem + a0, g_mem + a1, a2) : 0; break;
-    case IMPL_strlen:  R[0] = a0 ? (uint32_t)strlen((const char *)(g_mem + a0)) : 0; break;
+    case IMPL_memcpy:  watch_check("memcpy", a0, a2);
+        if (guest_ok(a0, a2, "memcpy dst") && guest_ok(a1, a2, "memcpy src"))
+            memcpy(g_mem + a0, g_mem + a1, a2);
+        R[0] = a0; break;
+    case IMPL_memset:  watch_check("memset", a0, a2);
+        if (guest_ok(a0, a2, "memset")) memset(g_mem + a0, (int)a1, a2);
+        R[0] = a0; break;
+    case IMPL_memmove: watch_check("memmove", a0, a2);
+        if (guest_ok(a0, a2, "memmove dst") && guest_ok(a1, a2, "memmove src"))
+            memmove(g_mem + a0, g_mem + a1, a2);
+        R[0] = a0; break;
+    case IMPL_memcmp:  R[0] = (guest_ok(a0, a2, "memcmp a") && guest_ok(a1, a2, "memcmp b"))
+            ? (uint32_t)(int32_t)memcmp(g_mem + a0, g_mem + a1, a2) : 0; break;
+    case IMPL_strlen:  R[0] = guest_str_ok(a0, GUEST_MEM_SIZE - a0, "strlen")
+            ? (uint32_t)strlen((const char *)(g_mem + a0)) : 0; break;
     case IMPL_strcmp:  R[0] = (uint32_t)(int32_t)strcmp(guest_str(a0, 4096), guest_str(a1, 4096)); break;
     case IMPL_strncmp: R[0] = (uint32_t)(int32_t)memcmp(guest_str(a0, a2 + 1), guest_str(a1, a2 + 1), a2); break;
     case IMPL_strcpy: {
@@ -825,10 +886,71 @@ void host_import_call(guest_import *im)
 
     /* ---- loader / misc ---- */
     case IMPL_getpid: R[0] = 4242; break;
+#ifndef WASM_FREESTANDING
+    case IMPL_mmap: {
+        /* mmap(void *addr, size_t length, int prot, int flags, int fd,
+         *      off_t offset)
+         *
+         * The engine reads its resources through MMappedFile::Open, which mmaps
+         * the asset archive -- so this has to actually produce the file's bytes,
+         * not scratch memory. A bump allocator that returns zeros makes every
+         * resource decode as empty, which surfaces as "not a PNG file" far from
+         * the cause.
+         *
+         * The guest address space is a plain buffer, so "mapping" is: reserve
+         * guest memory and read the file into it. There is no unmap to do --
+         * munmap already does nothing and the guest never reuses the range. */
+        uint32_t len = a1;
+        int fd = (int)extra_arg(4);
+        long off = (long)(int32_t)extra_arg(5);
+        FILE *f = file_of((uint32_t)fd);
+        static int logged;
+        if (logged < 6) {
+            logged++;
+            host_log("  [mmap] len=%u fd=%d off=%ld file=%s\n", len, fd, off,
+                     f ? "open" : "NO HANDLE");
+        }
+        uint32_t dst = host_guest_mmap(len ? len : 1);
+        if (!dst) { R[0] = (uint32_t)-1; break; }
+        if (f && len) {
+            memset(g_mem + dst, 0, len);
+            if (fseek(f, off, SEEK_SET) == 0)
+                fread(g_mem + dst, 1, len, f);
+        }
+        R[0] = dst;
+        break;
+    }
+    case IMPL_mkdir: {
+        /* The engine creates /sdcard/Android/data/<package>/files before using
+         * it. One level at a time is all it asks for. */
+        guest_path(a0, g_path_buf, sizeof(g_path_buf));
+        R[0] = (mkdir(g_path_buf, 0777) == 0) ? 0 : (uint32_t)-1;
+        break;
+    }
+    case IMPL_stat: {
+        /* struct stat is bionic's, and the engine only reads st_size and
+         * st_mode from it. Writing the whole host struct would be wrong -- the
+         * layouts differ -- so only those two fields are filled, at bionic's
+         * offsets. */
+        guest_path(a0, g_path_buf, sizeof(g_path_buf));
+        FILE *f = fopen(g_path_buf, "rb");
+        if (!f) { R[0] = (uint32_t)-1; break; }
+        fseek(f, 0, SEEK_END);
+        long sz = ftell(f);
+        fclose(f);
+        if (a1) {
+            if (!guest_ok(a1, 64, "stat")) { R[0] = (uint32_t)-1; break; }
+            memset(g_mem + a1, 0, 64);
+            ST32(a1 + 8, (uint32_t)sz);       /* st_size  (bionic arm: +8) */
+            ST32(a1 + 16, 0100644);           /* st_mode  (bionic arm: +16) */
+        }
+        R[0] = 0;
+        break;
+    }
+#endif
     case IMPL_dlopen: R[0] = 0; break;
     case IMPL_dlsym:  R[0] = 0; break;
     case IMPL_dlclose: R[0] = 0; break;
-    case IMPL_mmap:   R[0] = host_guest_mmap(a1); break;
     case IMPL_munmap: R[0] = 0; break;
 
     /* ---- file I/O ---- */

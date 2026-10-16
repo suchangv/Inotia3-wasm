@@ -54,6 +54,7 @@ enum {
     IMPL_pthread_cond_broadcast, IMPL_pthread_cond_destroy,
     IMPL_mmap, IMPL_munmap,
     IMPL_getpid, IMPL_errno_addr,
+    IMPL_mkdir, IMPL_stat,
     IMPL_dlopen, IMPL_dlsym, IMPL_dlclose,
     IMPL_fopen, IMPL_fclose, IMPL_fread, IMPL_fwrite, IMPL_fseek, IMPL_fstat,
     IMPL_open, IMPL_close, IMPL_read, IMPL_write, IMPL_lseek,

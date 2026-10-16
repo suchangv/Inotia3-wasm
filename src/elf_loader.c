@@ -322,6 +322,18 @@ int elf_load(const uint8_t *file, size_t len, guest_image *out)
                  * what selects Thumb state. */
                 *slot = g_imports[idx].is_object ? g_imports[idx].stub
                                                  : g_imports[idx].interwork;
+                /* A function reached through the PLT must get a stub, never a
+                 * variable's address: the engine calls through this slot, and
+                 * a data address there is a jump into the loader's own state.
+                 * Logged rather than assumed -- a symbol classified as an
+                 * object when it is a function is invisible until something
+                 * calls it. */
+                static int n_obj_reloc;
+                if (g_imports[idx].is_object && n_obj_reloc < 12) {
+                    n_obj_reloc++;
+                    host_log("elf: reloc %s at %08x -> %08x (%s)\n",
+                             rl[r].what, r_offset, *slot, nm);
+                }
                 break;
             }
 

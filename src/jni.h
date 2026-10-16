@@ -61,6 +61,12 @@ void jni_guest_init(void);
 uint32_t jni_host_new_int_array(int n);
 uint32_t jni_host_new_array(int elem, int n);
 
+/* Create a jstring from a host C string. The Java methods the engine calls for
+ * its paths, locale and clock all return strings, and every one of them
+ * returning zero is what turns "/sdcard/Android/data/%s/files/%s" into a path
+ * with unsubstituted format specifiers. */
+uint32_t jni_host_new_string(const char *s);
+
 /* Guest address of an array handle's payload, for the host to fill in a value
  * the Java side would have supplied (e.g. the current wall-clock time). */
 uint32_t jni_host_array_addr(uint32_t handle);

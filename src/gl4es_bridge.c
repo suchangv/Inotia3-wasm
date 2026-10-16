@@ -59,13 +59,39 @@ extern void set_getprocaddress(void *(*fn)(const char *));
  * treat a null pointer as meaningful (glTexImage2D with NULL allocates storage
  * without uploading), and handing gl4es g_mem+0 instead would make it read the
  * guard region. */
+/* Every guest pointer that crosses into gl4es goes through here, and an
+ * out-of-range one is checked rather than followed. Without the check a bad
+ * pointer is read by gl4es at host level -- an opaque wasm trap with no PC --
+ * while with it the address and the calling GL entry point are named. */
 static inline const void *G(uint32_t guest_addr)
 {
-    return guest_addr ? (const void *)(g_mem + guest_addr) : (const void *)0;
+    if (!guest_addr)
+        return (const void *)0;
+    if (guest_addr >= GUEST_MEM_SIZE) {
+        static int warned;
+        if (warned < 10) {
+            warned++;
+            host_log("gl: bad guest pointer %08x from caller %08x -- passing "
+                     "NULL\n", guest_addr, g_cpu.r[14]);
+        }
+        return (const void *)0;
+    }
+    return (const void *)(g_mem + guest_addr);
 }
 static inline void *GW(uint32_t guest_addr)
 {
-    return guest_addr ? (void *)(g_mem + guest_addr) : (void *)0;
+    if (!guest_addr)
+        return (void *)0;
+    if (guest_addr >= GUEST_MEM_SIZE) {
+        static int warned;
+        if (warned < 10) {
+            warned++;
+            host_log("gl: bad guest pointer %08x (write) from caller %08x -- "
+                     "passing NULL\n", guest_addr, g_cpu.r[14]);
+        }
+        return (void *)0;
+    }
+    return (void *)(g_mem + guest_addr);
 }
 
 /* GLfloat arguments cross the boundary as their bit pattern in a word; the
@@ -114,6 +140,79 @@ static const float *fixed_matrix(const void *src)
     for (int i = 0; i < 16; i++)
         m[i] = X(v[i]);
     return m;
+}
+
+/* ---- GL_FIXED client arrays ----------------------------------------------
+ *
+ * GLES1's most common vertex format, and WebGL's one hard exclusion: the
+ * WebGL-friendly GLES2 subset drops GL_FIXED, so `glVertexPointer(..., GL_FIXED,
+ * ...)` reaches the driver as GL_INVALID_ENUM and the array is left unbound --
+ * which is why every draw then fails with "an enabled vertex array has no
+ * buffer" and the screen stays empty while the engine draws happily.
+ *
+ * gl4es does not convert it. It only has GL_FIXED in its enum name table; its
+ * array code never mentions it, because a real GLES2 driver accepts the type
+ * and WebGL does not. So the conversion belongs here: record the array when it
+ * is set, and convert it at draw time, because GLES1 client arrays are read
+ * when the draw happens, not when the pointer is set.
+ */
+#define GL_FIXED_ 0x140C
+
+typedef struct {
+    int      active;
+    int      size;
+    uint32_t stride;      /* bytes; 0 means tightly packed */
+    uint32_t ptr;         /* guest address */
+    int      logged;
+} fixed_array;
+
+static fixed_array g_fx_vertex, g_fx_texcoord, g_fx_color;
+
+static float  *g_conv;
+static size_t  g_conv_cap;
+
+/* Convert `count` vertices starting at `first` and install the result as a
+ * float array, then clear the record so the next call re-records. */
+static void fixed_install(const char *what, fixed_array *fx, int first, int count)
+{
+    if (!fx->active)
+        return;
+    int size = fx->size > 0 && fx->size <= 4 ? fx->size : 4;
+    uint32_t stride = fx->stride ? fx->stride : (uint32_t)size * 4u;
+
+    if (!fx->logged) {
+        fx->logged = 1;
+        host_log("gl: %s is GL_FIXED (size=%d stride=%u ptr=%08x) -- converting "
+                 "to float, WebGL has no GL_FIXED\n",
+                 what, size, stride, fx->ptr);
+    }
+
+    size_t need = (size_t)(first + count) * (size_t)size * sizeof(float);
+    if (need > g_conv_cap) {
+        g_conv = (float *)host_alloc(need);
+        g_conv_cap = need;
+    }
+    const uint32_t *src = (const uint32_t *)G(fx->ptr + (uint32_t)first * stride);
+    if (!src) {
+        fx->active = 0;
+        return;
+    }
+    size_t n = (size_t)count * (size_t)size;
+    for (size_t i = 0; i < n; i++)
+        g_conv[i] = (float)(int32_t)src[i] / 65536.0f;
+
+    /* Host memory, not guest: the float copy lives in this process, and gl4es
+     * hands the pointer straight to the driver. */
+    if (strcmp(what, "glVertexPointer") == 0) {
+        gl4es_glVertexPointer(size, 0x1406 /* GL_FLOAT */, size * 4, g_conv);
+        fx->active = 0;
+    } else if (strcmp(what, "glTexCoordPointer") == 0) {
+        gl4es_glTexCoordPointer(size, 0x1406, size * 4, g_conv);
+        fx->active = 0;
+    } else if (strcmp(what, "glColorPointer") == 0) {
+        gl4es_glColorPointer(size, 0x1406, size * 4, g_conv);
+        fx->active = 0;
+    }
 }
 
 /* ---- initialisation ------------------------------------------------------ */
@@ -487,12 +586,33 @@ int gl4es_dispatch(const char *name, const uint32_t *args, int nargs,
      * The engine sets client-side arrays and draws from them. Emscripten's GL
      * needs -sFULL_ES2 for these; gl4es also has its own path for them. */
     if (strcmp(name, "glVertexPointer") == 0) {
+        if (a1 == GL_FIXED_) {
+            /* Do not forward: WebGL rejects the type and the array is left
+             * unbound. Recorded for conversion at draw time instead. */
+            g_fx_vertex.active = 1; g_fx_vertex.size = (int)a0; g_fx_vertex.stride = a2; g_fx_vertex.ptr = a3;
+            return 1;
+        }
+        g_fx_vertex.active = 0;
         gl4es_glVertexPointer((int32_t)a0, a1, (int32_t)a2, G(a3)); return 1;
     }
     if (strcmp(name, "glColorPointer") == 0) {
+        if (a1 == GL_FIXED_) {
+            /* Do not forward: WebGL rejects the type and the array is left
+             * unbound. Recorded for conversion at draw time instead. */
+            g_fx_color.active = 1; g_fx_color.size = (int)a0; g_fx_color.stride = a2; g_fx_color.ptr = a3;
+            return 1;
+        }
+        g_fx_color.active = 0;
         gl4es_glColorPointer((int32_t)a0, a1, (int32_t)a2, G(a3)); return 1;
     }
     if (strcmp(name, "glTexCoordPointer") == 0) {
+        if (a1 == GL_FIXED_) {
+            /* Do not forward: WebGL rejects the type and the array is left
+             * unbound. Recorded for conversion at draw time instead. */
+            g_fx_texcoord.active = 1; g_fx_texcoord.size = (int)a0; g_fx_texcoord.stride = a2; g_fx_texcoord.ptr = a3;
+            return 1;
+        }
+        g_fx_texcoord.active = 0;
         gl4es_glTexCoordPointer((int32_t)a0, a1, (int32_t)a2, G(a3)); return 1;
     }
     if (strcmp(name, "glNormalPointer") == 0) {
@@ -517,6 +637,9 @@ int gl4es_dispatch(const char *name, const uint32_t *args, int nargs,
      * the calls that will cost the most once the renderer is real, which is why
      * gl_report counts them. */
     if (strcmp(name, "glDrawArrays") == 0) {
+        fixed_install("glVertexPointer", &g_fx_vertex, (int)a1, (int)a2);
+        fixed_install("glTexCoordPointer", &g_fx_texcoord, (int)a1, (int)a2);
+        fixed_install("glColorPointer", &g_fx_color, (int)a1, (int)a2);
         gl4es_glDrawArrays(a0, (int32_t)a1, (int32_t)a2);
         g_gl_draw_calls++;
         return 1;

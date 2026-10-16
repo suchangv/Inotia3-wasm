@@ -35,7 +35,7 @@ find_wasm_ld() {
     return 1
 }
 
-COMMON="src/util.c src/elf_loader.c src/cpu.c src/imports.c src/host_libc.c src/jni.c src/gl.c src/patches.c src/timers.c"
+COMMON="src/util.c src/elf_loader.c src/cpu.c src/imports.c src/host_libc.c src/jni.c src/gl.c src/patches.c src/timers.c src/asset_zip.c"
 COMMON_BROWSER="$COMMON"
 
 build_native() {
@@ -105,7 +105,15 @@ build_browser() {
     # which the WebGL-compatible GLES2 subset excludes by default.
     # --preload-file keeps the source path, so the image would land at
     # game/libgame.so; the "@" form places it where the loader looks.
+    # The .apk is the asset archive the engine reads resources out of, at byte
+    # offsets (see src/asset_zip.c). 22 MB, and --preload-file puts it in the
+    # emscripten filesystem where fopen finds it.
     PRELOAD="--preload-file game/libgame.so@libgame.so"
+    if [ -f game/assets.apk ]; then
+        PRELOAD="$PRELOAD --preload-file game/assets.apk@assets.apk"
+    else
+        echo "   note: game/assets.apk missing -- the engine will find no assets"
+    fi
     for d in ${ASSET_DIRS:-}; do
         if [ -d "$d" ]; then PRELOAD="$PRELOAD --preload-file $d"; fi
     done

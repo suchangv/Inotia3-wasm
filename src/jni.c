@@ -30,6 +30,15 @@
 #include "imports.h"
 #include "compat.h"
 #include "timers.h"
+#include "asset_zip.h"
+
+/* The archive the engine reads its assets out of, and where inside it they
+ * live. The engine's own resource code decides the sub-path and appends the
+ * extension (see asset_zip.c), so these three constants are the whole of this
+ * port's opinion about the layout. */
+#define ASSET_ARCHIVE "assets.apk"
+#define ASSET_PREFIX  "assets/common/game_res/"
+#define ASSET_SUFFIX  ".jpg"
 
 /* ---- guest layout -------------------------------------------------------- */
 
@@ -512,10 +521,172 @@ int jni_host_call(const char *name, uint32_t *args, int nargs, uint32_t *ret_lo,
         (strstr(fn, "Method") || strstr(fn, "Field"))) {
         note_method(a2);
 
-        /* The timer table is the one Java-side facility the engine cannot run
-         * without: it is how the game loop schedules itself (see timers.h).
-         * The registration arrives as an ordinary Java call, so it is
-         * intercepted here rather than implemented as a JNI entry point.
+        /* The handful of Java methods that have to return something real.
+         *
+         * Everything else answers zero, which is fine for a getter nothing acts
+         * on -- but not for these. GetUserDir and GetPackageName are the inputs
+         * to every resource path the engine builds: with them empty, mode 0 and
+         * mode 3 produce "/sdcard/Android/data//sdcard/Android/data/%s/files"
+         * and the engine can never find a file. They are also the reason the
+         * path formatting shows literal %s -- the format string is fine, its
+         * arguments are not.
+         *
+         * The values are the ones this build actually shipped with; the package
+         * name comes from the APK, and the Vita port records the same one
+         * ("com.com2us.inotia3...google.global"). */
+        {
+            jni_handle *m = handle_of(a2);
+            if (m && m->kind == H_METHOD) {
+                const char *n = m->name;
+                if (strcmp(n, "GetPackageName") == 0) {
+                    *ret_lo = jni_host_new_string("com.com2us.inotia3.google.global");
+                    st->implemented = 1; return 1;
+                }
+                if (strcmp(n, "GetUserDir") == 0) {
+                    /* Where the engine puts saves. A directory that exists is
+                     * enough; the browser build backs it with IndexedDB. */
+                    *ret_lo = jni_host_new_string("/data");
+                    st->implemented = 1; return 1;
+                }
+                if (strcmp(n, "GetApkFilePath") == 0 ||
+                    strcmp(n, "GetBundlePath") == 0 ||
+                    strcmp(n, "GetResourcePath") == 0) {
+                    /* The engine reads its assets out of this file at byte
+                     * offsets (mode 2's "@offset|length|path"), so it has to be
+                     * the real archive, not a directory. One constant path for
+                     * every asset is exactly what Android does and what makes
+                     * jGetApkFilePath's own caching harmless. */
+                    *ret_lo = jni_host_new_string(ASSET_ARCHIVE);
+                    st->implemented = 1; return 1;
+                }
+                if (strcmp(n, "GetFileDescriptor") == 0) {
+                    /* GetFileDescriptor(String name, int[] values,
+                     *                    boolean closeFDdirectly)
+                     *
+                     * This is Android's AssetManager.openFd(): fill values[0]
+                     * with the offset and values[1] with the length of the
+                     * asset inside the archive, and return the descriptor. The
+                     * engine reads those two and mmaps the archive at that
+                     * offset -- which is why the archive has to be the real
+                     * .apk and the entries have to be STORED.
+                     *
+                     * A missing asset is reported as {-1, -1}, which is what
+                     * the Java side does; the engine checks for it. */
+                    /* The name arrives as a jstring *handle*, not a guest
+                     * string pointer -- every jstring the engine holds came
+                     * from NewStringUTF, and a handle is the only thing that
+                     * identifies it. Reading it as a pointer gives an empty
+                     * string, which looks exactly like "the asset is missing".
+                     * See jni_handle: strings keep their payload address. */
+                    char name[192];
+                    name[0] = 0;
+                    {
+                        jni_handle *sh = handle_of(a3);
+                        if (sh && sh->kind == H_STRING && sh->guest)
+                            read_guest_str(sh->guest, name, sizeof(name));
+                        else
+                            read_guest_str(a3, name, sizeof(name));
+                    }
+                    uint32_t values = args[4];
+                    char entry[256];
+                    int off = 0;
+                    const char *p = ASSET_PREFIX;
+                    while (*p && off < (int)sizeof(entry) - 1) entry[off++] = *p++;
+                    for (const char *q = name; *q && off < (int)sizeof(entry) - 40; q++)
+                        entry[off++] = *q;
+                    p = ASSET_SUFFIX;
+                    while (*p && off < (int)sizeof(entry) - 1) entry[off++] = *p++;
+                    entry[off] = 0;
+
+                    uint32_t asset_off = 0, asset_len = 0;
+                    /* The archive's location differs by build: the browser has
+                     * it preloaded at the filesystem root, the desktop build
+                     * keeps it beside the .so. Trying the candidates is simpler
+                     * than threading a build-time path through. */
+                    static const char *k_archive[] = {
+                        ASSET_ARCHIVE, "game/" ASSET_ARCHIVE, "/" ASSET_ARCHIVE, 0
+                    };
+                    FILE *apk = NULL;
+                    for (int i = 0; k_archive[i] && !apk; i++)
+                        apk = fopen(k_archive[i], "rb");
+                    int found = apk ? asset_zip_find(apk, entry, &asset_off,
+                                                     &asset_len) : 1;
+                    if (apk)
+                        fclose(apk);
+
+                    static int logged;
+                    if (logged < 20) {
+                        logged++;
+                        host_log("  [assets] %-40s %s%s\n", entry,
+                                 found ? "NOT FOUND" : "offset",
+                                 found ? "" : "");
+                        if (!found)
+                            host_log("           offset=%u length=%u\n",
+                                     asset_off, asset_len);
+                    }
+
+                    if (values && values < GUEST_MEM_SIZE - 8) {
+                        ST32(values, found ? 0xFFFFFFFFu : asset_off);
+                        ST32(values + 4, found ? 0xFFFFFFFFu : asset_len);
+                    }
+                    *ret_lo = 0;
+                    st->implemented = 1;
+                    return 1;
+                }
+                if (strcmp(n, "GetLanguage") == 0) {
+                    *ret_lo = jni_host_new_string("en");
+                    st->implemented = 1; return 1;
+                }
+                if (strcmp(n, "GetCountry") == 0) {
+                    *ret_lo = jni_host_new_string("US");
+                    st->implemented = 1; return 1;
+                }
+                if (strcmp(n, "GetUDID") == 0 || strcmp(n, "GetCom2usUDID") == 0) {
+                    *ret_lo = jni_host_new_string("0000000000000000");
+                    st->implemented = 1; return 1;
+                }
+                if (strcmp(n, "GetPhoneNumber") == 0) {
+                    *ret_lo = jni_host_new_string("");
+                    st->implemented = 1; return 1;
+                }
+                if (strcmp(n, "GetRealScreenWidth") == 0 ||
+                    strcmp(n, "GetScreenWidth") == 0) {
+                    *ret_lo = 960;
+                    st->implemented = 1; return 1;
+                }
+                if (strcmp(n, "GetRealScreenHeight") == 0 ||
+                    strcmp(n, "GetScreenHeight") == 0) {
+                    *ret_lo = 544;
+                    st->implemented = 1; return 1;
+                }
+                if (strcmp(n, "GetSystemCurrentTime") == 0) {
+                    /* This must be the SAME clock the engine schedules its
+                     * timers against, and that clock is the sysTime[] array
+                     * handed to nativeInit() -- WrapperRenderer computes the
+                     * one from the other, so on Android they are identical.
+                     *
+                     * Returning host_now() instead made them two different
+                     * clocks: SetTimer registered firetime=6915768 (measured in
+                     * this one) while the frame loop advanced the array from
+                     * near zero, so no timer was ever due and the engine sat at
+                     * "timers=0" for the whole run. */
+                    extern uint32_t g_sys_time_addr;
+                    if (g_sys_time_addr) {
+                        *ret_lo = LD32(g_sys_time_addr);
+                    } else {
+                        *ret_lo = (uint32_t)(host_now() * 1000.0);
+                    }
+                    st->implemented = 1; return 1;
+                }
+                if (strcmp(n, "GetAppProperty") == 0) {
+                    *ret_lo = jni_host_new_string("");
+                    st->implemented = 1; return 1;
+                }
+            }
+        }
+
+        /* The timer table is the one other Java-side facility the engine cannot
+         * run without: it is how the game loop schedules itself (see timers.h).
          *
          * CallStaticVoidMethod(env, clazz, methodID, id, firetime, interval):
          * the varargs start at args[3], and each jlong occupies two words. */
@@ -596,6 +767,18 @@ uint32_t jni_host_new_array(int elem, int n)
     o->guest = buf;
     o->len = (uint32_t)n;
     o->elem = (uint32_t)elem;
+    return h;
+}
+
+uint32_t jni_host_new_string(const char *s)
+{
+    size_t len = strlen(s);
+    uint32_t buf = guest_heap_alloc((uint32_t)len + 1);
+    memcpy(g_mem + buf, s, len + 1);
+    uint32_t h = handle_new(H_STRING);
+    jni_handle *o = handle_of(h);
+    o->guest = buf;
+    o->len = (uint32_t)len;
     return h;
 }
 

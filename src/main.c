@@ -85,7 +85,7 @@ static guest_image g_img;
  * its clock from here (CS_knlCurrentTime), and the timer firetimes arriving
  * from SetTimer are absolute in that same clock -- so the frame loop advances
  * this array rather than keeping a host-side notion of "now". */
-static uint32_t g_sys_time_addr;
+uint32_t g_sys_time_addr;
 
 static uint32_t find_symbol(const char *name)
 {
@@ -656,6 +656,8 @@ int main(int argc, char **argv)
                 int ok = 0;
                 int64_t clock = (int64_t)LD32(g_sys_time_addr) |
                                 ((int64_t)LD32(g_sys_time_addr + 4) << 32);
+                host_log("  clock at frame loop start: %lld (sysTime array at "
+                         "%08x)\n", (long long)clock, g_sys_time_addr);
                 for (int f = 0; f < frames; f++) {
                     /* Advance the guest's clock by one 16 ms tick and write it
                      * back, so firetimes are compared against the same clock
@@ -690,6 +692,8 @@ int main(int argc, char **argv)
                     for (int i = 0; i < g_nimports; i++)
                         x1 += g_imports[i].calls;
 
+                    if (reason == HALT_BAD_PC)
+                        host_log("  frame %3d : pc ran to %08x\n", f, g_cpu.r[15]);
                     host_log("  frame %3d : %9llu instrs  %7.2f ms  %6.2f MIPS"
                              "  timers=%d draw=%llu host_calls=%llu  -> %s\n",
                              f, (unsigned long long)frame_insns,
@@ -701,10 +705,18 @@ int main(int argc, char **argv)
                              reason == HALT_BUDGET ? "budget exhausted"
                                                    : cpu_halt_str(reason));
                     total += frame_insns;
-                    if (reason != HALT_BUDGET)
-                        ok++;
-                    else
-                        break;
+                    /* A frame with no timer due runs nothing -- that is a
+                     * normal tick of the clock, not the end of the run. Only a
+                     * frame that actually executed and exhausted its budget
+                     * stops things. Getting this wrong ends the loop on the
+                     * very first tick, because `reason` still holds its
+                     * initial value when nothing ran to change it. */
+                    if (ndue > 0) {
+                        if (reason != HALT_BUDGET)
+                            ok++;
+                        else
+                            break;
+                    }
                 }
                 if (ok)
                     host_log("  average over %d frame(s): %llu instructions\n",

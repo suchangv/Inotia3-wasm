@@ -73,8 +73,16 @@ uint32_t host_guest_mmap(uint32_t size)
     static uint32_t next = GUEST_MMAP_BASE;
     if (!size)
         return 0;
+    /* Overflow-safe: a caller-supplied size near 4 GB would wrap `a + size`
+     * past the check and hand back an address outside the arena, which the
+     * interpreter then writes through. An out-of-bounds wasm trap is how that
+     * surfaces -- a long way from the mmap that caused it. */
+    if (size > GUEST_MMAP_SIZE) {
+        host_log("mmap: refusing %u bytes\n", size);
+        return 0;
+    }
     uint32_t a = (next + 0xFFFu) & ~0xFFFu;
-    if (a + size > GUEST_MMAP_BASE + GUEST_MMAP_SIZE) {
+    if (a < next || a + size < a || a + size > GUEST_MMAP_BASE + GUEST_MMAP_SIZE) {
         host_log("mmap: arena exhausted (%u requested)\n", size);
         return 0;
     }

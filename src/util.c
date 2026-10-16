@@ -8,6 +8,7 @@
 
 #include "compat.h"
 #include "guest.h"
+#include "cpu.h"
 
 /* ---- guest address space ------------------------------------------------- */
 
@@ -119,5 +120,67 @@ char *strncpy(char *d, const char *s, size_t n)
     for (; i < n && s[i]; i++) d[i] = s[i];
     for (; i < n; i++) d[i] = 0;
     return d;
+}
+#endif
+
+#ifdef GUEST_CHECK
+/*
+ * Bounds-checked guest access.
+ *
+ * The release build indexes the guest buffer directly -- that is what keeps the
+ * interpreter's inner loop tight, and the loader has already validated every
+ * segment. The cost is that a bad guest pointer becomes a fault at *host*
+ * level: a SIGSEGV on the desktop build (translated back to a guest PC by the
+ * crash handler) and an opaque "memory access out of bounds" trap under wasm,
+ * with no PC and no trace.
+ *
+ * Enabling this turns that into an interpreter-level trap that names the
+ * address and the instruction, which is the difference between "something
+ * dereferenced garbage" and a place to look. It slows the interpreter by
+ * roughly half, so it is a debugging build.
+ */
+static void guest_bad(uint32_t addr, const char *what)
+{
+    host_log("guest: %s at bad address %08x (pc=%08x, insn=%08x) -- guest "
+             "memory is %u MB\n", what, addr, g_cpu.r[15],
+             g_fault_insn ? g_fault_insn : (uint32_t)g_cpu.r[15],
+             GUEST_MEM_SIZE >> 20);
+    /* Stop the interpreter at the instruction that did it, so the trace and
+     * the register dump describe the fault and not what followed. */
+    extern int g_guest_check_fault;
+    g_guest_check_fault = 1;
+}
+
+#define GUEST_INRANGE(a, n) ((uint32_t)(a) <= GUEST_MEM_SIZE - (n))
+
+uint32_t guest_ld32(uint32_t a)
+{
+    if (!GUEST_INRANGE(a, 4)) { guest_bad(a, "load32"); return 0; }
+    return *(uint32_t *)(g_mem + a);
+}
+uint16_t guest_ld16(uint32_t a)
+{
+    if (!GUEST_INRANGE(a, 2)) { guest_bad(a, "load16"); return 0; }
+    return *(uint16_t *)(g_mem + a);
+}
+uint8_t guest_ld8(uint32_t a)
+{
+    if (!GUEST_INRANGE(a, 1)) { guest_bad(a, "load8"); return 0; }
+    return *(uint8_t *)(g_mem + a);
+}
+void guest_st32(uint32_t a, uint32_t v)
+{
+    if (!GUEST_INRANGE(a, 4)) { guest_bad(a, "store32"); return; }
+    *(uint32_t *)(g_mem + a) = v;
+}
+void guest_st16(uint32_t a, uint16_t v)
+{
+    if (!GUEST_INRANGE(a, 2)) { guest_bad(a, "store16"); return; }
+    *(uint16_t *)(g_mem + a) = v;
+}
+void guest_st8(uint32_t a, uint8_t v)
+{
+    if (!GUEST_INRANGE(a, 1)) { guest_bad(a, "store8"); return; }
+    *(uint8_t *)(g_mem + a) = v;
 }
 #endif

@@ -82,7 +82,14 @@ static const known_import g_known[] = {
     /* --- imported *variables* --- */
     { "__stack_chk_guard",     IMPL_NONE, 1, 4 },
     { "__sF",                  IMPL_NONE, 1, 0x200 },  /* bionic stdio array */
-    { "__errno",               IMPL_errno_addr, 1, 4 },
+    /* __errno is a FUNCTION in bionic -- `volatile int *__errno(void)` -- even
+     * though the symbol table in some NDK builds types it as an object. It is
+     * classified by where the .so reaches it: this one is in .rel.plt, i.e.
+     * called through the PLT, while __sF and __page_size are in .rel.dyn, i.e.
+     * addressed. Treating it as a variable puts a data address in the slot the
+     * engine branches through -- a jump into the loader's own state, several
+     * hundred thousand instructions into a boot that had looked healthy. */
+    { "__errno",               IMPL_errno_addr, 0, 0 },
     { "__page_size",           IMPL_NONE, 1, 4 },
 
     /* --- time / math --- */
@@ -133,6 +140,8 @@ static const known_import g_known[] = {
     { "fwrite",                IMPL_fwrite,   0, 0 },
     { "fseek",                 IMPL_fseek,    0, 0 },
     { "fstat",                 IMPL_fstat,    0, 0 },
+    { "mkdir",                 IMPL_mkdir,    0, 0 },
+    { "stat",                  IMPL_stat,     0, 0 },
     { "open",                  IMPL_open,     0, 0 },
     { "close",                 IMPL_close,    0, 0 },
     { "read",                  IMPL_read,     0, 0 },
