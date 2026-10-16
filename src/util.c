@@ -209,19 +209,58 @@ uint8_t guest_ld8(uint32_t a)
     if (!GUEST_INRANGE(a, 1)) { guest_bad(a, "load8"); return 0; }
     return *(uint8_t *)(g_mem + a);
 }
+/* TEMP probe (see guest_st32): names the stores that paint the composite
+ * buffer. 32-bit stores log individually; 16/8-bit ones aggregate into a
+ * tiny per-PC table and flush it when the budget runs out. */
+uint32_t g_probe_lo, g_probe_len, g_probe_n, g_probe_on = 1;
+static struct { uint32_t pc; int n; } g_probe_pcs[8];
+
+static void probe_note(uint32_t pc)
+{
+    for (int i = 0; i < 8; i++) {
+        if (!g_probe_pcs[i].n) { g_probe_pcs[i].pc = pc; g_probe_pcs[i].n = 1; return; }
+        if (g_probe_pcs[i].pc == pc) { g_probe_pcs[i].n++; return; }
+    }
+}
+
+static void probe_flush(void)
+{
+    g_probe_on = 0;
+    for (int i = 0; i < 8 && g_probe_pcs[i].n; i++)
+        host_log("  [str8/16] pc=%08x stores=%d\n", g_probe_pcs[i].pc,
+                 g_probe_pcs[i].n);
+    memset(g_probe_pcs, 0, sizeof(g_probe_pcs));
+}
+
 void guest_st32(uint32_t a, uint32_t v)
 {
     if (!GUEST_INRANGE(a, 4)) { guest_bad(a, "store32"); return; }
+    if (g_probe_lo && g_probe_on && (uint32_t)(a - g_probe_lo) < g_probe_len) {
+        if (g_probe_n < 32) {
+            g_probe_n++;
+            host_log("  [str32] %08x = %08x pc=%08x lr=%08x\n", a, v,
+                     g_cpu.r[15], g_cpu.r[14]);
+            if (g_probe_n >= 32) probe_flush();
+        }
+    }
     *(uint32_t *)(g_mem + a) = v;
 }
 void guest_st16(uint32_t a, uint16_t v)
 {
     if (!GUEST_INRANGE(a, 2)) { guest_bad(a, "store16"); return; }
+    if (g_probe_lo && g_probe_on && (uint32_t)(a - g_probe_lo) < g_probe_len) {
+        if (g_probe_n < 65536) { g_probe_n++; probe_note(g_cpu.r[15]);
+            if (g_probe_n >= 65536) probe_flush(); }
+    }
     *(uint16_t *)(g_mem + a) = v;
 }
 void guest_st8(uint32_t a, uint8_t v)
 {
     if (!GUEST_INRANGE(a, 1)) { guest_bad(a, "store8"); return; }
+    if (g_probe_lo && g_probe_on && (uint32_t)(a - g_probe_lo) < g_probe_len) {
+        if (g_probe_n < 65536) { g_probe_n++; probe_note(g_cpu.r[15]);
+            if (g_probe_n >= 65536) probe_flush(); }
+    }
     *(uint8_t *)(g_mem + a) = v;
 }
 #endif

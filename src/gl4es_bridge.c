@@ -67,6 +67,22 @@ extern void set_getprocaddress(void *(*fn)(const char *));
 /* The engine's own screen surface, remembered so a run can dump it. See
  * gl4es_dump_last_screen() -- it is the ground truth for "did the engine draw
  * anything", which a black canvas cannot answer on its own. */
+/* Which texture each draw actually samples.
+ *
+ * "The splash is drawn and comes out washed out" and "the splash is drawn and
+ * something else is sampled" look identical from the canvas. Tracking the
+ * binding is what tells them apart, and it is the only way to attribute a
+ * wrong-looking draw to a texture in a build with no debugger. */
+static uint32_t g_cur_tex;
+static struct { uint32_t id, w, h, fmt; } g_tex[64];
+static int g_ntex;
+
+/* The last RGBA upload at each of the sizes the engine composes with, so a
+ * run can show what a draw is really sampling. */
+uint32_t g_u480_ptr, g_u600_ptr;
+/* The engine's own screen surface: 384x256 RGB565, blitted every frame. */
+uint32_t g_csfb_ptr;
+
 uint32_t g_last_screen_ptr, g_last_screen_w, g_last_screen_h;
 uint32_t g_last_screen_fmt, g_last_screen_type;
 
@@ -335,11 +351,6 @@ static void backend_glTexEnvx(GLenum target, GLenum pname, GLfixed param)
     gl4es_glTexEnvf(target, pname, XP(pname, param));
 }
 
-static void backend_glColor4x(GLfixed r, GLfixed g, GLfixed b, GLfixed a)
-{
-    gl4es_glColor4f((float)r / 65536.0f, (float)g / 65536.0f,
-                    (float)b / 65536.0f, (float)a / 65536.0f);
-}
 
 /* glClearColor and glLineWidth *are* GLES2 entry points, so those two go to the
  * backend directly. */
@@ -368,7 +379,6 @@ struct backend_shim { const char *name; void *fn; };
 static const struct backend_shim k_backend_shims[] = {
     { "glTexParameterx", (void *)backend_glTexParameterx },
     { "glTexEnvx",       (void *)backend_glTexEnvx },
-    { "glColor4x",       (void *)backend_glColor4x },
     { "glClearColorx",   (void *)backend_glClearColorx },
     { "glAlphaFuncx",    (void *)backend_glAlphaFuncx },
     { "glLineWidthx",    (void *)backend_glLineWidthx },
@@ -462,18 +472,47 @@ int gl4es_dispatch(const char *name, const uint32_t *args, int nargs,
     uint32_t a8 = nargs > 8 ? args[8] : 0;
 
     /* ---- state ---- */
-    if (strcmp(name, "glEnable") == 0)  { gl4es_glEnable(a0); return 1; }
-    if (strcmp(name, "glDisable") == 0) { gl4es_glDisable(a0); return 1; }
+    if (strcmp(name, "glEnable") == 0 || strcmp(name, "glDisable") == 0) {
+        extern int g_gl_trace;
+        if (g_gl_trace > 0)
+            host_log("  [state] %s(%04x)\n", name, a0);
+        /* strcmp, not a character test: name[2] is 'E' in "glEnable" and 'D'
+         * in "glDisable", so a one-character shortcut here silently turned
+         * glEnable into a no-op -- no GL_TEXTURE_2D, no GL_BLEND, and a white
+         * screen with no error to point at it. */
+        if (strcmp(name, "glEnable") == 0)
+            gl4es_glEnable(a0);
+        else
+            gl4es_glDisable(a0);
+        return 1;
+    }
     if (strcmp(name, "glIsEnabled") == 0) {
         *ret = (uint32_t)gl4es_glIsEnabled(a0); return 1;
     }
-    if (strcmp(name, "glEnableClientState") == 0)  { gl4es_glEnableClientState(a0); return 1; }
-    if (strcmp(name, "glDisableClientState") == 0) { gl4es_glDisableClientState(a0); return 1; }
-    if (strcmp(name, "glBlendFunc") == 0) { gl4es_glBlendFunc(a0, a1); return 1; }
+    if (strcmp(name, "glEnableClientState") == 0 ||
+        strcmp(name, "glDisableClientState") == 0) {
+        extern int g_gl_trace;
+        if (g_gl_trace > 0)
+            host_log("  [state] %s(%04x)\n", name, a0);
+        if (strcmp(name, "glEnableClientState") == 0)
+            gl4es_glEnableClientState(a0);
+        else
+            gl4es_glDisableClientState(a0);
+        return 1;
+    }
+    if (strcmp(name, "glBlendFunc") == 0) {
+        extern int g_gl_trace;
+        if (g_gl_trace > 0) host_log("  [state] glBlendFunc(%04x, %04x)\n", a0, a1);
+        gl4es_glBlendFunc(a0, a1); return 1;
+    }
     if (strcmp(name, "glDepthMask") == 0)  { gl4es_glDepthMask((uint8_t)a0); return 1; }
     if (strcmp(name, "glDepthFunc") == 0)  { gl4es_glDepthFunc(a0); return 1; }
     if (strcmp(name, "glStencilMask") == 0) { gl4es_glStencilMask(a0); return 1; }
-    if (strcmp(name, "glShadeModel") == 0) { gl4es_glShadeModel(a0); return 1; }
+    if (strcmp(name, "glShadeModel") == 0) {
+        extern int g_gl_trace;
+        if (g_gl_trace > 0) host_log("  [state] glShadeModel(%04x)\n", a0);
+        gl4es_glShadeModel(a0); return 1;
+    }
     if (strcmp(name, "glCullFace") == 0)   { gl4es_glCullFace(a0); return 1; }
     if (strcmp(name, "glFrontFace") == 0)  { gl4es_glFrontFace(a0); return 1; }
     if (strcmp(name, "glColorMask") == 0) {
@@ -525,8 +564,6 @@ int gl4es_dispatch(const char *name, const uint32_t *args, int nargs,
     }
 
     if (strcmp(name, "glMatrixMode") == 0) {
-        static int n;
-        if (n < 6) { n++; host_log("  [gl] glMatrixMode(%04x)\n", a0); }
         gl4es_glMatrixMode(a0); return 1;
     }
     if (strcmp(name, "glLoadIdentity") == 0) { gl4es_glLoadIdentity(); return 1; }
@@ -587,7 +624,11 @@ int gl4es_dispatch(const char *name, const uint32_t *args, int nargs,
         gl4es_glDeleteTextures((int32_t)a0, (const uint32_t *)G(a1));
         return 1;
     }
-    if (strcmp(name, "glBindTexture") == 0) { gl4es_glBindTexture(a0, a1); return 1; }
+    if (strcmp(name, "glBindTexture") == 0) {
+        g_cur_tex = a1;
+        gl4es_glBindTexture(a0, a1); return 1;
+    }
+    if (strcmp(name, "__glBindTexture") == 0) { gl4es_glBindTexture(a0, a1); return 1; }
     if (strcmp(name, "glActiveTexture") == 0)       { gl4es_glActiveTexture(a0); return 1; }
     if (strcmp(name, "glClientActiveTexture") == 0) { gl4es_glClientActiveTexture(a0); return 1; }
     if (strcmp(name, "glTexParameteri") == 0) {
@@ -600,31 +641,85 @@ int gl4es_dispatch(const char *name, const uint32_t *args, int nargs,
         gl4es_glTexParameterf(a0, a1, F(a2)); return 1;
     }
     if (strcmp(name, "glTexImage2D") == 0) {
+        {
+            extern int g_gl_trace;
+            if (g_gl_trace > 0) {
+                uint32_t nz = 0, n = 0;
+                if (a8 && a8 < GUEST_MEM_SIZE) {
+                    n = (uint32_t)a3 * (uint32_t)a4 * 4u;
+                    if (a8 + n > GUEST_MEM_SIZE) n = GUEST_MEM_SIZE - a8;
+                    for (uint32_t i = 0; i < n; i++)
+                        if (g_mem[a8 + i]) nz++;
+                }
+                host_log("  [tex] glTexImage2D target=%04x level=%d "
+                         "internal=%04x w=%d h=%d border=%d format=%04x "
+                         "type=%04x px=%08x (%u bytes, %u non-zero)\n",
+                         a0, (int)a1, a2, (int)a3, (int)a4, (int)a5,
+                         a6, a7, a8, n, nz);
+            }
+        }
+        {
+            int i;
+            for (i = 0; i < g_ntex; i++)
+                if (g_tex[i].id == g_cur_tex) break;
+            if (i == g_ntex && g_ntex < 64) g_ntex++;
+            g_tex[i].id = g_cur_tex; g_tex[i].w = a3; g_tex[i].h = a4;
+            g_tex[i].fmt = a2;
+        }
         gl4es_glTexImage2D(a0, (int32_t)a1, (int32_t)a2, (int32_t)a3,
                            (int32_t)a4, (int32_t)a5, a6, a7, G(a8));
         return 1;
     }
     if (strcmp(name, "glTexSubImage2D") == 0) {
-        static int logged;
-        if (logged < 30) {
-            logged++;
-            host_log("  [gl] glTexSubImage2D nargs=%d target=%04x level=%d "
+        extern int g_gl_trace;
+        if (g_gl_trace > 0) {
+            host_log("  [gl] glTexSubImage2D target=%04x level=%d "
                      "x=%d y=%d w=%d h=%d format=%04x type=%04x px=%08x "
                      "caller=%08x\n",
-                     nargs, a0, (int)a1, (int)a2, (int)a3, (int)a4,
+                     a0, (int)a1, (int)a2, (int)a3, (int)a4,
                      (int)a5, a6, a7, a8, g_cpu.r[14]);
         }
         /* What the engine is actually handing over. A black screen has two
          * very different causes -- the engine drew nothing, or it drew
          * something that never reached the canvas -- and this is the line that
          * tells them apart without a debugger. */
+        if (a6 == 0x1907 && a7 == 0x8363 && a4 == 384 && a5 == 256 && a8)
+            g_csfb_ptr = a8;
+        if (a6 == 0x1908 && a7 == 0x1401 && a8) {
+            if (a4 == 480 && a5 == 320) g_u480_ptr = a8;
+            if (a4 == 600 && a5 == 320) g_u600_ptr = a8;
+        }
+        {
+            extern int g_gl_trace;
+            /* For an RGBA upload, the alpha byte is the whole question: a
+             * texture that arrives with alpha 0.2 draws as a 20% ghost of
+             * itself over whatever is behind it, and nothing else in the log
+             * says so. */
+            if (g_gl_trace > 0 && a6 == 0x1908 && a7 == 0x1401 &&
+                a8 && a8 < GUEST_MEM_SIZE) {
+                uint32_t n = (uint32_t)a4 * (uint32_t)a5;
+                if (a8 + n * 4u <= GUEST_MEM_SIZE) {
+                    uint32_t hist[8] = {0};
+                    uint64_t sum = 0;
+                    for (uint32_t i = 0; i < n; i++) {
+                        uint32_t al = g_mem[a8 + i * 4u + 3u];
+                        hist[al >> 5]++;
+                        sum += al;
+                    }
+                    host_log("  [tex]   %ux%u RGBA alpha: mean=%.1f "
+                             "hist[0-31,32-63,...]=%u,%u,%u,%u,%u,%u,%u,%u\n",
+                             a4, a5, (double)sum / n, hist[0], hist[1],
+                             hist[2], hist[3], hist[4], hist[5], hist[6],
+                             hist[7]);
+                }
+            }
+        }
         g_last_screen_ptr = a8; g_last_screen_w = (uint32_t)a4;
         g_last_screen_h = (uint32_t)a5; g_last_screen_fmt = a6;
         g_last_screen_type = a7;
         {
-            static int stats;
-            if (stats < 6 && a8 && a8 < GUEST_MEM_SIZE) {
-                stats++;
+            extern int g_gl_trace;
+            if (g_gl_trace > 0 && a8 && a8 < GUEST_MEM_SIZE) {
                 uint32_t nz = 0, n = (uint32_t)a4 * (uint32_t)a5 * 2u;
                 const uint8_t *p = g_mem + a8;
                 if (a8 + n <= GUEST_MEM_SIZE)
@@ -655,19 +750,8 @@ int gl4es_dispatch(const char *name, const uint32_t *args, int nargs,
             }
             return 1;
         }
-        {
-            static int n;
-            const void *p = G(a8);
-            if (n < 4) {
-                n++;
-                host_log("  [gl] -> gl4es_glTexSubImage2D(%u,%d,%d,%d,%d,%d,%04x,%04x,%p)\n",
-                         a0,(int)a1,(int)a2,(int)a3,(int)a4,(int)a5,a6,a7,p);
-            }
-            gl4es_glTexSubImage2D(a0, (int32_t)a1, (int32_t)a2, (int32_t)a3,
-                                  (int32_t)a4, (int32_t)a5, a6, a7, p);
-            if (n <= 4)
-                host_log("  [gl] <- returned\n");
-        }
+        gl4es_glTexSubImage2D(a0, (int32_t)a1, (int32_t)a2, (int32_t)a3,
+                              (int32_t)a4, (int32_t)a5, a6, a7, G(a8));
         return 1;
     }
     if (strcmp(name, "glCompressedTexImage2D") == 0) {
@@ -685,7 +769,13 @@ int gl4es_dispatch(const char *name, const uint32_t *args, int nargs,
                                   (int32_t)a4, (int32_t)a5, (int32_t)a6, (int32_t)a7);
         return 1;
     }
-    if (strcmp(name, "glTexEnvx") == 0) { gl4es_glTexEnvf(a0, a1, XP(a1, a2)); return 1; }
+    if (strcmp(name, "glTexEnvx") == 0) {
+        extern int g_gl_trace;
+        if (g_gl_trace > 0)
+            host_log("  [state] glTexEnvx(target=%04x pname=%04x param=%08x)\n",
+                     a0, a1, a2);
+        gl4es_glTexEnvf(a0, a1, XP(a1, a2)); return 1;
+    }
     if (strcmp(name, "glTexEnvf") == 0) { gl4es_glTexEnvf(a0, a1, F(a2)); return 1; }
     if (strcmp(name, "glTexEnvxv") == 0) {
         gl4es_glTexEnvfv(a0, a1, (const float *)G(a2)); return 1;
@@ -731,6 +821,11 @@ int gl4es_dispatch(const char *name, const uint32_t *args, int nargs,
 
     /* ---- colour ---- */
     if (strcmp(name, "glColor4x") == 0) {
+        extern int g_gl_trace;
+        if (g_gl_trace > 0)
+            host_log("  [state] glColor4x(%d,%d,%d,%d)\n",
+                     (int32_t)a0 >> 16, (int32_t)a1 >> 16,
+                     (int32_t)a2 >> 16, (int32_t)a3 >> 16);
         gl4es_glColor4f(X(a0), X(a1), X(a2), X(a3));
         return 1;
     }
@@ -783,9 +878,53 @@ int gl4es_dispatch(const char *name, const uint32_t *args, int nargs,
                         o += snprintf(vb + o, sizeof(vb) - (size_t)o, ") ");
                     }
                 }
-                host_log("  [draw] mode=%d n=%d fixed=%d ptr=%08x verts %s\n",
-                         (int)a0, (int)a2, g_fx_vertex.active,
-                         g_fx_vertex.ptr, vb);
+                {
+                    char tb[120] = {0};
+                    if (g_fx_texcoord.active) {
+                        const int32_t *t = (const int32_t *)(g_mem + g_fx_texcoord.ptr);
+                        int tn = g_fx_texcoord.size ? g_fx_texcoord.size : 2;
+                        int o3 = 0;
+                        for (int i = 0; i < 4 && o3 < 100; i++) {
+                            o3 += snprintf(tb + o3, sizeof(tb) - (size_t)o3, "(");
+                            for (int k = 0; k < tn; k++)
+                                o3 += snprintf(tb + o3, sizeof(tb) - (size_t)o3,
+                                               "%s%.3f", k ? "," : "",
+                                               (double)t[i * tn + k] / 65536.0);
+                            o3 += snprintf(tb + o3, sizeof(tb) - (size_t)o3, ")");
+                        }
+                    } else snprintf(tb, sizeof(tb), "(texcoord array off)");
+                    host_log("  [draw]   texcoords %s\n", tb);
+                }
+                {
+                    char cb[80] = {0};
+                    if (g_fx_color.active) {
+                        const int32_t *c = (const int32_t *)(g_mem + g_fx_color.ptr);
+                        int cn = g_fx_color.size ? g_fx_color.size : 4;
+                        int o2 = 0;
+                        for (int i = 0; i < 4 && o2 < 60; i++) {
+                            o2 += snprintf(cb + o2, sizeof(cb) - (size_t)o2, "(");
+                            for (int k = 0; k < cn; k++)
+                                o2 += snprintf(cb + o2, sizeof(cb) - (size_t)o2,
+                                               "%s%.2f", k ? "," : "",
+                                               (double)c[i * cn + k] / 65536.0);
+                            o2 += snprintf(cb + o2, sizeof(cb) - (size_t)o2, ")");
+                        }
+                    } else {
+                        snprintf(cb, sizeof(cb), "(color array off)");
+                    }
+                    host_log("  [draw]   colorarray %s\n", cb);
+                }
+                {
+                    uint32_t tw = 0, th = 0, tf = 0;
+                    for (int i = 0; i < g_ntex; i++)
+                        if (g_tex[i].id == g_cur_tex) {
+                            tw = g_tex[i].w; th = g_tex[i].h; tf = g_tex[i].fmt;
+                        }
+                    host_log("  [draw] mode=%d n=%d fixed=%d tex=%u(%ux%u "
+                             "internal=%04x) verts %s\n",
+                             (int)a0, (int)a2, g_fx_vertex.active,
+                             g_cur_tex, tw, th, tf, vb);
+                }
             }
         }
         fixed_install("glVertexPointer", &g_fx_vertex, (int)a1, (int)a2);

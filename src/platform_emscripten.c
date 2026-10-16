@@ -146,6 +146,25 @@ EM_JS(void, spike_read_gl_trace_js, (void), {
 });
 void spike_set_gl_trace(int n) { g_browser_gl_trace = n; }
 void host_browser_read_gl_trace(void) { spike_read_gl_trace_js(); }
+
+/* Read the default framebuffer, 4x downsampled, as tightly packed RGB.
+ * glReadPixels is the only thing here that sees what the canvas really holds
+ * -- everything else reads the engine's own surfaces, which is a different
+ * question. */
+void host_browser_read_pixels(unsigned char *out, int w, int h, int step)
+{
+    int dw = w / step, dh = h / step;
+    unsigned char *row = (unsigned char *)host_alloc((size_t)w * 4);
+    for (int y = 0; y < dh; y++) {
+        glReadPixels(0, (h - 1) - y * step, w, 1, GL_RGBA, GL_UNSIGNED_BYTE, row);
+        for (int x = 0; x < dw; x++) {
+            out[(y * dw + x) * 4 + 0] = row[x * step * 4 + 0];
+            out[(y * dw + x) * 4 + 1] = row[x * step * 4 + 1];
+            out[(y * dw + x) * 4 + 2] = row[x * step * 4 + 2];
+            out[(y * dw + x) * 4 + 3] = row[x * step * 4 + 3];
+        }
+    }
+}
 EM_JS(void, spike_read_dump_js, (void), {
     if (typeof Module !== 'undefined' && Module.spikeDumpScreen)
         _spike_set_dump_screen(1);
@@ -159,6 +178,11 @@ int host_browser_gl_setup(void)
 {
     EmscriptenWebGLContextAttributes attr;
     emscripten_webgl_init_context_attributes(&attr);
+    /* alpha = 0, not 1. With an alpha channel the canvas is *composited* over
+     * the page, and the engine's frames carry alpha well below 1 -- so the
+     * whole picture came out washed toward the white page behind it, which
+     * reads as "the colours are wrong" rather than "the canvas is
+     * translucent". The game never wants a see-through screen. */
     attr.alpha = 1;
     attr.depth = 1;
     attr.stencil = 1;

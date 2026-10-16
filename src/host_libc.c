@@ -702,12 +702,17 @@ static void watch_check_fmt(const char *what, uint32_t dst, uint32_t len,
 
 static void watch_check(const char *what, uint32_t dst, uint32_t len)
 {
-    if (!g_watch_addr || !len)
+    /* TEMP: bounded while diagnosing the white composite; the unbounded
+     * variant floods every per-frame row copy. */
+    static int watched;
+    if (!g_watch_addr || !len || watched >= 64)
         return;
-    if (dst <= g_watch_addr && g_watch_addr < dst + len)
+    if (dst <= g_watch_addr && g_watch_addr < dst + len) {
+        watched++;
         host_log("  WATCH: %s() wrote %u bytes to %08x..%08x covering %08x"
                  "  (return address %08x)\n",
                  what, len, dst, dst + len, g_watch_addr, g_cpu.r[14]);
+    }
 }
 
 /* ========================================================================== */
@@ -810,6 +815,13 @@ void host_import_call(guest_import *im)
 
     /* ---- strings ---- */
     case IMPL_memcpy:  watch_check("memcpy", a0, a2);
+        /* TEMP probe: the per-frame composite is ~294 memcpy crossings per
+         * active frame, and the uploaded 384x256 surface comes out all-white.
+         * Trace the big ones to learn what the composite reads. */
+        static int cpy_traced;
+        if (cpy_traced < 60 && a2 >= 512)
+            cpy_traced++,
+            host_log("  [cpy] %08x <- %08x n=%u caller=%08x\n", a0, a1, a2, g_cpu.r[14]);
         if (guest_ok(a0, a2, "memcpy dst") && guest_ok(a1, a2, "memcpy src"))
             memcpy(g_mem + a0, g_mem + a1, a2);
         R[0] = a0; break;

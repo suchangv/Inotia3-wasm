@@ -129,13 +129,14 @@ build_browser() {
     # it. Debug builds add --profiling-funcs so those frames have names.
     DBG=""
     [ -n "$SPIKE_DEBUG" ] && DBG="-g --profiling-funcs -sASSERTIONS=2"
-    $EMCC -O2 -I src $DBG --pre-js tools/trap.js \
+    $EMCC -O2 -I src $DBG --pre-js tools/trap.js --pre-js tools/page-options.js \
         $COMMON_BROWSER src/gl4es_bridge.c src/platform_emscripten.c src/main.c \
         "$GL4ES/libGL.a" \
         -sFULL_ES2=1 -sALLOW_MEMORY_GROWTH=1 -sSTACK_SIZE=8388608 \
         -sMIN_WEBGL_VERSION=2 -sMAX_WEBGL_VERSION=2 \
         -sEXIT_RUNTIME=0 \
         -sEXPORTED_RUNTIME_METHODS=ccall,cwrap \
+        -sEXPORTED_FUNCTIONS=_main,_spike_set_frames,_spike_set_dump_screen,_spike_set_gl_trace \
         $PRELOAD \
         -o build/spike.html
     echo "   -> build/spike.html (serve this directory and open the page)"

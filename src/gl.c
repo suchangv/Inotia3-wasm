@@ -295,9 +295,9 @@ void gl_host_call(const char *name, const uint32_t *args, int nargs,
             long n = (long)w * h;
             for (long i = 0; i < n; i++)
                 if (q[i]) nz++;
-            host_log("  [tex] %-18s %4dx%-4d %s caller=%08x  nonblack=%u/%ld\n",
+            host_log("  [tex] %-18s %4dx%-4d %s caller=%08x px=%08x  nonblack=%u/%ld\n",
                      name, w, h, is_sub ? "sub" : "full",
-                     g_cpu.r[14], nz, n);
+                     g_cpu.r[14], px, nz, n);
         }
         if (dumped < 80 && px && w >= 256 && h >= 192) {
             dumped++;

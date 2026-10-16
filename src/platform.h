@@ -33,6 +33,7 @@ void host_browser_read_dump(void);
 void host_browser_read_gl_trace(void);
 extern int g_browser_dump_screen;
 extern int g_browser_gl_trace;
+void host_browser_read_pixels(unsigned char *out, int w, int h, int step);
 
 /* Per-instruction trace sink, written from inside the interpreter loop.
  * Format is a contract with tools/oracle.py. */

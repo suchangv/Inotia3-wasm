@@ -6,6 +6,8 @@
 # machine (puppeteer's cache); nothing needs installing.
 #
 #   tools/run_browser.sh [seconds] [out.png]
+#
+# QUERY=... adds page options to the URL, e.g. QUERY=frames=3000&gltrace=200
 set -e
 cd "$(dirname "$0")/.."
 BUDGET=${1:-20}
@@ -26,7 +28,7 @@ trap 'kill "$(cat /tmp/inotia3-http.pid)" 2>/dev/null || true' EXIT
       --hide-scrollbars --window-size=1100,700 \
       --virtual-time-budget=$((BUDGET * 1000)) \
       --enable-logging=stderr --screenshot="$OUT" \
-      "http://127.0.0.1:$PORT/spike.html" 2>&1 |
+      "http://127.0.0.1:$PORT/spike.html${QUERY:+?$QUERY}" 2>&1 |
     grep -E "CONSOLE|ERROR: 0:" | sed 's/.*CONSOLE:[0-9]*\] //' || true
 
 echo "screenshot -> $OUT"

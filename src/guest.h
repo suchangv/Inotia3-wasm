@@ -81,6 +81,8 @@ void     guest_st8 (uint32_t a, uint8_t  v);
 #define ST32(a, v) guest_st32((a), (v))
 #define ST16(a, v) guest_st16((a), (v))
 #define ST8(a, v)  guest_st8((a), (v))
+/* TEMP store probe (see util.c). Set from --probe=ADDR,LEN. */
+extern uint32_t g_probe_lo, g_probe_len, g_probe_n, g_probe_on;
 #else
 #define LD32(a) (*(uint32_t *)(g_mem + (uint32_t)(a)))
 #define LD16(a) (*(uint16_t *)(g_mem + (uint32_t)(a)))

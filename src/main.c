@@ -443,6 +443,16 @@ int main(int argc, char **argv)
             g_stop_at = (uint32_t)strtoul(argv[i] + 10, NULL, 16);
         else if (strncmp(argv[i], "--watch=", 8) == 0)
             g_watch_addr = (uint32_t)strtoul(argv[i] + 8, NULL, 16);
+        else if (strncmp(argv[i], "--probe=", 8) == 0) {
+#ifdef GUEST_CHECK
+            char rest[32];
+            g_probe_lo = (uint32_t)strtoul(argv[i] + 8, NULL, 16);
+            snprintf(rest, sizeof(rest), "%s", strchr(argv[i], ',') + 1);
+            g_probe_len = (uint32_t)strtoul(rest, NULL, 10);
+#else
+            host_log("--probe needs a GUEST_CHECK build\n");
+#endif
+        }
         else if (strcmp(argv[i], "--oracle") == 0)
             g_oracle_mode = 1;
         else if (strncmp(argv[i], "--dump-guest=", 13) == 0)
@@ -839,23 +849,26 @@ int main(int argc, char **argv)
                  * the canvas *should* be showing. Chunked because a single
                  * 262 KB console line is truncated. */
                 if (g_browser_dump_screen) {
-                    extern uint32_t g_last_screen_ptr, g_last_screen_w;
-                    extern uint32_t g_last_screen_h;
-                    extern uint32_t g_last_screen_fmt, g_last_screen_type;
-                    host_log("  [dump] screen %ux%u fmt=%04x type=%04x at %08x\n",
-                             g_last_screen_w, g_last_screen_h,
-                             g_last_screen_fmt, g_last_screen_type,
-                             g_last_screen_ptr);
+                    /* Read the *default framebuffer*, not the engine's own
+                     * surface: this is what the canvas actually holds, after
+                     * gl4es, the shaders and the browser have had their say.
+                     * Downsampled 4x -- 960x544 RGBA is 2 MB, and a console
+                     * line is not -- which is still enough to recognise a
+                     * frame. */
+                    extern void host_browser_read_pixels(unsigned char *, int,
+                                                         int, int);
+                    static unsigned char px[240 * 136 * 4];
+                    host_browser_read_pixels(px, SCREEN_W, SCREEN_H, 4);
                     static const char b64[] =
                         "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz"
                         "0123456789+/";
-                    uint32_t n = g_last_screen_w * g_last_screen_h * 2u;
-                    const uint8_t *p = g_mem + g_last_screen_ptr;
                     char line[4097];
                     uint32_t o = 0;
-                    for (uint32_t i = 0; i + 2 < n; i += 3) {
-                        uint32_t v = ((uint32_t)p[i] << 16) |
-                                     ((uint32_t)p[i + 1] << 8) | p[i + 2];
+                    host_log("  [dump] framebuffer %dx%d (4x downsample)\n",
+                             240, 136);
+                    for (size_t i = 0; i + 3 < sizeof(px); i += 4) {
+                        uint32_t v = ((uint32_t)px[i] << 16) |
+                                     ((uint32_t)px[i + 1] << 8) | px[i + 2];
                         line[o++] = b64[(v >> 18) & 63];
                         line[o++] = b64[(v >> 12) & 63];
                         line[o++] = b64[(v >> 6) & 63];
@@ -863,6 +876,62 @@ int main(int argc, char **argv)
                         if (o >= 4096) { line[o] = 0; host_log("[dump] %s\n", line); o = 0; }
                     }
                     if (o) { line[o] = 0; host_log("[dump] %s\n", line); }
+                    /* And the two surfaces the engine composes with, RGBA,
+                     * 4x downsampled -- the framebuffer alone cannot say
+                     * whether a wrong-looking frame is the texture's fault. */
+                    {
+                        extern uint32_t g_u480_ptr, g_u600_ptr, g_csfb_ptr;
+                        if (g_csfb_ptr) {
+                            host_log("[dump] csfb 384x256\n");
+                            uint32_t o3 = 0;
+                            char l3[4097];
+                            for (uint32_t y = 0; y < 256; y += 2)
+                                for (uint32_t x = 0; x < 384; x += 2) {
+                                    const uint8_t *q = g_mem + g_csfb_ptr +
+                                                       (y * 384u + x) * 2u;
+                                    uint32_t v = (uint32_t)q[0] |
+                                                 ((uint32_t)q[1] << 8);
+                                    uint32_t r = (v >> 11) & 0x1f,
+                                             g2 = (v >> 5) & 0x3f,
+                                             b2 = v & 0x1f;
+                                    uint32_t rgb =
+                                        (((r << 3) | (r >> 2)) << 16) |
+                                        (((g2 << 2) | (g2 >> 4)) << 8) |
+                                        ((b2 << 3) | (b2 >> 2));
+                                    l3[o3++] = b64[(rgb >> 18) & 63];
+                                    l3[o3++] = b64[(rgb >> 12) & 63];
+                                    l3[o3++] = b64[(rgb >> 6) & 63];
+                                    l3[o3++] = b64[rgb & 63];
+                                    if (o3 >= 4096) { l3[o3] = 0;
+                                        host_log("[dump] %s\n", l3); o3 = 0; }
+                                }
+                            if (o3) { l3[o3] = 0; host_log("[dump] %s\n", l3); }
+                        }
+                        const struct { const char *nm; uint32_t p, w, h; } u[2] = {
+                            { "upload480", g_u480_ptr, 480, 320 },
+                            { "upload600", g_u600_ptr, 600, 320 },
+                        };
+                        for (int k = 0; k < 2; k++) {
+                            if (!u[k].p) continue;
+                            host_log("[dump] %s %ux%u\n", u[k].nm, u[k].w, u[k].h);
+                            uint32_t o2 = 0;
+                            char l2[4097];
+                            for (uint32_t y = 0; y < u[k].h; y += 4)
+                                for (uint32_t x = 0; x < u[k].w; x += 4) {
+                                    const uint8_t *q = g_mem + u[k].p +
+                                        (y * u[k].w + x) * 4u;
+                                    uint32_t v = ((uint32_t)q[0] << 16) |
+                                                 ((uint32_t)q[1] << 8) | q[2];
+                                    l2[o2++] = b64[(v >> 18) & 63];
+                                    l2[o2++] = b64[(v >> 12) & 63];
+                                    l2[o2++] = b64[(v >> 6) & 63];
+                                    l2[o2++] = b64[v & 63];
+                                    if (o2 >= 4096) { l2[o2] = 0;
+                                        host_log("[dump] %s\n", l2); o2 = 0; }
+                                }
+                            if (o2) { l2[o2] = 0; host_log("[dump] %s\n", l2); }
+                        }
+                    }
                     host_log("[dump] end\n");
                 }
 #endif
