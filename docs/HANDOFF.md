@@ -3,11 +3,51 @@
 Everything needed to continue this work. Read this first; `docs/SPIKE.md` has the
 running engineering log and `docs/REUSE.md` the dependency research.
 
-**State as of 2026-10-16 (later): the engine boots, finds its assets, opens the
-archive, and the PNG decoder now gets *into* `inflate` and past the zlib header
-check — but decompression still fails, currently with `libpng error: invalid bit
-length repeat`.** The first real frame has not been seen yet. The blocker is now
-a decode divergence inside zlib's `inflate`, described below.
+**State as of 2026-10-17: the game renders its title screen in the browser.**
+Headless Chrome shows the Inotia 3 splash — the parchment map with the Com2uS
+logo — drawn through gl4es → WebGL2 and out to the canvas.
+
+The frame is **washed out**: it measures `out = 0.2 * src + 204` against the
+source asset, i.e. the splash composited at ~20% over white. Everything that
+could produce that has been checked and ruled out (below), so this is where the
+next session should start.
+
+### What is known about the wash
+
+Measured, not guessed:
+
+- The engine uploads a **correct** 480x320 RGBA splash — decoding it out of the
+  guest buffer gives the real artwork, dark border and red logo included.
+- The GL state is ordinary: `glBlendFunc(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA)`,
+  `glTexEnvx(GL_TEXTURE_ENV, GL_TEXTURE_ENV_MODE, GL_MODULATE)`,
+  `glShadeModel(GL_SMOOTH)`, colour `glColor4x(1,1,1,1)`.
+- Forcing every RGBA upload opaque (alpha=255) changes nothing, so the sampled
+  texture's alpha is not it.
+- Forcing `GL_BLEND` off at draw time gives a blank white canvas, which is not
+  the expected result and suggests the test itself perturbs gl4es' batching.
+- The framebuffer's own alpha is opaque, so this is not canvas compositing.
+- **The engine's software framebuffer — the 384x256 RGB565 surface
+  `SGL_FrameBufferToScreen` blits — is entirely `0xffff` (white).** That is the
+  most suspicious fact in the set: if the engine's own compositor were running,
+  that surface would hold the frame, and the GL draws on top would be overlays.
+
+So the leading reading is: the engine's *software* rendering is not producing a
+frame, the CSFB stays white, and what the canvas shows is only the GL splash
+overlay sitting on it — washed because it is one layer of a fade-in over white.
+The next thing to check is why the software compositor draws nothing, starting
+from `SGL_grpFillRect` / `SGL_DrawTexture` / `SGL_FrameBufferToScreen` and what
+feeds the CSFB.
+
+### How to reproduce
+
+```
+tools/build.sh browser
+QUERY="frames=600&gltrace=200&dump=1" tools/run_browser.sh 60 /tmp/shot.png
+```
+
+`?dump=1` prints the default framebuffer (glReadPixels, base64, 4x downsampled)
+plus the engine's own screen surface and the two composed uploads, so a run can
+be inspected as images rather than by guessing. See the "Diagnostics" section.
 
 ### Progress since the previous handoff
 
@@ -160,42 +200,40 @@ conditions you meant it to run under.**
 
 ## The immediate next task
 
-**`inflate` fails with `libpng error: invalid bit length repeat`.**
+**Find out why the engine's software framebuffer is white.**
 
-The chain is now: `File::Open` → `MMappedFile::Open` → `mmap` (reads the archive
-at the offset) → PNG decode → `inflate`. The header check passes (`0x78da % 31 ==
-0`, verified from the division helper's trace), so the failure is in the
-Huffman/deflate body of `inflate`, not the wrapper. The error string is one of
-zlib 1.2.3's `strm->msg` assignments; `invalid bit length repeat` has two sites,
-both in the `CODELENS` loop of `inflate.c` (the `state->have == 0` case for a
-repeat code 16, and the `state->have + copy > nlen + ndist` overflow case).
+`SGL_FrameBufferToScreen` uploads a 384x256 RGB565 surface every frame and
+blits it. That surface is entirely `0xffff`. The engine composes the game into
+it in software (`SGL_grpFillRect`, `SGL_DrawTexture`,
+`SGL_LoadProjectionView_FrameBuffer`, `SGL_LoadProjectionView_Screen`), so a
+white one means the compositor is not writing, or is writing somewhere else.
+Everything visible on the canvas today is the GL splash overlay drawn on top of
+it, at ~20% — see the wash note at the top.
 
-Method that found the last bug, and the one to repeat:
+Method that has worked on this codebase, and the one to repeat:
 
-1. `inflate` is **Thumb** and lives at runtime `0x01103774` (verified from
-   `.dynsym`; `tools/callers.py`-style lookups are in `/tmp/opencode/funcdis.py`).
-   The failing check site is at `0x01103d6c`–`0x01103d7e` (it computes
-   `(BITS(8)<<8)+(hold>>8)`, calls `__aeabi_uidivmod` at `0x010d1bd4`, and tests
-   the remainder in `r1`).
-2. **Add a bounded register-only probe at the suspect PC** in `cpu.c`'s
-   interpreter loop. Never dereference a guest pointer from a probe without a
-   range check — that is exactly what produced the phantom SIGSEGV (see the
-   cautionary note in the state section). Print registers, then remove the probe.
-3. The zlib sources are in `/tmp/opencode/zlib_inflate.c` (1.2.3) and
-   `/tmp/opencode/pngread124.c` (libpng 1.2.24) if the scratch dir survives.
+1. `?gltrace=N` names every GL call in order with its arguments, and
+   `?dump=1` writes the framebuffer and the engine's own surfaces out as
+   base64 images. Together they say which draw put which pixels where, which
+   is what turned "the canvas is black" into "the CSFB is white and the splash
+   is drawn at 20%".
+2. When a value looks wrong, dump the guest buffer it came from and look at it
+   rather than reasoning about the state that produced it. Reading the splash
+   out of guest memory is what proved the engine's upload is correct and moved
+   the search off the texture path entirely.
+3. `tools/difftest.sh` still works and is still the fastest way to pin a
+   decoder bug; the oracle now covers `memcpy`/`memset`/`memcmp`/`strlen`/
+   `strcmp`/`strncmp`/`strcpy`/`strncpy` on both sides, so it runs past the
+   first import.
 
-The likely shape is another wrong-bitfield / wrong-format decode, given `MUL`
-was. **The differential oracle would find it in one step if it could run past
-the first import** — `inflate` calls `memcpy`/`memset`, and the oracle stops at
-the first host crossing (oracle.py's `on_code`). Extending the oracle to
-implement `memcpy`/`memset`/`memcmp`/`strlen`/`strncpy` faithfully (a handful of
-lines over `uc.mem_read`/`uc.mem_write`) is the highest-leverage change here; it
-turns every decoder question from "probe and guess" into "diff and point".
+### What the previous session found, in case it recurs
 
-Also worth fixing: **`tools/difftest.sh` coverage is four constructors running
-9–102 instructions.** `MUL` was wrong the whole time and never exercised. A
-synthetic difftest entry that runs each decoded instruction family once (or the
-`inflate` prologue, whose memory image can be captured) would have caught it.
+The four bugs between "boots and draws" and a picture were: gl4es' GL state
+never allocated (`NewGLState` is only called from the EGL path, which `NOEGL`
+skips); emscripten's 64 KB default host stack; `patch_vm_caches` writing the
+JavaVM into 844 globals whose pattern also matched intrusive list heads; and
+GL_FIXED client arrays converted once and sharing one buffer between vertex,
+texcoord and colour. All four are described in the bug-class list below.
 
 ### Superseded: the `@assets.ap` parse (fixed)
 
@@ -312,6 +350,32 @@ Also note: **`build.sh wasm` and `build.sh browser` both write
 ## The bug classes, because they recur
 
 Fifteen-plus bugs, all found by running. Grouped by what they teach.
+
+**Host and loader** (the browser build's bring-up, 2026-10-17)
+
+0a. **gl4es' GL state was never allocated.** `NewGLState()` is only called from
+   the EGL context-creation path, which `NOEGL` skips, so `glstate` stayed on the
+   zero-filled default and every matrix call dereferenced a null sub-struct. The
+   symptom is a wasm trap with no guest PC and no stack, in a function named
+   `gl4es_glLoadIdentity`. Call `NewGLState(DEFAULT_STATE, 0)` yourself.
+0b. **Emscripten's host stack defaults to 64 KB.** gl4es and the shims recurse
+   past it, and the resulting trap reads "memory access out of bounds" — the
+   message names the wrong subsystem entirely. `-sSTACK_SIZE=8388608`.
+0c. **A pattern scan that is one instruction short of its idiom matches
+   everything.** `patch_vm_caches` looked for "load a global, read a field of
+   what it points to" and called it a cached JavaVM; that is also how every
+   intrusive linked list is walked, so it matched 844 sites and wrote the JavaVM
+   into two list heads — the network worker then read the JNI struct as
+   `node->next` and freed it. Requiring the call through the vtable is what
+   makes the pattern mean what it claims.
+0d. **A GLES1 client array is read at draw time, and its record has to survive
+   the draw.** Converting once and clearing the record means only the first quad
+   of a run sees the engine's data. And each array needs its own conversion
+   buffer: one shared scratch buffer is aliased by all three pointers, so by draw
+   time the vertex array holds the colour data.
+0e. **A one-character shortcut on a name is not a name test.** `name[2] == 'n'`
+   to tell `glEnable` from `glDisable` is never true — `name[2]` is `'E'` — so
+   `glEnable` became a no-op and the screen went white with no error at all.
 
 **Instruction-set semantics** (full detail in `docs/SPIKE.md`)
 
