@@ -27,8 +27,30 @@
 #include "guest.h"
 #include "compat.h"
 
+#ifndef WASM_FREESTANDING
 #include <stdio.h>
-#include <string.h>
+#endif
+/* compat.h, not <string.h>: it supplies the handful of functions this file
+ * needs for the freestanding build too. */
+#include "compat.h"
+
+#ifdef WASM_FREESTANDING
+/* The freestanding build -- the throughput measurement -- has no filesystem and
+ * no libc, so none of this is reachable there. Guarded as a block rather than
+ * function by function, because every one of them uses stdio.
+ *
+ * The entry point still needs a definition: callers are compiled in every
+ * build, and leaving it undefined makes the linker emit an import from "env"
+ * rather than fail -- which shows up as a WASM instantiation error in the node
+ * driver, nowhere near the cause. */
+#include "asset_zip.h"
+int asset_zip_find(FILE *f, const char *entry_name, uint32_t *out_offset,
+                   uint32_t *out_length)
+{
+    (void)f; (void)entry_name; (void)out_offset; (void)out_length;
+    return 1;
+}
+#else
 
 /* --- little-endian readers over a byte buffer ----------------------------- */
 static uint32_t rd16(const uint8_t *p) { return (uint32_t)(p[0] | (p[1] << 8)); }
@@ -150,3 +172,5 @@ int asset_zip_find(FILE *f, const char *entry_name, uint32_t *out_offset,
         host_log("assets: %s not found in the archive\n", entry_name);
     return result;
 }
+
+#endif /* !WASM_FREESTANDING */

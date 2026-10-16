@@ -598,6 +598,10 @@ int jni_host_call(const char *name, uint32_t *args, int nargs, uint32_t *ret_lo,
                     while (*p && off < (int)sizeof(entry) - 1) entry[off++] = *p++;
                     entry[off] = 0;
 
+#ifdef WASM_FREESTANDING
+                    int found = 1;   /* no filesystem: nothing to look up */
+                    uint32_t asset_off = 0, asset_len = 0;
+#else
                     uint32_t asset_off = 0, asset_len = 0;
                     /* The archive's location differs by build: the browser has
                      * it preloaded at the filesystem root, the desktop build
@@ -613,6 +617,7 @@ int jni_host_call(const char *name, uint32_t *args, int nargs, uint32_t *ret_lo,
                                                      &asset_len) : 1;
                     if (apk)
                         fclose(apk);
+#endif
 
                     static int logged;
                     if (logged < 20) {

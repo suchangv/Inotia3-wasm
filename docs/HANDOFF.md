@@ -1,445 +1,329 @@
 # Handoff
 
-Everything a fresh agent needs to continue this work. Read this first, then
-`docs/SPIKE.md` for the running engineering log.
+Everything needed to continue this work. Read this first; `docs/SPIKE.md` has the
+running engineering log and `docs/REUSE.md` the dependency research.
 
-## The goal, and why it is shaped this way
+**State as of 2026-10-16: the engine boots, loads its assets, runs 200 frames of
+its own logic and draws — but the first frame has not been seen yet.** The
+remaining obstacle is one specific string format, described below.
 
-Run the Android build of **Inotia 3** in a browser by executing its original
-ARM `libgame.so` — no Android, no Dalvik, no reimplementation of the game.
+---
 
-The binary decides the approach. From the real `libgame.so` (1.36 MB):
+## What this is
 
-| Property | Value | Consequence |
-|---|---|---|
-| `Tag_CPU_arch` | **v5TE** | no ARMv7 semantics |
-| `Tag_THUMB_ISA_use` | **Thumb-1** | no Thumb-2, no IT blocks; 16-bit fixed width |
-| `Tag_FP_arch` | **VFPv2** | no NEON |
-| Dynamic flags | `BIND_NOW` + `SYMBOLIC`, no `mprotect` | no JIT, no self-modifying code |
-| Relocations | 2954 `R_ARM_RELATIVE`, 178 `R_ARM_JUMP_SLOT` | all resolvable at load |
-| Imports | 183 (58 GLES1 fixed-function, rest libc/libm/pthread) | small, closed host surface |
-| `.dynsym` | 5962 functions in `.text` | every entry point enumerable |
+A browser port of Inotia 3 that runs the original ARM `libgame.so` — no Android,
+no Dalvik, no reimplementation of the game.
 
-That last row is why a static translation to WebAssembly is realistic later:
-code that cannot change itself has a recoverable call graph.
+```
+guest GLES1 → gl4es (MIT) → GLES2 → emscripten → WebGL
+```
 
-**The interpreter is stage one, not the destination.** Two numbers decide
-whether the project stays an interpreter or pays for a translation:
+The decision that shapes everything: **a hand-written ARMv5TE/Thumb-1
+interpreter**, because the binary makes a static translation to wasm realistic
+later and the interpreter is what will prove that translation correct.
 
-1. instructions retired per unit of guest work, at what MIPS, native and under wasm;
-2. host crossings per frame — a crossing costs ~50–200 ns in a browser.
+The measured numbers that justified the approach:
 
-Getting to the first real frame is what produces those numbers. That is the
-current objective.
+| | |
+|---|---|
+| interpreter, native | 151.9 MIPS |
+| interpreter, wasm | **77.7 MIPS = 51% of native** |
+| idle/menu-ish frame | 8,963 instructions |
+| extrapolated busy frame | 15–30M instructions → **2.8–5.2 FPS** |
+
+So the interpreter is a correctness oracle and a demo, not the shipping path. A
+static translation is what makes it playable — which is why the interpreter
+matters: it is the thing the translated build gets diffed against.
+
+---
 
 ## Repository layout
 
-This is a **separate git repository** inside `Inotia3-vita/wasm/`. The parent
-repo is public and `.gitignore`s `/wasm/`, so nothing here is published.
-Nothing has been pushed anywhere; there is no remote. See "Where things stand"
-at the end for the one open question about that.
+`Inotia3-vita/wasm/` is its own git repository. The parent repo is public and
+gitignores `/wasm/`. Nothing has been pushed anywhere; there is no remote.
 
 ```
-Inotia3-vita/            (public repo, the PS Vita port — the reference)
-  source/ lib/           the Vita loader: FalsoJNI, so_util, java.c, patch.c
-  PORTING_PLAN.md        104 Corridas of Vita debugging; answers many questions
-  WASM_PORT_ASSESSMENT.md  the interpreter-vs-AOT analysis
-  inotia3-wasm repo ↓
+src/
+  guest.h          fixed 144 MB guest address space, one flat host buffer
+  elf.h/.c         ELF32/ARM reader, relocation, address-ordered symbol index
+  cpu.h/.c         ARMv5TE / Thumb-1 interpreter
+  imports.h/.c     the 183 imports: BKPT stubs, dispatch, crossing counters
+  jni.h/.c         the JNI environment, built in guest memory
+  jni_offsets.h    GENERATED from lib/falso_jni/jni.h — the table order is the ABI
+  gl.h/.c          GLES1 state tracker (the fallback when no backend is linked)
+  gl4es_bridge.c   the real GL backend: typed adapters into gl4es
+  gl4es_protos.h   GENERATED from gl4es' GLES1 header
+  asset_zip.c      find an asset inside the .apk
+  host_libc.c      bionic shims, the guest heap, file I/O, the path hook
+  patches.c        deliberate modifications to the guest binary
+  timers.c         the Java-side software timer table
+  platform_*.c     host services: native / wasm-freestanding / emscripten
+  main.c           the runner
+tools/
+  build.sh             native | wasm | browser
+  build_gl4es.sh       fetch and build gl4es into vendor/ (gitignored)
+  gen_gl4es_protos.sh  regenerate gl4es_protos.h
+  run_browser.sh       serve build/ and screenshot with headless Chrome
+  run_wasm.mjs         node driver for the freestanding build
+  oracle.py            Unicorn differential oracle
+  difftrace.py         first divergent instruction, with a register diff
+  difftest.sh          run the oracle over every entry point
+  callers.py           who calls this function (finds direct BL/BLX only)
+docs/
+  HANDOFF.md       this file
+  SPIKE.md         the engineering log: every bug, every finding
+  REUSE.md         what off-the-shelf code exists and why each was chosen
 ```
 
+`game/` is gitignored and must be supplied locally:
+
 ```
-wasm/
-  README.md              design rationale, build/run, what is and is not done
-  docs/SPIKE.md          engineering log: every bug, every finding, harness gotchas
-  docs/HANDOFF.md        this file
-  src/
-    guest.h              fixed guest address space, host service declarations
-    elf.h/.c             ELF32/ARM reader, relocation, address-ordered symbol index
-    cpu.h/.c             the ARMv5TE/Thumb-1 interpreter
-    imports.h/.c         the 183 ELF imports: BKPT stubs, dispatch, crossing counters
-    jni.h/.c             the JNI environment, built in guest memory
-    jni_offsets.h        GENERATED — the JNI function table order (the ABI)
-    host_libc.c          bionic shims + the guest heap
-    platform.h/_native.c host services for the desktop build
-    main.c               the spike runner
-  tools/
-    build.sh             native and wasm32 builds
-    oracle.py            Unicorn differential oracle
-    difftrace.py         first divergent instruction, with register diff
-    difftest.sh          runs the oracle over every entry point
-  game/                  GITIGNORED — put libgame.so here
-  .venv/                 GITIGNORED — the oracle's Unicorn install
+game/libgame.so      the ARM binary from the APK
+game/assets.apk      the original .apk (the engine reads assets out of it)
 ```
+
+---
 
 ## Build and run
 
 ```sh
-tools/build.sh native        # -> build/spike
-mkdir -p game && cp /path/to/libgame.so game/
+tools/build_gl4es.sh              # once: fetch + build gl4es into vendor/
+tools/build.sh native             # -> build/spike        (fast iteration)
 
-./build/spike game/libgame.so --boot    # the interesting one: the full boot sequence
-./build/spike game/libgame.so --init-array
-./build/spike game/libgame.so --jni
-./build/spike game/libgame.so --jni --jni-verbose
-./build/spike game/libgame.so --entry=010b6a09 --trace
+./build/spike game/libgame.so --boot --frames=200
 ```
 
-Flags: `--boot` (constructors → `JNI_OnLoad` → `nativePreInit`) · `--init-array`
-· `--jni` · `--all` · `--entry=HEX` (one guest function) · `--budget=N`
-instruction cap · `--trace` last 96 instructions, dumped on a fault ·
-`--jni-verbose` first 3 calls per JNI function with arguments · `--oracle` ·
-`--dump-guest=FILE` · `--trace-insns=FILE` · `--no-profile`.
-
-**No emscripten and no sudo are needed.** clang 19 targets wasm32 directly and
-lld supplies `wasm-ld`; the core is freestanding (`compat.h`). Emscripten comes
-back only for the browser host layer.
-
-## The differential oracle
-
-The single most valuable tool here. `tools/difftest.sh` runs each guest entry
-point twice — once under the hand-written interpreter, once under Unicorn — and
-`tools/difftrace.py` names the first instruction whose semantics differ.
+Flags: `--boot` (constructors → JNI_OnLoad → nativePreInit → nativeInit →
+UserAgreeCallback → resumes → nativeRender frames) · `--frames=N` · `--trace`
+(last 96 instructions, dumped on a fault) · `--jni-verbose` · `--oracle` ·
+`--dump-guest=FILE` · `--trace-insns=FILE` · `--watch=ADDR`
 
 ```sh
-tools/difftest.sh
-  entry 010b6a09 : traces are identical for all 102 instructions
-  entry 010d03c5 : traces are identical for all 9 instructions
-  entry 010d0b3d : traces are identical for all 9 instructions
-  entry 010ea589 : traces are identical for all 13 instructions
-all entries match
+tools/build.sh browser            # -> build/spike.html + .js + .wasm + .data
+tools/run_browser.sh 60 /tmp/x.png
 ```
 
-Both sides start from the *same* relocated memory image (the interpreter dumps
-it with `--dump-guest`), stub every import to a no-op returning 0, and stop when
-PC leaves the image. That leaves pure CPU semantics, so a mismatch is a decoder
-bug by construction. **Run it after every interpreter change** — it has already
-caught three bugs that no amount of reading would have.
+**Work on the native build.** It iterates in seconds, has a working crash
+handler that translates a host SIGSEGV back into a guest PC and register dump,
+and has the differential oracle. The browser build is for validating, not for
+finding things.
 
-Setting up the oracle needs no pip and no system Python:
+### Debugging aids, and where they bit
 
-```sh
-python3 -m venv --without-pip .venv
-# then download the unicorn wheel from PyPI and unzip it into
-# .venv/lib/python*/site-packages
-.venv/bin/python3 -c "import unicorn; print(unicorn.__version__)"
-```
+- `--trace` ring + crash handler: the main tool. A host fault reports the guest
+  PC, registers and the last 96 instructions.
+- `--watch=ADDR` logs host-side writes covering a guest address. Guest stores
+  are visible in the trace; a *shim's* writes are not, and that asymmetry is
+  what made a canary corruption hard to place.
+- The `[imp]` trace in `host_import_call` names every crossing, so a fault
+  inside one has a location.
+- The `[glcall]` trace in `gl4es_bridge.c` does the same for GL. A wasm trap
+  carries no PC and no stack, so the last name printed is the only record.
+- `GUEST_CHECK=1 tools/build.sh browser` turns the interpreter's memory access
+  into checked accessors that report the address and the instruction.
 
-Unicorn is an **oracle, not the product**: its speed is QEMU's TCG JIT, which a
-browser cannot use, so under wasm it runs TCI (a two-level interpreter doing
-strictly more work per guest instruction than a direct decoder). It is also
-GPLv2. Read `docs/SPIKE.md` §"The differential oracle" for the five harness
-asymmetries that each reported a divergence having nothing to do with the CPU —
-you will hit them in the same order if you re-derive this.
+**Two debugging aids have caused more work than they found.** The texture-dump
+block in `gl.c` ran for *every* GL entry point and read `args[8]` as a pixel
+pointer — for `glTexCoordPointer(2, GL_FIXED, 0, ptr)` that is a stack word,
+and the resulting host fault looked exactly like an engine bug. Both are now
+bounded to the calls they are about. **When adding one, ask what conditions it
+runs under, not what conditions you meant it to run under.**
 
-## Where things stand
-
-```
-ctor[0]                entry=010b6a09    227 instrs  -> returned to caller
-ctor[1]                entry=010d03c5     24 instrs  -> returned to caller
-ctor[2]                entry=010d0b3d     46 instrs  -> returned to caller
-ctor[3]                entry=010ea589     79 instrs  -> returned to caller
-ctor[4]                (null entry, skipped)
-JNI_OnLoad             entry=010d9bad     99 instrs  -> returned to caller
-    JNI_OnLoad returned 65542 (JNI_VERSION_1_6)          <-- correct
-nativePreInit          entry=010db621     57 instrs  -> returned to caller
-nativeInit             entry=010dc411 188339 instrs  -> returned to caller
-nativeResume           entry=010db55d     12 instrs  -> returned to caller
-nativeResumeClet       entry=010db529     12 instrs  -> returned to caller
-nativeRender           entry=...          33 instrs  -> returned to caller
-    draw calls 0, host crossings 0                       <-- see below
-```
-
-**The whole boot sequence completes.** Working: ELF load and relocation (3139
-relocations, 0 unhandled, 7713 symbols indexed), the full 183-symbol import
-table with interworking stubs, the guest heap, the Thumb-1 decoder, an ARM
-subset decoder, the JNI environment (229 + 5 table entries), a GLES1 **state**
-layer (texture IDs, bindings, enable bits, queries — not a renderer), the
-Java-method worklist, per-function profiling, crash triage that translates a
-host `SIGSEGV` back into a guest address and register dump, a host-write
-watchpoint, and the oracle.
-
-Not started: **VFPv2**, the GLES1→WebGL2 renderer, audio, assets, the browser
-host.
-
-## Achieved: the engine runs
-
-The game executes its real per-frame logic. Measured over 30 frames on the
-boot path, native build (this is the number the spike existed to produce):
-
-| | per frame |
-|---|---|
-| instructions retired | **~8,963** |
-| draw calls | **2-4** (88 over 30 frames) |
-| host crossings | **~293**, of which **memcpy is 71.6%** |
-| native time | **0.059 ms** |
-| **wasm time** | **0.115 ms** |
-
-And the number the spike was built for:
-
-```
-native   151.9 MIPS
-wasm      77.7 MIPS      = 51% of native
-```
-
-The synthetic benchmark predicted 58%; the real binary is a little worse, as it
-should be. Runnable with `tools/build.sh wasm && node tools/run_wasm.mjs`; the
-instruction counts are identical between the two builds (8,963), which is what
-makes the comparison a measurement of the interpreter rather than of two
-different programs.
-
-### What this means for the plan
-
-**The interpreter is a correctness oracle and a demo, not the shipping path.**
-The Vita port measured ~125 ms/frame in a busy combat scene at 444 MHz, which is
-roughly 28M guest instructions. At 77.7 MIPS that is 360 ms/frame -- under 3 FPS
--- and even a low estimate of 15M gives about 5 FPS. So the assessment's
-conclusion stands, now with a measured number behind it: **a static translation
-to WebAssembly is what makes this playable, and the interpreter is what proves
-the translated version correct.**
-
-(That busy-frame figure is an extrapolation from the Vita's profiling, not a
-measurement here. The idle figure is measured.)
-
-**One earlier worry was misplaced, in the port's favour.** The assessment assumed
-50-200 ns per host crossing -- the cost of a wasm-to-JS boundary call. But the
-shims are compiled *into* the module: a guest `memcpy` goes BKPT -> interpreter
--> `import_dispatch` -> C function, entirely inside wasm. There is no JS
-boundary, and ~301 crossings/frame cost almost nothing. That matters because
-`memcpy` alone is 71.6% of them; had they been JS calls the same frame would be
-roughly a third slower.
-
-The remaining caveat: this is the init/menu path, not a busy scene. The profile
-shows real graphics work (`GRP_FillRect`, the `GRP_Filter*` family) and each
-frame makes 2-4 draw calls, so it is not idle -- but it is not combat either.
-
-## What it took, and what is next
-
-Four things stood between "boots cleanly" and "runs", each presenting as a
-different symptom. All four are in the parent repository's history too, which is
-why `PORTING_PLAN.md` and `patch.c` are worth reading before chasing anything
-here.
-
-1. **Anti-tamper.** `nativeInit` only bootstraps the game when `excuteDirectly()`
-   and `jIsCracked()` both return 0. Both run `system("ps > <file>")` and scan
-   the process list; with no shell the file is never created, so both answer
-   "tampered" and `startClet()` is **silently skipped**. The game booted
-   perfectly and idled forever. Now patched in `src/patches.c`.
-2. **Lazily-populated JavaVM caches.** `CS_UserAgreeSetCallback` reads its own
-   `.bss` copy of the JavaVM, which a missing subsystem init was to fill via
-   `GetJavaVM`, and dereferences it. `patches.c` finds every such copy by
-   scanning for the idiom rather than hardcoding addresses -- the parent
-   repository's list of seven is tied to one APK build.
-3. **The Java-side timer table** (`src/timers.c`). The loop is timer-driven:
-   `SetTimer(id, firetime, interval)` out, `nativeRender(id)` back. The id is
-   **opaque, not an index** -- this build passes `&g_MainTimer`.
-4. **`UserAgreeCallback(0)`** after `nativeInit`. `STATE_Set(0)`'s only call
-   site in the whole `.so` is inside it, and on Android a Java module calls back
-   into it.
+---
 
 ## The immediate next task
 
-`nativeRender` returns cleanly in 33 instructions with 0 draw calls and 0 host
-crossings. That is not a crash and not a bug in the interpreter — the engine's
-per-frame work is dispatched from its timer table, and nothing has registered a
-timer.
+**The engine receives `@6490388|148229|assets.apk` and opens `@assets.ap`.**
 
-**Deepen what runs, then take it to wasm.**
+Everything upstream of it works. From a run:
 
-The engine executes its per-frame logic; what it does not yet do is render
-anything, because the GL layer only keeps state (see `gl.h`). In rough order of
-value:
+```
+[assets] values[] <- offset=6490388 length=148229        ← the offset reaches the engine
+[path]   mode=0 MainMenu.png -> @6490388|148229|assets.apk  ← the host's path hook
+[io]     open @assets.ap   FAILED                          ← and this is what it opens
+```
 
-1. **Run the boot further.** Only the init path has been exercised. Quantity to
-   aim at: drive enough frames that the game reaches its title screen and the
-   profile shows the state machine advancing rather than idling.
-2. **Drive a heavier scene.** The measurement above is the init path. Getting
-   the engine into combat would replace the extrapolation with a measurement,
-   and would say directly whether the translated build is worth its cost.
-3. **VFPv2.** Still unimplemented and still not needed on this path. It will be
-   needed the moment the engine does float maths, and it traps with its encoding
-   recorded when it is.
-4. **The remaining file I/O**: `stat`, `statfs`, `fsync`, `raise`. Small.
-5. **The GL renderer.** The 6-10 week item. `gl4es` and emscripten's
-   `LEGACY_GL_EMULATION` are the reference implementations worth reading first.
+`@assets.ap` is ten characters — one short of `assets.apk`, which reads like a
+truncating destination buffer. **It is not truncation in this port**: the same
+string passed through *unchanged* when it did not begin with `@`
+(`assets.apk|6490388|148229` → `open assets.apk|6490388|148229`). So the `@` is
+a real marker, something parses it, and its output is what needs matching.
 
-A measurement worth repeating as the work goes on: **`memcpy` is 71.6% of host
-crossings.** Anything that reduces crossing count should be checked against that
-number, because it is the one that costs browser time.
+**Where the parse is not:** `File::Open(char const*, int)` — disassembled, it
+has no compare against `0x40` and no call to `ParseOffsetAndLengthAndPath`.
+`tools/callers.py` finds no direct caller of `File::GetFullPathName` either, so
+the path goes through a function pointer.
 
-## A map of the bugs found so far
+Cheapest ways in, in order:
 
-Worth reading as a list of *classes*, because they recur. All are in
-`docs/SPIKE.md` with full detail.
+1. **Use `patches_replace_with_import` to instrument.** It can point any symbol
+   at a host handler, and a handler that logs its arguments and then forwards is
+   a log point with no guest-address unknown. `ParseOffsetAndLengthAndPath`
+   (`_Z27ParseOffsetAndLengthAndPathPiPci`, 202 bytes) is a good target: log the
+   buffer it receives and the one it leaves.
+2. **Read `ParseOffsetAndLengthAndPath` properly.** Its disassembly is in
+   `docs/SPIKE.md`'s neighbourhood: it scans for `|` (`0x7C`), and there is a
+   compare against `-` (`0x2D`) suggesting signed parsing. The offsets may not
+   be plain decimal.
+3. **Try formats.** The harness makes this cheap: change the `snprintf` in
+   `host_file_get_full_path_name`, rebuild (seconds), and read what
+   `[io] open` reports. Three formats are already ruled out and recorded in the
+   commit `08fc5fc`.
 
-**Instruction-set semantics** (`src/cpu.c`)
+**Read the parent repository's `source/patch.c` first.** Its
+`File_GetFullPathName_hook` is the same fix, it works, and its comments explain
+the failure mode this port is hitting ("that branch is the ONLY place File::Open's
+offset/length fields get written at all -- skip it and those fields keep whatever
+was already sitting in that stack slot"). Corridas 34, 35, 37 are all this area.
 
-1. `ADD rN, PC` read PC as `pc+2`; Thumb reads PC as a *source* operand as
-   `pc+4`. Not a corner case: this is how GCC materialises the GOT base, so
-   every GOT-relative global access goes through it.
-2. `PUSH` stored registers in descending address order. ARM stores the
-   lowest-numbered register at the lowest address. Reversing the frame hands
-   back a data word as the return address.
-3. `BL` vs `BLX` are told apart by **bit 12 of the second halfword**, not by
-   `J2`. Getting it wrong runs the ARM PLT through the Thumb decoder.
-4. Bit 25 of the ARM load/store offset field is **inverted** from expectation:
-   0 selects the 12-bit immediate. This one instruction is on the path of all
-   178 imports.
-5. ARM data processing clobbered the flags when `S` was clear (`add_c`/`sub_c`
-   write all four flags unconditionally).
-6. **Thumb `BLX Rm` did not set LR** — treated as a plain `BX`. Invisible until
-   a stubbed import is reached through `blx`, at which point the callee returns
-   one frame too high. This was the whole reason `JNI_OnLoad` failed.
-7. The PC range check rejected the import **stub page**, so the BKPT at a stub
-   was never decoded and every host crossing became `HALT_BAD_PC` — which read
-   as "the constructors call nothing".
+### What happens once it works
 
-**Loader / host** (`src/elf_loader.c`, `src/host_libc.c`, `src/jni.c`)
+The chain from there: `File::Open` → `MMappedFile::Open` (absent from the
+profile today, which is how the break was localised) → `mmap` (implemented, reads
+the archive at the offset) → PNG decode → `glTexImage2D` with real pixels.
 
-8. Symbol index not rebased to the load address, so the profiler reported a
-   confident "100% of time in `_end`".
-9. Imported **variables** (`__stack_chk_guard`, `__sF`, `__errno`) are not
-   functions; pointing their GOT slot at a code stub faults on first read.
-10. Import stubs need the **interworking bit** (`stub|1`): the ARM PLT
-    dispatches with `ldr pc, [ip]`, and bit 0 selects Thumb state.
-11. `JNIInvokeInterface` has **3** reserved slots, `JNINativeInterface` has
-    **4**. Assuming 4 for both shifted the whole JavaVM table one slot, so
-    `GetEnv` arrived as `DetachCurrentThread`.
-12. The guest heap's initial block was never marked free, so an empty 64 MB
-    arena reported "out of memory" on the first allocation.
-13. JNI arguments were read as strings before dispatch — a `jclass` is a handle
-    at `0x40000000`, so that dereferences a gigabyte outside the guest space.
-14. The `jni/env/` prefix was not stripped, so no `JNINativeInterface` entry was
-    ever routed — while the report blamed the functions rather than the
-    dispatcher.
+Verify with the framebuffer dump in `gl.c`: it writes the engine's 384×256
+RGB565 surface to `fbNNN.raw`. Today those are 0/98304 or a single flat colour;
+**a dump with many distinct colours is the first frame.**
 
-**Bring-up, continued**
+---
 
-20. **The binary contains its own anti-tamper, and it fails closed.** Two
-    functions shell out to `ps`, find no file (no shell), and answer "tampered"
-    -- which silently skips `startClet()`. The failure mode is a clean boot and
-    an idle engine, which is the most expensive kind: everything looks right.
-    See `patches.c`.
-21. **Subsystems cache the JavaVM in `.bss` and expect a Java-side init to fill
-    it.** Nothing here calls those inits, so the cache reads as 0 and the first
-    dereference is a null. `patches.c` finds every copy by scanning for the
-    idiom; hardcoded address lists rot across APK builds.
-22. **`SetTimer`'s "timer id" is an opaque handle, not a table index.** This
-    build passes the address of the guest's own timer object. Indexing by it
-    discards every registration.
-23. **The engine's own state machine is entered from a callback nothing fires.**
-    `STATE_Set(0)`'s only call site is inside `UserAgreeCallback`, which a Java
-    module calls back into on Android.
+## Where things stand, precisely
 
-**Instruction-set semantics, continued**
+Working:
 
-17. Thumb format 11 (SP-relative load/store) takes Rd from **bits[10:8]**, not
-    bits[2:0] like formats 9 and 10 which share its `case`. So
-    `ldr r1, [sp, #20]` (0x9905) wrote r5 — and r5 held the GOT base, so the
-    failure surfaced thousands of instructions later as a load through a
-    garbage address. Found by diffing every change of r5 in a full register
-    trace, which is the only way to see it: the instruction looks innocent in
-    any trace that prints PCs alone.
-18. The ARM branch target is **PC + 8** + offset, not PC + 4 + offset. `next` is
-    the *link* value; using it for both puts every ARM branch 4 bytes short —
-    small enough to land inside a neighbouring instruction rather than fault.
-    It presented as `__divsf3` spinning for 49.8M instructions, 99.66% of the
-    profile. The oracle found it in one diff.
-19. A `va_list` is a **plain pointer to the argument list**, not the
-    `struct { void *__ap; }` AAPCS describes and not the flat
-    r0-r3-then-stack array the other formatting entry points take. Passing
-    `&args[2]` made the va_list's own pointer the first argument, shifting every
-    conversion by one; `%s` then copied from whatever integer was there until it
-    hit a NUL. That is how a call meant to produce "1.3.2" wrote 14 bytes over a
-    12-byte stack buffer and tripped the guest's stack canary, thousands of
-    instructions after the mistake. Settled by reading the guest's own frames:
-    for `"Android Wrapper v%s #%d"`, `[va_list]` held a pointer to a valid
-    string, which is only true if the arguments start *at* va_list.
+| | |
+|---|---|
+| ELF load + relocation | 3139 relocations, 0 unhandled, 7713 symbols |
+| Import table | 183 ELF + 234 JNI entries, interworking stubs |
+| Thumb-1 decoder | full coverage, oracle-verified |
+| ARM decoder | verified against Unicorn |
+| Oracle | `tools/difftest.sh`, all four constructors instruction-identical |
+| Boot sequence | ctors → JNI_OnLoad → nativePreInit → nativeInit(605K instrs) → UserAgreeCallback → resumes → frames |
+| Timer table | engine clock unified with `GetSystemCurrentTime` |
+| Assets | found in the .apk, offsets delivered, archive opens |
+| GL | gl4es linked and live in the browser; GL_FIXED converted by hand |
+| Browser build | boots in Chrome, frames run, traps in `gl4es_glLoadIdentity` |
 
-**Harness** (the ones that cost the most time, because they lie)
+Not started: **VFPv2** · the browser host proper (canvas loop, input, audio,
+saves) · AOT translation · threads.
 
-15. The "returned to caller" sentinel was 0, which is also where a guest lands
-    after branching through a null function pointer. A real failure was
-    reported as a clean return.
-16. The instruction trace ring did not reset per entry, so `--trace` on a
-    multi-entry run reported whichever entry ran last.
-17. The oracle's copy of the sentinel has to move whenever `main.c`'s does.
+### Known break: the freestanding wasm target
 
-## Conventions this codebase follows
+`tools/build.sh wasm` builds, but `node tools/run_wasm.mjs` fails with
+`Import #0 "env": module is not an object or function`. The cause is the pattern
+this port keeps meeting: **with `--allow-undefined` an undefined symbol becomes
+an import from `env` rather than a link error**, and the failure surfaces at
+instantiation with no hint of which symbol. `asset_zip.c` was guarded for
+`WASM_FREESTANDING` after `jni.c` started calling into it; a stub was added, and
+one more undefined reference evidently remains. Dump the wasm's import section
+(parse section id 2) to name it.
 
-Worth preserving; they are load-bearing for the next person.
+This only affects the throughput-measurement target. The numbers above were
+measured before the break and remain valid, but re-measuring needs this fixed.
 
-* **Comments say why, not what.** Every non-obvious line records the failure it
-  prevents. Several of the above are only findable because the comment says
-  which symptom it caused.
-* **Fail loudly and precisely.** Unimplemented things report their name and
-  count rather than returning a plausible zero; `trap()` records the raw
-  encoding. The worklist is generated by running, never guessed.
-* **Let the trap report drive the work.** Do not implement a whole instruction
-  class speculatively — run, read what actually traps, implement that. The same
-  applies one level up: `jni_report`'s Java-method list is the worklist for the
-  Java semantics, and it is generated by running, never guessed.
-* **When guest memory is corrupted and no guest instruction did it, suspect a
-  shim.** Guest stores are visible in the instruction trace; a shim's writes are
-  not, because the shim is host C the interpreter never sees. `--watch=ADDR`
-  logs host-side writes covering an address, which is how the canary corruption
-  was placed in one run after the instruction trace had ruled the guest out.
-* **Verify against the oracle immediately** after any decoder change.
-* **No premature abstraction.** The interpreter is a switch statement on
-  purpose; the guest address space is one flat buffer with unchecked access
-  because that is what keeps the inner loop tight.
+Also note: **`build.sh wasm` and `build.sh browser` both write
+`build/spike.wasm`** and clobber each other's output.
 
-## What has been considered and rejected
+---
 
-Do not re-litigate these without new evidence; the reasoning is in
-`WASM_PORT_ASSESSMENT.md` and the conversation that produced it.
+## The bug classes, because they recur
 
-* **QEMU-in-wasm + Linux.** It replaces the ~1–2 month CPU layer (which a
-  static translation does better for this binary) with a much larger problem —
-  a guest OS, an Android userspace, and GPU emulation — while saving none of
-  the JNI, GL or asset work. For an aarch32 guest it also only gets TCI, so it
-  would be *slower* than the hand-written interpreter.
-* **Decompiling `libgame.so` and recompiling it.** Ghidra's C is not
-  compilable, and the `.so`'s `.data`/`.bss` are referenced by absolute
-  addresses from its own relocations. Read it for reference; do not try to
-  build it.
-* **Unicorn as the product.** See above: TCI under wasm, and GPLv2.
-* **The Vita port's GPU code.** `vitaGL` is an external library implementing GL
-  on **GXM**, Sony's Vita-only GPU API — it is not in this repo and cannot run
-  anywhere else. `source/utils/glutil.c` is vitaGL-shaped glue full of
-  `psp2/*` and NEON headers. What *is* portable: `source/patch.c`'s GL patches
-  (they act on the guest's call stream) and the accumulated knowledge of what
-  the game does that is unusual.
+Fifteen-plus bugs, all found by running. Grouped by what they teach.
 
-## Roadmap and rough effort
+**Instruction-set semantics** (full detail in `docs/SPIKE.md`)
 
-| Item | Remaining | Notes |
-|---|---|---|
-| **VFPv2** | 1–2 weeks | not started; needed as soon as the engine does float maths |
-| Deepen oracle coverage | 1 week | currently only the prologue path |
-| ~~`nativeInit` → first frame~~ | **done** | the numbers are in the section above |
-| ~~wasm32 build of the runner~~ | **done** | `tools/build.sh wasm && node tools/run_wasm.mjs` |
-| JNI semantics (`WrapperJinterface`, fonts, Sound) | 2–4 weeks | `source/java.c` in the Vita repo has the logic |
-| **GLES1 → WebGL2 fixed function** | **6–10 weeks** | the big one; 58 entry points, no reuse from this repo. Consider `gl4es` or emscripten's `LEGACY_GL_EMULATION` before writing it |
-| Audio (WebAudio + OGG) | 1–3 weeks | |
-| Assets (926 files) | 2–3 weeks | |
-| Browser host (emscripten, threads, saves) | 2–4 weeks | threads are the variable: COOP/COEP + SharedArrayBuffer, or cooperative fibres |
+1. `ADD rN, PC` reads PC as `pc+4`, but `R[15]` holds `pc+2`. This is how GCC
+   materialises the GOT base, so every GOT-relative global access goes through it.
+2. `PUSH` stores the lowest register at the lowest address. Reversing the frame
+   returns a data word as the return address.
+3. `BL` vs `BLX`: **bit 12 of the second halfword**, not `J2`.
+4. Bit 25 of the ARM load/store offset field is **inverted** from expectation.
+5. ARM data processing clobbered the flags when `S` was clear.
+6. **Thumb `BLX Rm` did not set LR** — treated as a plain `BX`. Invisible until a
+   stubbed import is reached through `blx`, then the callee returns one frame up.
+7. The PC range check rejected the import **stub page**.
+8. Thumb format 11's `Rd` is bits[10:8], not bits[2:0].
+9. The ARM branch target is **PC + 8**, not PC + 4.
+10. A `va_list` is a plain pointer to the argument list — not the AAPCS struct,
+    and not the flat array the other formatting entry points take.
 
-Total for a playable browser build: **roughly 3.5–6 months** of focused work.
-That estimate is dominated by GL and the browser host, not the CPU.
+**The boundary between guest and host** (this is the fertile ground)
 
-## One open question for the user
+11. **A `jstring` is a handle, not a pointer.** *And the same mistake was made
+    twice more with a `jintArray`.* A handle is `0x400000xx`, above
+    `GUEST_MEM_SIZE`, so a range check silently rejects it and nothing is
+    written. The engine then reads zeros and the whole path reports success.
+12. **`__errno` is a function**, not a variable — and the test is where the
+    symbol is reached from: `.rel.plt` (called) vs `.rel.dyn` (addressed).
+13. **A stub that returns success and does nothing is worse than one that
+    fails.** `fstat` was that, and it hid the asset chain completely.
+14. **Imported variables need storage, not stubs** — `__sF`, `__stack_chk_guard`.
+15. `mmap` has to actually read the file; and its arena check has to be
+    overflow-safe, or a size near 4 GB wraps past it.
 
-The repository is local only — **nothing has been pushed to a remote**, per the
-original instruction to leave GitHub out of it for now. When it is time:
+**Patches and hooks**
 
-* `gh` is not installed, there is no PAT, and the GitHub CLI cannot create a
-  repository without one. SSH authentication **does** work as `suchangv`, so
-  pushing to an already-existing repository needs nothing more.
-* The parent `Inotia3-vita` repo is **public**; this one was to be private.
+16. The engine contains anti-tamper that fails closed. `excuteDirectly()` and
+    `jIsCracked()` shell out to `ps`, find nothing, and answer "tampered" — which
+    **silently skips `startClet()`** and leaves the game booting perfectly and
+    doing nothing. See `patches.c`.
+17. Subsystems cache the JavaVM in `.bss` and expect a Java-side init to fill it.
+    `patches.c` *finds* the copies by scanning for the idiom rather than
+    hardcoding addresses.
+18. `SetTimer`'s "timer id" is an **opaque handle** (this build passes
+    `&g_MainTimer`), not a table index.
+19. The engine's state machine is entered from a callback nothing fires.
+
+**Harness defects — the ones that lie**
+
+20. The return sentinel was 0, which is also where a guest lands after branching
+    through a null pointer.
+21. The instruction trace ring did not reset per entry.
+22. **Two debugging aids read guest memory they had no business reading.** See
+    above.
+23. A comment was left unterminated by an edit, so the build failed and runs used
+    a stale binary — which made two real fixes look ineffective.
+
+---
+
+## Conventions
+
+- **Comments say why, not what.** Every non-obvious line records the failure it
+  prevents. Several bugs above are only findable because the comment says which
+  symptom it caused.
+- **Fail loudly and precisely.** Unimplemented things report their name and
+  count; `trap()` records the raw encoding. The worklist is generated by
+  running, never guessed — same for the Java-method report in `jni.c`.
+- **Let the report drive the work.** Run, read what actually traps, implement
+  that. The same at every level: the import worklist, the Java-method worklist,
+  the GL entry points in use.
+- **Verify against the oracle after any decoder change.**
+- **Diagnostics must be bounded to the calls they are about.**
+- No premature abstraction: the interpreter is a switch statement on purpose.
+
+## What was considered and rejected
+
+Do not re-litigate without new evidence; `docs/REUSE.md` has the detail.
+
+- **QEMU-in-wasm + Linux** — replaces the CPU layer with a guest OS, an Android
+  userspace and GPU emulation, and saves no JNI, GL or asset work. For an
+  aarch32 guest it only gets TCI, so it would be *slower*.
+- **Decompiling and recompiling `libgame.so`** — Ghidra's C is not compilable and
+  the `.data`/`.bss` are referenced by absolute addresses.
+- **Unicorn as the product** — TCI under wasm, and GPLv2. It is a test oracle
+  only.
+- **Emscripten's `-sLEGACY_GL_EMULATION`** — emulates legacy *desktop* GL 1.x,
+  not the GLES1 API surface; the `x`-suffixed fixed-point calls are absent.
+- **Writing a GLES1 renderer** — gl4es has the complete API surface, an
+  emscripten build target and an MIT licence.
+- **The Vita port's GPU code** — `vitaGL` implements GL on GXM, which is
+  Vita-only. What *is* portable is `source/patch.c`'s accumulated knowledge, and
+  that has been used repeatedly.
 
 ## Ground rules
 
-* **`game/libgame.so` and the assets are Com2uS's copyrighted work.** `game/`,
-  `*.so`, `*.apk` and `*.obb` are gitignored. Never commit them, and do not
-  publish them — a browser build is far more visible than a Vita homebrew.
-* Run `tools/difftest.sh` before committing anything that touches `src/cpu.c`.
+- **`libgame.so` and the assets are Com2uS's copyrighted work.** `game/`, `*.so`,
+  `*.apk`, `*.obb` are gitignored. Never commit or publish them — a browser build
+  is far more visible than a Vita homebrew.
+- Run `tools/difftest.sh` before committing anything that touches `src/cpu.c`.
