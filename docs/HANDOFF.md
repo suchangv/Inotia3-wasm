@@ -38,12 +38,46 @@ The next thing to check is why the software compositor draws nothing, starting
 from `SGL_grpFillRect` / `SGL_DrawTexture` / `SGL_FrameBufferToScreen` and what
 feeds the CSFB.
 
-### How to reproduce
+### The browser host
+
+The page is a real host now: one engine tick per `requestAnimationFrame`, mouse
+and touch input reaching the guest, and no frame cap unless you ask for one.
 
 ```
 tools/build.sh browser
-QUERY="frames=600&gltrace=200&dump=1" tools/run_browser.sh 60 /tmp/shot.png
+tools/run_browser.sh 60 /tmp/shot.png          # headless, 600 frames
+QUERY="frames=200&gltrace=200&dump=1" tools/run_browser.sh 60 /tmp/shot.png
+node tools/click_test.mjs http://127.0.0.1:8080/spike.html 70   # live input test
 ```
+
+Page options: `frames=N` (stop after N; unset means run until closed),
+`fixed=1` (16 ms per tick instead of real elapsed time), `gltrace=N`, `dump=1`.
+
+`main()` is split into `spike_load` / `spike_boot` / `spike_tick` /
+`spike_finish`. The CLI keeps a synchronous loop over `spike_tick`; the browser
+hands `spike_tick_browser` to `host_browser_main_loop`. **The CLI frame log is
+byte-identical to the pre-split build** -- `tools/build.sh native &&
+./build/spike game/libgame.so --boot --frames=600 --no-profile` should print
+`average over 119 frame(s): 8701 instructions` and `final pc=0badf00c`. That
+comparison is the regression test for any further change to the split.
+
+Two things about the stop condition and the clock that are easy to get wrong:
+
+- `HALT_BUDGET` is the *stop* signal, not the continue signal. A frame that
+  completes normally ends `HALT_BAD_PC` with `r15 == RETURN_SENTINEL & ~1`.
+  Inverting this makes the browser run exactly one frame.
+- `g_clock` must be seeded from the guest's `sysTime[]`, because that is what
+  `SetTimer`'s absolute firetimes are comparable to. Starting at zero puts every
+  timer ten hours in the future and the engine just looks idle.
+
+Input lives in `src/input.c`: the Vita port's five-stable-slot state machine
+with the device layer removed. The one place its model does not transfer is
+*how events arrive* -- it polls hardware at ~60 Hz, so a finger that starts and
+ends between two polls is impossible, while here a tick runs for 200-300 ms and
+a tap is 50-100 ms. A level snapshot would drop the tap entirely, so events go
+into a FIFO and are replayed at the frame boundary.
+
+### How to reproduce
 
 `?dump=1` prints the default framebuffer (glReadPixels, base64, 4x downsampled)
 plus the engine's own screen surface and the two composed uploads, so a run can
