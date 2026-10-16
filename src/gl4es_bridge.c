@@ -192,11 +192,25 @@ static void fixed_install(const char *what, fixed_array *fx, int first, int coun
         g_conv = (float *)host_alloc(need);
         g_conv_cap = need;
     }
-    const uint32_t *src = (const uint32_t *)G(fx->ptr + (uint32_t)first * stride);
-    if (!src) {
+    /* Check the WHOLE range, not just its start: G() validates one address, and
+     * the loop below reads `count` vertices of `size` words each, so an array
+     * ending near the top of guest memory walks off the end of linear memory --
+     * an opaque wasm trap, from a call that had already returned successfully
+     * from gl4es' own point of view. */
+    uint32_t start = fx->ptr + (uint32_t)first * stride;
+    uint32_t span = (uint32_t)(count > 0 ? (count - 1) : 0) * stride +
+                    (uint32_t)size * 4u;
+    if (start >= GUEST_MEM_SIZE || span > GUEST_MEM_SIZE - start) {
+        static int warned;
+        if (warned < 8) {
+            warned++;
+            host_log("gl: GL_FIXED array %08x+%u exceeds guest memory (%u MB) "
+                     "-- skipping the draw\n", start, span, GUEST_MEM_SIZE >> 20);
+        }
         fx->active = 0;
         return;
     }
+    const uint32_t *src = (const uint32_t *)(g_mem + start);
     size_t n = (size_t)count * (size_t)size;
     for (size_t i = 0; i < n; i++)
         g_conv[i] = (float)(int32_t)src[i] / 65536.0f;
@@ -391,6 +405,16 @@ int gl4es_dispatch(const char *name, const uint32_t *args, int nargs,
     if (!g_gl4es_ready)
         return 0;
 
+    /* Log the next N entry points by name. A wasm trap carries no guest PC and
+     * no stack, so the last name printed is the only record of which call was
+     * running when it happened -- the interpreter's own trace ring cannot help,
+     * because the trap is not an interpreter-level fault. */
+    extern int g_gl_trace;
+    if (g_gl_trace > 0) {
+        g_gl_trace--;
+        host_log("  [glcall] %s\n", name);
+    }
+
     uint32_t a0 = nargs > 0 ? args[0] : 0;
     uint32_t a1 = nargs > 1 ? args[1] : 0;
     uint32_t a2 = nargs > 2 ? args[2] : 0;
@@ -557,8 +581,19 @@ int gl4es_dispatch(const char *name, const uint32_t *args, int nargs,
             }
             return 1;
         }
-        gl4es_glTexSubImage2D(a0, (int32_t)a1, (int32_t)a2, (int32_t)a3,
-                              (int32_t)a4, (int32_t)a5, a6, a7, G(a8));
+        {
+            static int n;
+            const void *p = G(a8);
+            if (n < 4) {
+                n++;
+                host_log("  [gl] -> gl4es_glTexSubImage2D(%u,%d,%d,%d,%d,%d,%04x,%04x,%p)\n",
+                         a0,(int)a1,(int)a2,(int)a3,(int)a4,(int)a5,a6,a7,p);
+            }
+            gl4es_glTexSubImage2D(a0, (int32_t)a1, (int32_t)a2, (int32_t)a3,
+                                  (int32_t)a4, (int32_t)a5, a6, a7, p);
+            if (n <= 4)
+                host_log("  [gl] <- returned\n");
+        }
         return 1;
     }
     if (strcmp(name, "glCompressedTexImage2D") == 0) {

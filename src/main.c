@@ -87,6 +87,11 @@ static guest_image g_img;
  * this array rather than keeping a host-side notion of "now". */
 uint32_t g_sys_time_addr;
 
+/* Browser debugging: log this many GL entry points by name, then stop. 0 is
+ * off. A wasm trap carries no guest PC and no stack, so the last name printed
+ * is the only record of which call was running when it happened. */
+int g_gl_trace;
+
 static uint32_t find_symbol(const char *name)
 {
     for (int i = 0; i < g_img.nsyms; i++) {
@@ -460,6 +465,7 @@ int main(int argc, char **argv)
     host_browser_read_frames();
     host_browser_gl_setup();
     gl4es_bridge_init(SCREEN_W, SCREEN_H);
+    { extern int g_gl_trace; g_gl_trace = 600; }
 #endif
 
     cpu_init(&g_img);
