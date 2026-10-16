@@ -625,9 +625,36 @@ int jni_host_call(const char *name, uint32_t *args, int nargs, uint32_t *ret_lo,
                                      asset_off, asset_len);
                     }
 
-                    if (values && values < GUEST_MEM_SIZE - 8) {
-                        ST32(values, found ? 0xFFFFFFFFu : asset_off);
-                        ST32(values + 4, found ? 0xFFFFFFFFu : asset_len);
+                    /* `values` is a jintArray HANDLE, not a guest pointer. Same
+                     * mistake as the `name` argument two lines up, and it fails
+                     * the same silent way: the handle is 0x400000xx, which is
+                     * above GUEST_MEM_SIZE, so the range check rejected it and
+                     * nothing was ever written. The engine then read {0, 0} as
+                     * the asset's offset and length, opened nothing, and drew a
+                     * black frame -- with every function on the path reporting
+                     * that it had run.
+                     *
+                     * The handle resolves to the array's payload, which is real
+                     * guest memory (see jni_handle, and jni_host_new_array). */
+                    uint32_t payload = 0;
+                    {
+                        jni_handle *ah = handle_of(values);
+                        if (ah && ah->kind == H_ARRAY)
+                            payload = ah->guest;
+                    }
+                    if (payload && payload < GUEST_MEM_SIZE - 8) {
+                        ST32(payload, found ? 0xFFFFFFFFu : asset_off);
+                        ST32(payload + 4, found ? 0xFFFFFFFFu : asset_len);
+                        static int n;
+                        if (n < 6) {
+                            n++;
+                            host_log("  [assets] values[] <- offset=%u length=%u\n",
+                                     found ? 0xFFFFFFFFu : asset_off,
+                                     found ? 0xFFFFFFFFu : asset_len);
+                        }
+                    } else {
+                        host_log("  [assets] cannot resolve the values array "
+                                 "(handle %08x)\n", values);
                     }
                     *ret_lo = 0;
                     st->implemented = 1;

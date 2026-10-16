@@ -18,6 +18,7 @@
 #include "elf.h"
 #include "cpu.h"
 #include "jni.h"
+#include "imports.h"
 #include "compat.h"
 
 /* Overwrite a function's prologue so that it returns `value` immediately.
@@ -144,6 +145,30 @@ static int patch_vm_caches(const guest_image *img)
     return patched;
 }
 
+int patches_replace_with_import(const guest_image *img, const char *symbol,
+                                const char *import_name)
+{
+    uint32_t addr = elf_find_symbol(img, symbol);
+    if (!addr) {
+        host_log("patches: %s not found -- not replaced\n", symbol);
+        return 0;
+    }
+    if (!(addr & 1)) {
+        host_log("patches: %s is ARM code; the jump below is Thumb\n", symbol);
+        return 0;
+    }
+    int idx = import_register(import_name, 0);
+    imports_build_stubs();   /* the stub has to exist before the jump names it */
+    uint32_t stub = g_imports[idx].stub | 1u;
+    uint32_t at = addr & ~1u;
+    ST16(at + 0, 0x4B00);                       /* ldr r3, [pc, #0] */
+    ST16(at + 2, 0x4718);                       /* bx  r3           */
+    ST32(at + 4, stub);
+    host_log("patches: %s (%08x) -> %s stub %08x\n", symbol, at,
+             import_name, stub);
+    return 1;
+}
+
 void patches_apply(const guest_image *img)
 {
     /* --- anti-tamper ---------------------------------------------------
@@ -176,6 +201,26 @@ void patches_apply(const guest_image *img)
      * prologue is sound. */
     patch_symbol_return(img, "excuteDirectly", 0);
     patch_symbol_return(img, "jIsCracked", 0);
+
+    /* --- File::GetFullPathName -------------------------------------------
+     *
+     * The function every resource path goes through, replaced with a host
+     * implementation. This is the same decision the parent repository made
+     * (source/patch.c's File_GetFullPathName_hook, Corrida 34/37) and for the
+     * same reason: the real one builds an "@offset|length|path" string for
+     * assets, and that "@" form is the *only* place File::Open's offset and
+     * length fields are written. Get it wrong and those fields keep whatever
+     * was in that stack slot from an unrelated earlier call.
+     *
+     * Doing it here rather than trusting the original means the pass-through
+     * case is also formatted the same way, which is what the parent repository
+     * found it had to fix: on Android every resource resolves through the apk
+     * branch, so the bug of a bare path never taking the "@" branch is
+     * unreachable there and only shows up in a port. */
+    patches_replace_with_import(img, "_ZN4File15GetFullPathNameEPKcPcmi",
+                                "host/File::GetFullPathName");
+    patches_replace_with_import(img, "_ZN4File15GetFullPathNameEPKcPcm",
+                                "host/File::GetFullPathName");
 }
 
 /* Separate from patches_apply() because it depends on jni_guest_init(), which

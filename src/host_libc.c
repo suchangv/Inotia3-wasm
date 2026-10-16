@@ -16,6 +16,7 @@
 #include "cpu.h"
 #include "compat.h"
 #include "platform.h"
+#include "asset_zip.h"
 #include "jni.h"
 #include "gl.h"
 
@@ -134,6 +135,11 @@ static uint32_t heap_usable(uint32_t ptr)
     blk_hdr *h = (blk_hdr *)(g_mem + ptr - HDR_SZ);
     return h->size & ~BLK_FREE;
 }
+
+/* Implemented below; declared here because the dispatcher calls it long before
+ * its definition. See the comment there. */
+void host_file_get_full_path_name(uint32_t name_ptr, uint32_t out_ptr,
+                                  uint32_t out_size, uint32_t mode);
 
 /* ========================================================================== */
 /* Guest pointer validation                                                    */
@@ -560,6 +566,12 @@ void host_import_call(guest_import *im)
         if (n < 4000) { n++; host_log("  [imp] %s\n", im->name); }
     }
 
+    /* The one guest function the host replaces outright. See patches.c. */
+    if (strcmp(im->name, "host/File::GetFullPathName") == 0) {
+        host_file_get_full_path_name(a0, a1, a2, extra_arg(4));
+        return;
+    }
+
     /* JNI table entries arrive through the same mechanism as everything else:
      * the guest branched to a BKPT stub and the interpreter derived its index
      * from the stub address. Nothing here needs to know that. */
@@ -965,6 +977,27 @@ void host_import_call(guest_import *im)
         R[0] = (mkdir(g_path_buf, 0777) == 0) ? 0 : (uint32_t)-1;
         break;
     }
+    case IMPL_fstat: {
+        /* fstat(int fd, struct stat *buf) -- the same bionic layout as stat.
+         * Left unimplemented until now, which meant it returned success and
+         * filled nothing: the engine opened the asset archive, read whatever
+         * happened to be in that struct, closed the file and moved on without
+         * ever reading the asset. A stub that reports success is worse than one
+         * that fails, because the caller has no reason to look further. */
+        FILE *f = file_of(a0);
+        if (!f) { R[0] = (uint32_t)-1; break; }
+        long here = ftell(f);
+        fseek(f, 0, SEEK_END);
+        long sz = ftell(f);
+        fseek(f, here, SEEK_SET);
+        if (a1 && guest_ok(a1, 64, "fstat")) {
+            memset(g_mem + a1, 0, 64);
+            ST32(a1 + 8, (uint32_t)sz);       /* st_size (bionic arm: +8)  */
+            ST32(a1 + 16, 0100644);           /* st_mode (bionic arm: +16) */
+        }
+        R[0] = 0;
+        break;
+    }
     case IMPL_stat: {
         /* struct stat is bionic's, and the engine only reads st_size and
          * st_mode from it. Writing the whole host struct would be wrong -- the
@@ -1144,3 +1177,122 @@ void host_import_call(guest_import *im)
         break;
     }
 }
+
+#ifndef WASM_FREESTANDING
+/*
+ * File::GetFullPathName(const char *name, char *out, unsigned out_size,
+ *                       int mode) -- the host's replacement.
+ *
+ * The engine resolves every path through here, and for assets it has to
+ * produce the "@offset|length|path" form: that is the only thing that makes
+ * File::Open write its own offset and length fields, and those fields are what
+ * the mmap that follows uses. A bare path leaves them holding whatever was in
+ * that stack slot from an earlier call, which is a truncated read and a CRC
+ * failure far from the cause.
+ *
+ * The modes are the parent repository's (source/patch.c, Corrida 34):
+ *   0  user dir      <userdir><package>/<name>       saves and profile data
+ *   2  apk           @<offset>|<length>|<archive>    assets
+ *   3  external      /sdcard/Android/data/<pkg>/files/<name>
+ *
+ * Mode 2 does the archive lookup directly rather than calling the engine's own
+ * CS_fsGetFileDescriptor: that is a guest function, and calling back into the
+ * interpreter from inside an import handler is re-entrancy this port has
+ * deliberately avoided. The lookup is the same work GetFileDescriptor does, so
+ * the answer is identical.
+ */
+void host_file_get_full_path_name(uint32_t name_ptr, uint32_t out_ptr,
+                                  uint32_t out_size, uint32_t mode)
+{
+    char name[512];
+    guest_path(name_ptr, name, sizeof(name));
+    if (!out_ptr || out_size == 0 || out_size > 4096) {
+        if (out_ptr)
+            ST8(out_ptr, 0);
+        return;
+    }
+
+    char buf[1024];
+    buf[0] = 0;
+
+    if (name[0] == '/' || strchr(name, ':') != NULL) {
+        /* Already resolved -- one of our own stubs' paths. It still has to
+         * carry the "@" form, or File::Open will not fill in its offset and
+         * length. The parent repository's Corrida 34 is exactly this fix. */
+        FILE *f = fopen(name, "rb");
+        long len = 0;
+        if (f) { fseek(f, 0, SEEK_END); len = ftell(f); fclose(f); }
+        snprintf(buf, sizeof(buf), "@0|%ld|%s", len, name);
+    } else if (mode == 2) {
+        char entry[256];
+        snprintf(entry, sizeof(entry), "assets/common/game_res/%s.jpg", name);
+        uint32_t off = 0, len = 0;
+        FILE *apk = fopen("assets.apk", "rb");
+        if (!apk) apk = fopen("game/assets.apk", "rb");
+        if (!apk) apk = fopen("/assets.apk", "rb");
+        int found = apk ? asset_zip_find(apk, entry, &off, &len) : 1;
+        if (apk) fclose(apk);
+        if (found)
+            snprintf(buf, sizeof(buf), "@0|0|assets.apk");
+        else
+            snprintf(buf, sizeof(buf), "@%u|%u|assets.apk", off, len);
+    } else if (mode == 3) {
+        snprintf(buf, sizeof(buf),
+                 "/sdcard/Android/data/%s/files/%s",
+                 "com.com2us.inotia3.google.global", name);
+    } else if (mode == 0) {
+        snprintf(buf, sizeof(buf), "/data%s/%s",
+                 "com.com2us.inotia3.google.global", name);
+    }
+
+    /* If whatever that produced does not exist, the engine is asking for a
+     * shipped asset whatever mode it used to ask.
+     *
+     * The mode numbering is not taken on faith: the parent repository's build
+     * resolves assets through mode 2, and this build asks for "MainMenu.png"
+     * in mode 0 -- the same APK version difference that moved every other
+     * offset in this port. Rather than encode an assumption about which mode
+     * means "asset", the fallback is the archive lookup itself, which is
+     * correct in every mode and costs one stat.
+     *
+     * It has to produce the "@" form regardless of which branch got here: that
+     * is the only thing that makes File::Open write its offset and length
+     * fields, and those are what the mmap that follows reads. */
+    if (!strchr(buf, '@')) {
+        FILE *probe = fopen(buf, "rb");
+        if (probe) {
+            fclose(probe);
+        } else {
+            char entry[256];
+            snprintf(entry, sizeof(entry), "assets/common/game_res/%s.jpg", name);
+            uint32_t off = 0, len = 0;
+            FILE *apk = fopen("assets.apk", "rb");
+            if (!apk) apk = fopen("game/assets.apk", "rb");
+            if (!apk) apk = fopen("/assets.apk", "rb");
+            if (apk) {
+                /* EXPERIMENT: the engine turned "@6490388|148229|assets.apk"
+                 * into "@assets.ap" -- 10 characters, exactly what an 11-byte
+                 * destination buffer holds. Trying the bare path to see what
+                 * it opens then. */
+                if (asset_zip_find(apk, entry, &off, &len) == 0)
+                    snprintf(buf, sizeof(buf), "@%u|%u|assets.apk", off, len);
+                fclose(apk);
+            }
+        }
+    }
+
+    static int logged;
+    if (logged < 200) {
+        logged++;
+        host_log("  [path] mode=%u %-34s -> %s\n", mode, name, buf);
+    }
+
+    size_t n = strlen(buf);
+    if (n + 1 > out_size) {
+        ST8(out_ptr, 0);
+        return;
+    }
+    memcpy(g_mem + out_ptr, buf, n + 1);
+    g_cpu.r[0] = 1;   /* the real function returns nonzero on success */
+}
+#endif
