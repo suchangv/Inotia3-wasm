@@ -13,6 +13,11 @@ cd "$(dirname "$0")/.."
 BUDGET=${1:-20}
 OUT=${2:-/tmp/inotia3-frame.png}
 PORT=8971
+# A headless run must be bounded: the page now runs one engine tick per
+# requestAnimationFrame and ticks cost ~200 ms of real CPU, so an uncapped loop
+# would spend the whole virtual-time budget (and then some) before the
+# screenshot. ?frames=N stops it.
+QUERY=${QUERY:-frames=600}
 
 CH=$(find "$HOME/.cache/puppeteer" -type f -name chrome 2>/dev/null | head -1)
 [ -x "$CH" ] || { echo "no Chrome for Testing found in ~/.cache/puppeteer"; exit 1; }

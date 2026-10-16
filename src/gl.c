@@ -18,7 +18,8 @@
 #include "compat.h"
 
 #ifndef WASM_FREESTANDING
-#include <stdio.h>   /* the framebuffer dump below is a debugging aid */
+#include <stdio.h>
+#include <stdlib.h>   /* the framebuffer dump below is a debugging aid */
 #endif
 
 uint64_t g_gl_draw_calls;
@@ -299,7 +300,11 @@ void gl_host_call(const char *name, const uint32_t *args, int nargs,
                      name, w, h, is_sub ? "sub" : "full",
                      g_cpu.r[14], px, nz, n);
         }
-        if (dumped < 80 && px && w >= 256 && h >= 192) {
+        /* Opt-in: this writes up to 80 x 192 KB files into the working
+         * directory, which is fine when you are staring at a black screen and
+         * want to know what the engine handed over, and pure litter the rest of
+         * the time. SPIKE_DUMP_FB=1. */
+        if (getenv("SPIKE_DUMP_FB") && dumped < 80 && px && w >= 256 && h >= 192) {
             dumped++;
             char path[64];
             snprintf(path, sizeof(path), "fb%03d.raw", dumped);

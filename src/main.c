@@ -29,6 +29,7 @@
 #include "gl.h"
 #include "patches.h"
 #include "timers.h"
+#include "input.h"
 
 #ifndef WASM_FREESTANDING
 #include <stdio.h>
@@ -80,6 +81,33 @@ void spike_set_so(const uint8_t *p, size_t n)
 #endif
 
 static guest_image g_img;
+
+/* ---- state that outlives a single tick ----------------------------------
+ *
+ * The browser drives the engine from requestAnimationFrame, so the run is no
+ * longer one synchronous loop and the things that loop carried have to live
+ * somewhere. Everything here is set once by spike_load()/spike_boot() and read
+ * by spike_tick().
+ */
+static uint32_t g_native_render;   /* Java_...WrapperRenderer_nativeRender   */
+static uint32_t g_native_event;    /* Java_...WrapperRenderer_nativeEvent    */
+static int64_t  g_clock;           /* the guest's clock, ms -- sysTime[]      */
+static uint64_t g_budget;          /* per-cpu_run instruction budget          */
+static int      g_frames_max;      /* 0 = run until something stops it        */
+static int      g_frames_done;
+static uint64_t g_total_insns;
+static int      g_ok_frames;
+static int      g_do_profile;
+static int      g_trace_on;
+static int      g_use_fixed_step = 1;  /* 16 ms per tick, not real elapsed      */
+static double   g_last_now_ms;
+
+static int spike_load(const char *path);
+static int spike_boot(void);
+static int spike_tick(void);
+static int spike_tick_browser(void);
+static void spike_finish(void);
+
 
 /* Guest address of the jlong sysTime[1] handed to nativeInit(). The guest reads
  * its clock from here (CS_knlCurrentTime), and the timer firetimes arriving
@@ -177,12 +205,12 @@ static int g_stop_at_resume;
  * tool that quietly does nothing.
  *
  * Returns the reason to report. */
-static int spike_resume_if_stopped(int reason, uint64_t budget);
+static int spike_resume_if_stopped(int reason, uint64_t g_budget);
 
 /* `arg0` is placed in r0 before the entry runs -- JNI_OnLoad expects the
  * JavaVM* there, and the native* entry points expect a JNIEnv*. */
 static run_result run_entry_arg(const char *what, uint32_t entry, uint32_t arg0,
-                                uint64_t budget)
+                                uint64_t g_budget)
 {
     run_result r;
     r.what = what;
@@ -207,10 +235,10 @@ static run_result run_entry_arg(const char *what, uint32_t entry, uint32_t arg0,
 
     uint64_t before = g_insn_count;
     double t0 = host_now();
-    r.reason = cpu_run(entry, g_cpu.r[13], g_insn_count + budget);
+    r.reason = cpu_run(entry, g_cpu.r[13], g_insn_count + g_budget);
     cpu_trace_final();
 
-    r.reason = spike_resume_if_stopped(r.reason, budget);
+    r.reason = spike_resume_if_stopped(r.reason, g_budget);
 
     r.seconds = host_now() - t0;
     r.insns = g_insn_count - before;
@@ -219,9 +247,9 @@ static run_result run_entry_arg(const char *what, uint32_t entry, uint32_t arg0,
 
 /* A guest entry point taking (JNIEnv*, jclass) and nothing else -- nativeResume
  * and nativeResumeClet are the two. */
-static run_result run_entry_env(const char *what, uint32_t entry, uint64_t budget)
+static run_result run_entry_env(const char *what, uint32_t entry, uint64_t g_budget)
 {
-    return run_entry_arg(what, entry, g_jnienv_ptr, budget);
+    return run_entry_arg(what, entry, g_jnienv_ptr, g_budget);
 }
 
 /* nativeRender(JNIEnv *env, jobject clazz, jint timerID), driven once per timer
@@ -235,7 +263,7 @@ static run_result run_entry_env(const char *what, uint32_t entry, uint64_t budge
  * `timer_id` is the opaque handle the guest registered through SetTimer and
  * must be passed back unchanged -- see timers.h. */
 static run_result run_native_render(uint32_t entry, uint32_t timer_id,
-                                    uint64_t budget)
+                                    uint64_t g_budget)
 {
     run_result r;
     r.what = "nativeRender";
@@ -250,7 +278,7 @@ static run_result run_native_render(uint32_t entry, uint32_t timer_id,
     g_cpu.cpsr = 0x10;
     uint64_t before = g_insn_count;
     double t0 = host_now();
-    r.reason = cpu_run(entry, g_cpu.r[13], g_insn_count + budget);
+    r.reason = cpu_run(entry, g_cpu.r[13], g_insn_count + g_budget);
     cpu_trace_final();
     r.insns = g_insn_count - before;
     r.seconds = host_now() - t0;
@@ -365,7 +393,7 @@ static void dump_guest(const char *path)
 static void dump_guest(const char *path) { (void)path; }
 #endif
 
-static int spike_resume_if_stopped(int reason, uint64_t budget)
+static int spike_resume_if_stopped(int reason, uint64_t g_budget)
 {
     if (reason != HALT_STOPPED || !g_stop_at_resume)
         return reason;
@@ -379,7 +407,7 @@ static int spike_resume_if_stopped(int reason, uint64_t budget)
     }
 
     uint64_t before = g_insn_count;
-    int r = cpu_run(g_cpu.r[15] | 1u, g_cpu.r[13], g_insn_count + budget);
+    int r = cpu_run(g_cpu.r[15] | 1u, g_cpu.r[13], g_insn_count + g_budget);
     cpu_trace_final();
     host_log("  snapshot: ran %llu more instructions -> %s\n",
              (unsigned long long)(g_insn_count - before), cpu_halt_str(r));
@@ -401,6 +429,554 @@ static int spike_resume_if_stopped(int reason, uint64_t budget)
 
 /* ---- entry --------------------------------------------------------------- */
 
+
+/* Everything every entry path needs, and nothing specific to the game boot:
+ * the --entry= / --init-array / --jni paths use this and stop there.
+ *
+ * Return codes are main()'s, preserved: 2 is "no image, or could not read it",
+ * 1 is "it is not a usable ELF".
+ */
+static int spike_load(const char *path)
+{
+g_mem = (uint8_t *)host_alloc(GUEST_MEM_SIZE);
+host_log("guest address space: %u MB at %p\n", GUEST_MEM_SIZE >> 20, (void *)g_mem);
+
+/* Must come after g_mem is known and before the first guest instruction:
+ * an unchecked guest access faults as a host SIGSEGV, and the handler's
+ * whole job is to translate that back into a guest address. */
+host_install_crash_handler();
+
+/* ---- read the .so ---- */
+const uint8_t *buf;
+size_t len;
+#ifdef WASM_FREESTANDING
+buf = g_wasm_so;
+len = g_wasm_so_len;
+if (!buf || !len) {
+    host_log("no image supplied: call spike_set_so() first\n");
+    return 2;
+}
+host_log("loaded libgame.so (%u bytes, supplied by the driver)\n",
+         (unsigned)len);
+#else
+FILE *f = fopen(path, "rb");
+if (!f) {
+    host_log("cannot open %s\n", path);
+    return 2;
+}
+fseek(f, 0, SEEK_END);
+long flen = ftell(f);
+fseek(f, 0, SEEK_SET);
+uint8_t *fread_buf = (uint8_t *)host_alloc((size_t)flen);
+if (fread(fread_buf, 1, (size_t)flen, f) != (size_t)flen) {
+    host_log("short read on %s\n", path);
+    fclose(f);
+    return 2;
+}
+fclose(f);
+buf = fread_buf;
+len = (size_t)flen;
+host_log("loaded %s (%ld bytes)\n", path, flen);
+#endif
+
+/* ---- map and relocate it ---- */
+if (elf_load(buf, len, &g_img) != 0)
+    return 1;
+/* Deliberate modifications to the guest binary, before anything runs.
+ * Without these the engine boots and then idles: see patches.c. */
+patches_apply(&g_img);
+
+/* Must follow elf_load: it registers the JNI table entries as imports and
+ * re-stamps the stub page. */
+jni_guest_init();
+
+/* After jni_guest_init: this writes the JavaVM's guest address into every
+ * .bss slot that a missing subsystem init would have filled. */
+patches_fill_vm_caches(&g_img);
+
+gl_state_init();
+
+#ifdef __EMSCRIPTEN__
+/* The browser build has a real renderer. The context has to exist before
+ * gl4es initialises -- with NOEGL nothing else can tell it the surface
+ * size -- and gl4es has to be up before any guest GL call arrives. */
+host_browser_set_size(SCREEN_W, SCREEN_H);
+host_browser_gl_setup();
+gl4es_bridge_init(SCREEN_W, SCREEN_H);
+/* Per-call GL tracing is off unless the page asks for it: it is the first
+ * thing to reach for when a draw misbehaves, and 600 lines of noise in
+ * every ordinary run otherwise. */
+{ extern int g_gl_trace; g_gl_trace = g_browser_gl_trace; }
+#endif
+
+cpu_init(&g_img);
+cpu_set_profile(g_do_profile);
+cpu_enable_trace(g_trace_on);
+    return 0;
+}
+
+
+/* The game boot proper: src/utils/init.c in the Vita port, in order. Running
+ * these in sequence is what puts the guest on the path to its first frame, and
+ * the order is load-bearing throughout -- see the comments inline.
+ */
+static int spike_boot(void)
+{
+    /* src/utils/init.c in the Vita port, in order: static constructors,
+     * then JNI_OnLoad, then nativePreInit. Getting these three to run in
+     * sequence is what puts the guest on the path to its first frame. */
+    host_log("=== boot sequence ===\n");
+    for (uint32_t i = 0; i < g_img.init_array_n; i++) {
+        uint32_t raw = LD32(g_img.init_array + i * 4);
+        /* The image's .init_array has a trailing NULL entry (ARRAYSZ
+         * counts it). Executing it would be exactly the "branch through a
+         * NULL function pointer" case the return sentinel exists to
+         * distinguish, so skip rather than run. */
+        if (!raw) {
+            host_log("ctor[%u]                : (null entry, skipped)\n", i);
+            continue;
+        }
+        uint32_t fn = raw | 1u;
+        char label[32];
+        label[0]='c'; label[1]='t'; label[2]='o'; label[3]='r';
+        label[4]='['; label[5]=(char)('0'+(i%10)); label[6]=']'; label[7]=0;
+        run_result rr = run_entry_arg(label, fn, 0, g_budget);
+        report_run(&rr);
+        if (rr.reason == HALT_TRAP)
+            break;
+    }
+
+    uint32_t jni_entry = find_symbol("JNI_OnLoad");
+    run_result rj = run_entry_arg("JNI_OnLoad", jni_entry, g_javavm_ptr, g_budget);
+    report_run(&rj);
+    host_log("    JNI_OnLoad returned %d (JNI_VERSION_1_6 is %d)\n",
+             (int)g_cpu.r[0], JNI_VERSION_1_6);
+
+    uint32_t pre = find_symbol(
+        "Java_com_com2us_wrapper_WrapperRenderer_nativePreInit");
+    if (!pre) {
+        host_log("nativePreInit symbol not found\n");
+    } else {
+        /* nativePreInit(JNIEnv *env, jclass clazz, jintArray parameter,
+         *               jint screenW, jint screenH) -- five arguments, so
+         *               the last one is on the guest stack, which
+         *               run_entry_arg cannot express. Set the register file
+         *               directly and push the fifth word. */
+        uint32_t array = jni_host_new_int_array(3);
+        g_cpu.r[13] = GUEST_STACK_TOP - 0x1000;
+        ST32(g_cpu.r[13], 544);          /* screenH, the fifth argument */
+        /* LR must be the same sentinel run_entry_arg uses. This was 1,
+         * which lands the return at PC 0 -- indistinguishable from a
+         * branch through a null function pointer, and reported as "PC left
+         * the loaded image" even when the function's epilogue ran
+         * correctly. Same class of mistake as the sentinel having been 0. */
+        g_cpu.r[14] = RETURN_SENTINEL;
+        for (int i = 0; i < 13; i++) g_cpu.r[i] = 0;
+        g_cpu.r[0] = g_jnienv_ptr;
+        g_cpu.r[1] = 0;                  /* clazz: the guest ignores it */
+        g_cpu.r[2] = array;
+        g_cpu.r[3] = 960;
+        g_cpu.cpsr = 0x10;
+        uint64_t before = g_insn_count;
+        double t0 = host_now();
+        run_result rp;
+        rp.what = "nativePreInit";
+        rp.entry = pre;
+        rp.reason = spike_resume_if_stopped(
+            cpu_run(pre, g_cpu.r[13], g_insn_count + g_budget), g_budget);
+        cpu_trace_final();
+        rp.insns = g_insn_count - before;
+        rp.seconds = host_now() - t0;
+        report_run(&rp);
+        /* getEnv() and JNI_OnLoad() share this globals block: JNI_OnLoad
+         * stores the JavaVM* at +0 and getEnv() reads it back before
+         * calling vm->GetEnv, which writes the JNIEnv* at +4. Printing it
+         * says directly whether the two agree. */
+        host_log("    module globals at 0115a36c: vm=%08x env=%08x\n",
+                 LD32(0x0115a36c), LD32(0x0115a370));
+    }
+
+    uint32_t init = find_symbol(
+        "Java_com_com2us_wrapper_WrapperRenderer_nativeInit");
+    if (!init) {
+        host_log("nativeInit symbol not found\n");
+    } else {
+        /* nativeInit(JNIEnv *env, jobject clazz, jlongArray sysTime,
+         *            jintArray upTime, jintArray pixel, jfloatArray gyro,
+         *            jobject activity) -- seven arguments, so the last
+         *            three go on the guest stack in order.
+         *
+         * The arrays are handles the guest itself calls Get*ArrayElements
+         * on; the Java side that would have allocated and filled them is
+         * mirrored here. sysTime is wall-clock ms on Android; host_now() is
+         * monotonic, so this is "some plausible non-zero ms" rather than a
+         * real epoch -- enough to tell whether the engine reads it once or
+         * every frame. */
+        uint32_t sysTime = jni_host_new_array(8, 1);
+        uint32_t sys_addr = jni_host_array_addr(sysTime);
+        g_sys_time_addr = sys_addr;
+        ST32(sys_addr, (uint32_t)(host_now() * 1000.0));
+        ST32(sys_addr + 4, 0);
+        uint32_t upTime = jni_host_new_array(4, 1);
+        uint32_t pixel  = jni_host_new_array(4, TEXTVIEW_WIDTH * TEXTVIEW_HEIGHT);
+        uint32_t gyro   = jni_host_new_array(4, 3);
+        uint32_t activity = guest_heap_alloc(16);  /* opaque jobject */
+
+        g_cpu.r[13] = GUEST_STACK_TOP - 0x1000;
+        ST32(g_cpu.r[13] + 0, pixel);
+        ST32(g_cpu.r[13] + 4, gyro);
+        ST32(g_cpu.r[13] + 8, activity);
+        g_cpu.r[14] = RETURN_SENTINEL;
+        for (int i = 0; i < 13; i++) g_cpu.r[i] = 0;
+        g_cpu.r[0] = g_jnienv_ptr;
+        g_cpu.r[1] = 0;                  /* clazz: the guest ignores it */
+        g_cpu.r[2] = sysTime;
+        g_cpu.r[3] = upTime;
+        g_cpu.cpsr = 0x10;
+        uint64_t ibefore = g_insn_count;
+        double it0 = host_now();
+        run_result ri;
+        ri.what = "nativeInit";
+        ri.entry = init;
+        ri.reason = spike_resume_if_stopped(
+            cpu_run(init, g_cpu.r[13], g_insn_count + g_budget), g_budget);
+        cpu_trace_final();
+        ri.insns = g_insn_count - ibefore;
+        ri.seconds = host_now() - it0;
+        report_run(&ri);
+
+        /* --- fire the UserAgree callback ---------------------------
+         *
+         * nativeInit() bootstraps the game but does not start it. The
+         * state machine is entered by STATE_Set(0) (the Init state), whose
+         * ONLY call site anywhere in the .so is inside UserAgreeCallback(0)
+         * -- and on Android that is reached by the Java-side Com2uS
+         * "ActiveUser"/UserAgree module calling back into
+         * Java_com_com2us_module_activeuser_ActiveUser_jniUserAgreeNotifier.
+         * There is no Java module here, so it is invoked directly.
+         *
+         * Without it the main timer fires steadily and nothing happens:
+         * MainProcess's per-tick check reads STATE_fpProcess, finds it NULL,
+         * and returns -- which is exactly the "boots perfectly, does
+         * nothing" state this port was in. The parent repository documents
+         * the same conclusion (source/patch.c, Corrida 33).
+         *
+         * Deliberately after nativeInit has fully returned, not inside it:
+         * startClet keeps initializing subsystems for several more lines
+         * after registering this callback, and firing inside would run the
+         * first Enter callback before that finishes -- an ordering Android
+         * never produces. */
+        uint32_t uac = find_symbol("UserAgreeCallback");
+        if (uac) {
+            run_result ru = run_entry_arg("UserAgreeCallback(0)", uac, 0, g_budget);
+            report_run(&ru);
+        } else {
+            host_log("UserAgreeCallback symbol not found\n");
+        }
+
+        /* The Vita port's order after nativeInit: two resume calls, then
+         * the render loop. Both resumes take (JNIEnv*, jclass). */
+        uint32_t resume = find_symbol(
+            "Java_com_com2us_wrapper_WrapperRenderer_nativeResume");
+        uint32_t resume_clet = find_symbol(
+            "Java_com_com2us_wrapper_WrapperRenderer_nativeResumeClet");
+        if (resume) {
+            run_result rr2 = run_entry_env("nativeResume", resume, g_budget);
+            report_run(&rr2);
+        }
+        if (resume_clet) {
+            run_result rr3 = run_entry_env("nativeResumeClet", resume_clet, g_budget);
+            report_run(&rr3);
+        }
+    }
+
+    /* The run's clock starts from what nativeInit was handed in sysTime[],
+     * because that is what the guest reads back through CS_knlCurrentTime --
+     * and therefore what SetTimer's absolute firetimes are comparable to.
+     * Starting at zero instead puts every timer ten hours in the future and
+     * nothing ever fires, which looks exactly like the engine idling. */
+    g_clock = (int64_t)LD32(g_sys_time_addr) |
+              ((int64_t)LD32(g_sys_time_addr + 4) << 32);
+
+    g_native_render = find_symbol(
+        "Java_com_com2us_wrapper_WrapperRenderer_nativeRender");
+    if (!g_native_render) {
+        host_log("nativeRender symbol not found\n");
+        return 1;
+    }
+    /* Input is optional: without it the game still boots and renders, it just
+     * cannot be driven. Say so rather than failing the boot. */
+    g_native_event = find_symbol(
+        "Java_com_com2us_wrapper_WrapperRenderer_nativeEvent");
+    if (!g_native_event)
+        host_log("nativeEvent symbol not found -- input will not work\n");
+    return 0;
+}
+
+
+/* ---- input -------------------------------------------------------------
+ *
+ * nativeEvent(JNIEnv *env, jobject clazz, int type, int p1, int p2,
+ *             int touchCount) -- six arguments, so AAPCS puts env/clazz/type/p1
+ * in r0-r3 and p2/touchCount on the guest stack. Same shape nativePreInit
+ * already needs for its fifth argument.
+ *
+ * Called only from spike_tick(), between cpu_run() calls. That is not a style
+ * preference: g_cpu and g_budget are single globals assigned at cpu_run entry,
+ * so a nested cpu_run would corrupt both silently, and the guest is meant to be
+ * entered at a frame boundary with a fresh stack.
+ */
+static void spike_dispatch_event(int type, int p1, int p2, int touch_count)
+{
+    if (!g_native_event)
+        return;
+    g_cpu.r[13] = GUEST_STACK_TOP - 0x1000;
+    ST32(g_cpu.r[13] + 0, (uint32_t)p2);
+    ST32(g_cpu.r[13] + 4, (uint32_t)touch_count);
+    g_cpu.r[14] = RETURN_SENTINEL;
+    for (int i = 0; i < 13; i++)
+        g_cpu.r[i] = 0;
+    g_cpu.r[0] = g_jnienv_ptr;      /* env   */
+    g_cpu.r[1] = 0;                 /* clazz */
+    g_cpu.r[2] = (uint32_t)type;
+    g_cpu.r[3] = (uint32_t)p1;
+    g_cpu.cpsr = 0x10;
+    /* A g_budget of its own: one event must not be able to burn seconds inside a
+     * tick with nothing in the log to say why. */
+    uint64_t before = g_insn_count;
+    int reason = cpu_run(g_native_event, g_cpu.r[13],
+                         g_insn_count + g_budget / 4);
+    cpu_trace_final();
+    /* Logged unconditionally: these are rare -- a few per second, and the drag
+     * gate caps the rest -- and "did my click reach the engine" is the first
+     * question anyone asks of the input path. */
+    host_log("  [event] type=%d slot=%d x=%d y=%d touches=%d  %llu instrs -> %s\n",
+             type, p1 - 1, (p2 >> 16) & 0xffff, p2 & 0xffff, touch_count,
+             (unsigned long long)(g_insn_count - before), cpu_halt_str(reason));
+}
+
+
+/* End of run: the browser surface dump, then the reports. Called from
+ * spike_tick_browser()'s stop path in the browser, and from the tail of main()
+ * on the CLI. */
+static void spike_finish(void)
+{
+#ifdef __EMSCRIPTEN__
+    /* Dump the engine's own screen surface, base64, in chunks.
+     *
+     * A black canvas is ambiguous -- the engine may have drawn
+     * nothing, or drawn correctly into a buffer that never reached
+     * the screen -- and there is no debugger here to tell them
+     * apart. This is the buffer the engine last handed to
+     * glTexSubImage2D for the screen blit, so it is exactly what
+     * the canvas *should* be showing. Chunked because a single
+     * 262 KB console line is truncated. */
+    if (g_browser_dump_screen) {
+        /* Read the *default framebuffer*, not the engine's own
+         * surface: this is what the canvas actually holds, after
+         * gl4es, the shaders and the browser have had their say.
+         * Downsampled 4x -- 960x544 RGBA is 2 MB, and a console
+         * line is not -- which is still enough to recognise a
+         * frame. */
+        extern void host_browser_read_pixels(unsigned char *, int,
+                                             int, int);
+        static unsigned char px[240 * 136 * 4];
+        host_browser_read_pixels(px, SCREEN_W, SCREEN_H, 4);
+        static const char b64[] =
+            "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz"
+            "0123456789+/";
+        char line[4097];
+        uint32_t o = 0;
+        host_log("  [dump] framebuffer %dx%d (4x downsample)\n",
+                 240, 136);
+        for (size_t i = 0; i + 3 < sizeof(px); i += 4) {
+            uint32_t v = ((uint32_t)px[i] << 16) |
+                         ((uint32_t)px[i + 1] << 8) | px[i + 2];
+            line[o++] = b64[(v >> 18) & 63];
+            line[o++] = b64[(v >> 12) & 63];
+            line[o++] = b64[(v >> 6) & 63];
+            line[o++] = b64[v & 63];
+            if (o >= 4096) { line[o] = 0; host_log("[dump] %s\n", line); o = 0; }
+        }
+        if (o) { line[o] = 0; host_log("[dump] %s\n", line); }
+        /* And the two surfaces the engine composes with, RGBA,
+         * 4x downsampled -- the framebuffer alone cannot say
+         * whether a wrong-looking frame is the texture's fault. */
+        {
+            extern uint32_t g_u480_ptr, g_u600_ptr, g_csfb_ptr;
+            if (g_csfb_ptr) {
+                host_log("[dump] csfb 384x256\n");
+                uint32_t o3 = 0;
+                char l3[4097];
+                for (uint32_t y = 0; y < 256; y += 2)
+                    for (uint32_t x = 0; x < 384; x += 2) {
+                        const uint8_t *q = g_mem + g_csfb_ptr +
+                                           (y * 384u + x) * 2u;
+                        uint32_t v = (uint32_t)q[0] |
+                                     ((uint32_t)q[1] << 8);
+                        uint32_t r = (v >> 11) & 0x1f,
+                                 g2 = (v >> 5) & 0x3f,
+                                 b2 = v & 0x1f;
+                        uint32_t rgb =
+                            (((r << 3) | (r >> 2)) << 16) |
+                            (((g2 << 2) | (g2 >> 4)) << 8) |
+                            ((b2 << 3) | (b2 >> 2));
+                        l3[o3++] = b64[(rgb >> 18) & 63];
+                        l3[o3++] = b64[(rgb >> 12) & 63];
+                        l3[o3++] = b64[(rgb >> 6) & 63];
+                        l3[o3++] = b64[rgb & 63];
+                        if (o3 >= 4096) { l3[o3] = 0;
+                            host_log("[dump] %s\n", l3); o3 = 0; }
+                    }
+                if (o3) { l3[o3] = 0; host_log("[dump] %s\n", l3); }
+            }
+            const struct { const char *nm; uint32_t p, w, h; } u[2] = {
+                { "upload480", g_u480_ptr, 480, 320 },
+                { "upload600", g_u600_ptr, 600, 320 },
+            };
+            for (int k = 0; k < 2; k++) {
+                if (!u[k].p) continue;
+                host_log("[dump] %s %ux%u\n", u[k].nm, u[k].w, u[k].h);
+                uint32_t o2 = 0;
+                char l2[4097];
+                for (uint32_t y = 0; y < u[k].h; y += 4)
+                    for (uint32_t x = 0; x < u[k].w; x += 4) {
+                        const uint8_t *q = g_mem + u[k].p +
+                            (y * u[k].w + x) * 4u;
+                        uint32_t v = ((uint32_t)q[0] << 16) |
+                                     ((uint32_t)q[1] << 8) | q[2];
+                        l2[o2++] = b64[(v >> 18) & 63];
+                        l2[o2++] = b64[(v >> 12) & 63];
+                        l2[o2++] = b64[(v >> 6) & 63];
+                        l2[o2++] = b64[v & 63];
+                        if (o2 >= 4096) { l2[o2] = 0;
+                            host_log("[dump] %s\n", l2); o2 = 0; }
+                    }
+                if (o2) { l2[o2] = 0; host_log("[dump] %s\n", l2); }
+            }
+        }
+        host_log("[dump] end\n");
+    }
+#endif
+
+/* ---- report ---- */
+    if (g_do_profile)
+        report_profile(60);
+    timers_report();
+    imports_report(20);
+    jni_report(15);
+    gl_report(70);
+
+    uint32_t at = 0;
+    const char *near = elf_nearest_sym(&g_img, g_cpu.r[15], &at);
+    host_log("\nfinal pc=%08x (%s+0x%x)\n", g_cpu.r[15],
+             near ? near : "?", near ? g_cpu.r[15] - at : 0);
+}
+
+
+/* One frame. Returns 1 to continue, 0 when the run should stop.
+ *
+ * The stop condition is the one main()'s loop had, and it is easy to invert:
+ * HALT_BUDGET is the *stop* signal. A frame that completes normally ends
+ * HALT_BAD_PC with r15 == RETURN_SENTINEL & ~1, which report_run labels
+ * "returned to caller". Note also the ndue > 0 guard -- `reason` still holds
+ * its stale initial value on a tick where no timer fired, and dropping the
+ * guard ends the run on the very first one.
+ */
+static int spike_tick(void)
+{
+    /* Input first, then the timers, so the engine sees this frame's input
+     * during this frame's render. Same order as the Vita port's loop. */
+    input_poll();
+
+    /* ---- the clock ----
+     *
+     * The guest reads this through GetSystemCurrentTime -> LD32(sysTime), which
+     * takes only the low 32 bits, so it has to stay under 2^31 ms and it has to
+     * be the same clock the timers are compared against. Nothing else may use
+     * it: the input drag gate uses host_now(), not this.
+     */
+    double dt = 16.0;
+    if (!g_use_fixed_step) {
+        double now = host_now() * 1000.0;
+        double real = now - g_last_now_ms;
+        g_last_now_ms = now;
+        /* A tick takes hundreds of milliseconds here, and a backgrounded tab
+         * takes much longer. Clamp so one stall cannot jump the game clock by
+         * an unbounded amount. */
+        if (real > 0.0)
+            dt = real > 250.0 ? 250.0 : real;
+    }
+    g_clock += (int64_t)dt;
+    ST32(g_sys_time_addr, (uint32_t)g_clock);
+    ST32(g_sys_time_addr + 4, (uint32_t)(g_clock >> 32));
+
+    uint32_t due[TIMER_MAX];
+    int ndue = timers_due(g_clock, due, TIMER_MAX);
+
+    uint64_t d0 = g_gl_draw_calls;
+    uint64_t x0 = 0;
+    for (int i = 0; i < g_nimports; i++)
+        x0 += g_imports[i].calls;
+
+    uint64_t frame_insns = 0;
+    double frame_secs = 0.0;
+    int reason = HALT_BUDGET;
+    for (int d = 0; d < ndue; d++) {
+        run_result rf = run_native_render(g_native_render, due[d], g_budget);
+        cpu_trace_final();
+        frame_insns += rf.insns;
+        frame_secs += rf.seconds;
+        reason = rf.reason;
+        if (rf.reason == HALT_BUDGET)
+            break;
+    }
+
+    uint64_t d1 = g_gl_draw_calls;
+    uint64_t x1 = 0;
+    for (int i = 0; i < g_nimports; i++)
+        x1 += g_imports[i].calls;
+
+    if (reason == HALT_BAD_PC)
+        host_log("  frame %3d : pc ran to %08x\n", g_frames_done, g_cpu.r[15]);
+    host_log("  frame %3d : %9llu instrs  %7.2f ms  %6.2f MIPS"
+             "  timers=%d draw=%llu host_calls=%llu  -> %s\n",
+             g_frames_done, (unsigned long long)frame_insns,
+             frame_secs * 1000.0,
+             frame_secs > 0 ? (double)frame_insns / frame_secs / 1e6 : 0.0,
+             ndue,
+             (unsigned long long)(d1 - d0),
+             (unsigned long long)(x1 - x0),
+             reason == HALT_BUDGET ? "budget exhausted" : cpu_halt_str(reason));
+    g_total_insns += frame_insns;
+    g_frames_done++;
+
+    if (ndue > 0) {
+        if (reason != HALT_BUDGET)
+            g_ok_frames++;
+        else
+            return 0;
+    }
+    return 1;
+}
+
+/* The browser's entry: adds the frame cap, and finishes the run -- report and
+ * dump -- from inside the same rAF callback as the last render, because
+ * glReadPixels on the default framebuffer from outside one reads an undefined
+ * buffer. */
+static int spike_tick_browser(void)
+{
+    if (g_frames_max > 0 && g_frames_done >= g_frames_max) {
+        spike_finish();
+        return 0;
+    }
+    if (!spike_tick()) {
+        spike_finish();
+        return 0;
+    }
+    return 1;
+}
+
 int main(int argc, char **argv)
 {
     const char *path = NULL;
@@ -411,6 +987,18 @@ int main(int argc, char **argv)
     int timer_id = 0;
     uint64_t budget = 200u * 1000u * 1000u;
     int do_init_array = 0, do_jni = 0, do_profile = 1, trace = 0, do_boot = 0;
+    (void)timer_id;   /* parsed but never used: the ids come from timers_due() */
+
+#ifdef __EMSCRIPTEN__
+    /* First thing: these are the page's options and the block below consumes
+     * them. Reading them further down (where the GL setup lives) left
+     * ?frames= doing nothing at all, because `frames` had already been
+     * computed from a g_browser_frames that was still zero. */
+    host_browser_read_frames();
+    host_browser_read_dump();
+    host_browser_read_gl_trace();
+    host_browser_read_fixed();
+#endif
     (void)0;
 
 #if defined(WASM_FREESTANDING) || defined(__EMSCRIPTEN__)
@@ -419,8 +1007,8 @@ int main(int argc, char **argv)
      * preloaded into it -- so only the option parsing is skipped. */
 #else
     for (int i = 1; i < argc; i++) {
-        if (strncmp(argv[i], "--budget=", 9) == 0)
-            budget = (uint64_t)strtoull(argv[i] + 9, NULL, 10);
+        if (strncmp(argv[i], "--g_budget=", 9) == 0)
+            g_budget = (uint64_t)strtoull(argv[i] + 9, NULL, 10);
         else if (strcmp(argv[i], "--init-array") == 0)
             do_init_array = 1;
         else if (strcmp(argv[i], "--jni") == 0)
@@ -468,18 +1056,16 @@ int main(int argc, char **argv)
 #if defined(WASM_FREESTANDING) || defined(__EMSCRIPTEN__)
     (void)argc; (void)argv;
     do_boot = 1;
-    /* Enough for the state machine to get somewhere. It is timer-driven at
-     * ~66 ms, so 30 frames is under a second of game time -- barely past the
-     * first tick. The browser build reads the real frame count from a global
-     * the page can set, so a screenshot run can ask for more without a
-     * rebuild. */
-    if (frames < 2)
-        frames = 600;
+    /* 0 means "no cap". This used to default to 600, which was "under a second
+     * of game time" when a tick was a fixed 16 ms -- but the browser now runs
+     * on real elapsed time at a few ticks per second, so 600 is minutes. The
+     * interactive page wants to run until it is closed; a headless run passes
+     * ?frames=N and gets the cap it needs. */
+    frames = 0;
 #ifdef __EMSCRIPTEN__
     {
         extern int g_browser_frames;
-        if (g_browser_frames > 0)
-            frames = g_browser_frames;
+        frames = g_browser_frames;   /* 0 unless the page asked for a cap */
     }
 #endif
 #ifdef __EMSCRIPTEN__
@@ -490,88 +1076,30 @@ int main(int argc, char **argv)
 #endif
 #if !defined(WASM_FREESTANDING)
     if (!path) {
-        host_log("usage: spike <libgame.so> [--all] [--budget=N] [--no-profile]\n");
+        host_log("usage: spike <libgame.so> [--all] [--g_budget=N] [--no-profile]\n");
         return 2;
     }
 #endif
 
-    g_mem = (uint8_t *)host_alloc(GUEST_MEM_SIZE);
-    host_log("guest address space: %u MB at %p\n", GUEST_MEM_SIZE >> 20, (void *)g_mem);
 
-    /* Must come after g_mem is known and before the first guest instruction:
-     * an unchecked guest access faults as a host SIGSEGV, and the handler's
-     * whole job is to translate that back into a guest address. */
-    host_install_crash_handler();
-
-    /* ---- read the .so ---- */
-    const uint8_t *buf;
-    size_t len;
-#ifdef WASM_FREESTANDING
-    buf = g_wasm_so;
-    len = g_wasm_so_len;
-    if (!buf || !len) {
-        host_log("no image supplied: call spike_set_so() first\n");
-        return 2;
-    }
-    host_log("loaded libgame.so (%u bytes, supplied by the driver)\n",
-             (unsigned)len);
-#else
-    FILE *f = fopen(path, "rb");
-    if (!f) {
-        host_log("cannot open %s\n", path);
-        return 2;
-    }
-    fseek(f, 0, SEEK_END);
-    long flen = ftell(f);
-    fseek(f, 0, SEEK_SET);
-    uint8_t *fread_buf = (uint8_t *)host_alloc((size_t)flen);
-    if (fread(fread_buf, 1, (size_t)flen, f) != (size_t)flen) {
-        host_log("short read on %s\n", path);
-        fclose(f);
-        return 2;
-    }
-    fclose(f);
-    buf = fread_buf;
-    len = (size_t)flen;
-    host_log("loaded %s (%ld bytes)\n", path, flen);
-#endif
-
-    /* ---- map and relocate it ---- */
-    if (elf_load(buf, len, &g_img) != 0)
-        return 1;
-    /* Deliberate modifications to the guest binary, before anything runs.
-     * Without these the engine boots and then idles: see patches.c. */
-    patches_apply(&g_img);
-
-    /* Must follow elf_load: it registers the JNI table entries as imports and
-     * re-stamps the stub page. */
-    jni_guest_init();
-
-    /* After jni_guest_init: this writes the JavaVM's guest address into every
-     * .bss slot that a missing subsystem init would have filled. */
-    patches_fill_vm_caches(&g_img);
-
-    gl_state_init();
-
+    g_budget = budget;
+    g_do_profile = do_profile;
+    g_trace_on = trace;
+    g_frames_max = frames > 0 ? frames : 0;
 #ifdef __EMSCRIPTEN__
-    /* The browser build has a real renderer. The context has to exist before
-     * gl4es initialises -- with NOEGL nothing else can tell it the surface
-     * size -- and gl4es has to be up before any guest GL call arrives. */
-    host_browser_set_size(SCREEN_W, SCREEN_H);
-    host_browser_read_frames();
-    host_browser_read_dump();
-    host_browser_read_gl_trace();
-    host_browser_gl_setup();
-    gl4es_bridge_init(SCREEN_W, SCREEN_H);
-    /* Per-call GL tracing is off unless the page asks for it: it is the first
-     * thing to reach for when a draw misbehaves, and 600 lines of noise in
-     * every ordinary run otherwise. */
-    { extern int g_gl_trace; g_gl_trace = g_browser_gl_trace; }
+    /* Real elapsed time by default in the browser, so the game runs at the
+     * right speed despite the interpreter's few ticks per second. ?fixed=1
+     * restores the deterministic 16 ms step for headless runs.
+     *
+     * The CLI keeps the fixed step unconditionally: the differential oracle and
+     * every recorded run depend on it. */
+    { extern int g_browser_fixed; g_use_fixed_step = !g_browser_fixed; }
 #endif
 
-    cpu_init(&g_img);
-    cpu_set_profile(do_profile);
-    cpu_enable_trace(trace);
+    int rc = spike_load(path);
+    if (rc)
+        return rc;
+
 
     if (g_stop_at) {
         /* A snapshot describes the engine's state at a chosen point, so both
@@ -588,360 +1116,44 @@ int main(int argc, char **argv)
         g_trace_insn_on = 1;
     }
 
+
     /* ---- run it ---- */
     host_log("\n");
     if (do_boot) {
-        /* src/utils/init.c in the Vita port, in order: static constructors,
-         * then JNI_OnLoad, then nativePreInit. Getting these three to run in
-         * sequence is what puts the guest on the path to its first frame. */
-        host_log("=== boot sequence ===\n");
-        for (uint32_t i = 0; i < g_img.init_array_n; i++) {
-            uint32_t raw = LD32(g_img.init_array + i * 4);
-            /* The image's .init_array has a trailing NULL entry (ARRAYSZ
-             * counts it). Executing it would be exactly the "branch through a
-             * NULL function pointer" case the return sentinel exists to
-             * distinguish, so skip rather than run. */
-            if (!raw) {
-                host_log("ctor[%u]                : (null entry, skipped)\n", i);
-                continue;
-            }
-            uint32_t fn = raw | 1u;
-            char label[32];
-            label[0]='c'; label[1]='t'; label[2]='o'; label[3]='r';
-            label[4]='['; label[5]=(char)('0'+(i%10)); label[6]=']'; label[7]=0;
-            run_result rr = run_entry_arg(label, fn, 0, budget);
-            report_run(&rr);
-            if (rr.reason == HALT_TRAP)
+        if (spike_boot() != 0)
+            return 1;
+        input_init(spike_dispatch_event);
+#ifdef __EMSCRIPTEN__
+        /* The browser drives the engine one tick per requestAnimationFrame.
+         * Input goes in first so the very first tick can already see events.
+         *
+         * Nothing may follow host_browser_main_loop(): it does not return, and
+         * main() returning is what lets the rAF chain own the page. */
+        host_browser_input_init();
+        host_browser_main_loop(spike_tick_browser);
+        return 0;
+#else
+        host_log("\n=== %d frame(s), timer-driven ===\n", frames);
+        if (!timers_active())
+            host_log("  no timer registered -- the engine schedules its own\n"
+                     "  work, so there is nothing to run yet\n");
+        host_log("  clock at frame loop start: %lld (sysTime array at %08x)\n",
+                 (long long)g_clock, g_sys_time_addr);
+        for (int f = 0; f < frames; f++) {
+            if (!spike_tick())
                 break;
         }
-
-        uint32_t jni_entry = find_symbol("JNI_OnLoad");
-        run_result rj = run_entry_arg("JNI_OnLoad", jni_entry, g_javavm_ptr, budget);
-        report_run(&rj);
-        host_log("    JNI_OnLoad returned %d (JNI_VERSION_1_6 is %d)\n",
-                 (int)g_cpu.r[0], JNI_VERSION_1_6);
-
-        uint32_t pre = find_symbol(
-            "Java_com_com2us_wrapper_WrapperRenderer_nativePreInit");
-        if (!pre) {
-            host_log("nativePreInit symbol not found\n");
-        } else {
-            /* nativePreInit(JNIEnv *env, jclass clazz, jintArray parameter,
-             *               jint screenW, jint screenH) -- five arguments, so
-             *               the last one is on the guest stack, which
-             *               run_entry_arg cannot express. Set the register file
-             *               directly and push the fifth word. */
-            uint32_t array = jni_host_new_int_array(3);
-            g_cpu.r[13] = GUEST_STACK_TOP - 0x1000;
-            ST32(g_cpu.r[13], 544);          /* screenH, the fifth argument */
-            /* LR must be the same sentinel run_entry_arg uses. This was 1,
-             * which lands the return at PC 0 -- indistinguishable from a
-             * branch through a null function pointer, and reported as "PC left
-             * the loaded image" even when the function's epilogue ran
-             * correctly. Same class of mistake as the sentinel having been 0. */
-            g_cpu.r[14] = RETURN_SENTINEL;
-            for (int i = 0; i < 13; i++) g_cpu.r[i] = 0;
-            g_cpu.r[0] = g_jnienv_ptr;
-            g_cpu.r[1] = 0;                  /* clazz: the guest ignores it */
-            g_cpu.r[2] = array;
-            g_cpu.r[3] = 960;
-            g_cpu.cpsr = 0x10;
-            uint64_t before = g_insn_count;
-            double t0 = host_now();
-            run_result rp;
-            rp.what = "nativePreInit";
-            rp.entry = pre;
-            rp.reason = spike_resume_if_stopped(
-                cpu_run(pre, g_cpu.r[13], g_insn_count + budget), budget);
-            cpu_trace_final();
-            rp.insns = g_insn_count - before;
-            rp.seconds = host_now() - t0;
-            report_run(&rp);
-            /* getEnv() and JNI_OnLoad() share this globals block: JNI_OnLoad
-             * stores the JavaVM* at +0 and getEnv() reads it back before
-             * calling vm->GetEnv, which writes the JNIEnv* at +4. Printing it
-             * says directly whether the two agree. */
-            host_log("    module globals at 0115a36c: vm=%08x env=%08x\n",
-                     LD32(0x0115a36c), LD32(0x0115a370));
-        }
-
-        uint32_t init = find_symbol(
-            "Java_com_com2us_wrapper_WrapperRenderer_nativeInit");
-        if (!init) {
-            host_log("nativeInit symbol not found\n");
-        } else {
-            /* nativeInit(JNIEnv *env, jobject clazz, jlongArray sysTime,
-             *            jintArray upTime, jintArray pixel, jfloatArray gyro,
-             *            jobject activity) -- seven arguments, so the last
-             *            three go on the guest stack in order.
-             *
-             * The arrays are handles the guest itself calls Get*ArrayElements
-             * on; the Java side that would have allocated and filled them is
-             * mirrored here. sysTime is wall-clock ms on Android; host_now() is
-             * monotonic, so this is "some plausible non-zero ms" rather than a
-             * real epoch -- enough to tell whether the engine reads it once or
-             * every frame. */
-            uint32_t sysTime = jni_host_new_array(8, 1);
-            uint32_t sys_addr = jni_host_array_addr(sysTime);
-            g_sys_time_addr = sys_addr;
-            ST32(sys_addr, (uint32_t)(host_now() * 1000.0));
-            ST32(sys_addr + 4, 0);
-            uint32_t upTime = jni_host_new_array(4, 1);
-            uint32_t pixel  = jni_host_new_array(4, TEXTVIEW_WIDTH * TEXTVIEW_HEIGHT);
-            uint32_t gyro   = jni_host_new_array(4, 3);
-            uint32_t activity = guest_heap_alloc(16);  /* opaque jobject */
-
-            g_cpu.r[13] = GUEST_STACK_TOP - 0x1000;
-            ST32(g_cpu.r[13] + 0, pixel);
-            ST32(g_cpu.r[13] + 4, gyro);
-            ST32(g_cpu.r[13] + 8, activity);
-            g_cpu.r[14] = RETURN_SENTINEL;
-            for (int i = 0; i < 13; i++) g_cpu.r[i] = 0;
-            g_cpu.r[0] = g_jnienv_ptr;
-            g_cpu.r[1] = 0;                  /* clazz: the guest ignores it */
-            g_cpu.r[2] = sysTime;
-            g_cpu.r[3] = upTime;
-            g_cpu.cpsr = 0x10;
-            uint64_t ibefore = g_insn_count;
-            double it0 = host_now();
-            run_result ri;
-            ri.what = "nativeInit";
-            ri.entry = init;
-            ri.reason = spike_resume_if_stopped(
-                cpu_run(init, g_cpu.r[13], g_insn_count + budget), budget);
-            cpu_trace_final();
-            ri.insns = g_insn_count - ibefore;
-            ri.seconds = host_now() - it0;
-            report_run(&ri);
-
-            /* --- fire the UserAgree callback ---------------------------
-             *
-             * nativeInit() bootstraps the game but does not start it. The
-             * state machine is entered by STATE_Set(0) (the Init state), whose
-             * ONLY call site anywhere in the .so is inside UserAgreeCallback(0)
-             * -- and on Android that is reached by the Java-side Com2uS
-             * "ActiveUser"/UserAgree module calling back into
-             * Java_com_com2us_module_activeuser_ActiveUser_jniUserAgreeNotifier.
-             * There is no Java module here, so it is invoked directly.
-             *
-             * Without it the main timer fires steadily and nothing happens:
-             * MainProcess's per-tick check reads STATE_fpProcess, finds it NULL,
-             * and returns -- which is exactly the "boots perfectly, does
-             * nothing" state this port was in. The parent repository documents
-             * the same conclusion (source/patch.c, Corrida 33).
-             *
-             * Deliberately after nativeInit has fully returned, not inside it:
-             * startClet keeps initializing subsystems for several more lines
-             * after registering this callback, and firing inside would run the
-             * first Enter callback before that finishes -- an ordering Android
-             * never produces. */
-            uint32_t uac = find_symbol("UserAgreeCallback");
-            if (uac) {
-                run_result ru = run_entry_arg("UserAgreeCallback(0)", uac, 0, budget);
-                report_run(&ru);
-            } else {
-                host_log("UserAgreeCallback symbol not found\n");
-            }
-
-            /* The Vita port's order after nativeInit: two resume calls, then
-             * the render loop. Both resumes take (JNIEnv*, jclass). */
-            uint32_t resume = find_symbol(
-                "Java_com_com2us_wrapper_WrapperRenderer_nativeResume");
-            uint32_t resume_clet = find_symbol(
-                "Java_com_com2us_wrapper_WrapperRenderer_nativeResumeClet");
-            if (resume) {
-                run_result rr2 = run_entry_env("nativeResume", resume, budget);
-                report_run(&rr2);
-            }
-            if (resume_clet) {
-                run_result rr3 = run_entry_env("nativeResumeClet", resume_clet, budget);
-                report_run(&rr3);
-            }
-
-            /* ---- the measurement ---- */
-            uint32_t render = find_symbol(
-                "Java_com_com2us_wrapper_WrapperRenderer_nativeRender");
-            if (!render) {
-                host_log("nativeRender symbol not found\n");
-            } else {
-                host_log("\n=== %d frame(s), timer-driven ===\n", frames);
-                if (!timers_active())
-                    host_log("  no timer registered -- the engine schedules its own\n"
-                             "  work, so there is nothing to run yet\n");
-
-                uint64_t total = 0;
-                int ok = 0;
-                int64_t clock = (int64_t)LD32(g_sys_time_addr) |
-                                ((int64_t)LD32(g_sys_time_addr + 4) << 32);
-                host_log("  clock at frame loop start: %lld (sysTime array at "
-                         "%08x)\n", (long long)clock, g_sys_time_addr);
-                for (int f = 0; f < frames; f++) {
-                    /* Advance the guest's clock by one 16 ms tick and write it
-                     * back, so firetimes are compared against the same clock
-                     * the guest will read. */
-                    clock += 16;
-                    ST32(g_sys_time_addr, (uint32_t)clock);
-                    ST32(g_sys_time_addr + 4, (uint32_t)(clock >> 32));
-
-                    uint32_t due[TIMER_MAX];
-                    int ndue = timers_due(clock, due, TIMER_MAX);
-
-                    uint64_t d0 = g_gl_draw_calls;
-                    uint64_t x0 = 0;
-                    for (int i = 0; i < g_nimports; i++)
-                        x0 += g_imports[i].calls;
-
-                    uint64_t frame_insns = 0;
-                    double frame_secs = 0.0;
-                    int reason = HALT_BUDGET;
-                    for (int d = 0; d < ndue; d++) {
-                        run_result rf = run_native_render(render, due[d], budget);
-                        cpu_trace_final();
-                        frame_insns += rf.insns;
-                        frame_secs += rf.seconds;
-                        reason = rf.reason;
-                        if (rf.reason == HALT_BUDGET)
-                            break;
-                    }
-
-                    uint64_t d1 = g_gl_draw_calls;
-                    uint64_t x1 = 0;
-                    for (int i = 0; i < g_nimports; i++)
-                        x1 += g_imports[i].calls;
-
-                    if (reason == HALT_BAD_PC)
-                        host_log("  frame %3d : pc ran to %08x\n", f, g_cpu.r[15]);
-                    host_log("  frame %3d : %9llu instrs  %7.2f ms  %6.2f MIPS"
-                             "  timers=%d draw=%llu host_calls=%llu  -> %s\n",
-                             f, (unsigned long long)frame_insns,
-                             frame_secs * 1000.0,
-                             frame_secs > 0 ? (double)frame_insns / frame_secs / 1e6 : 0.0,
-                             ndue,
-                             (unsigned long long)(d1 - d0),
-                             (unsigned long long)(x1 - x0),
-                             reason == HALT_BUDGET ? "budget exhausted"
-                                                   : cpu_halt_str(reason));
-                    total += frame_insns;
-                    /* A frame with no timer due runs nothing -- that is a
-                     * normal tick of the clock, not the end of the run. Only a
-                     * frame that actually executed and exhausted its budget
-                     * stops things. Getting this wrong ends the loop on the
-                     * very first tick, because `reason` still holds its
-                     * initial value when nothing ran to change it. */
-                    if (ndue > 0) {
-                        if (reason != HALT_BUDGET)
-                            ok++;
-                        else
-                            break;
-                    }
-                }
-                if (ok)
-                    host_log("  average over %d frame(s): %llu instructions\n",
-                             ok, (unsigned long long)(total / (uint64_t)ok));
-#ifdef __EMSCRIPTEN__
-                /* Dump the engine's own screen surface, base64, in chunks.
-                 *
-                 * A black canvas is ambiguous -- the engine may have drawn
-                 * nothing, or drawn correctly into a buffer that never reached
-                 * the screen -- and there is no debugger here to tell them
-                 * apart. This is the buffer the engine last handed to
-                 * glTexSubImage2D for the screen blit, so it is exactly what
-                 * the canvas *should* be showing. Chunked because a single
-                 * 262 KB console line is truncated. */
-                if (g_browser_dump_screen) {
-                    /* Read the *default framebuffer*, not the engine's own
-                     * surface: this is what the canvas actually holds, after
-                     * gl4es, the shaders and the browser have had their say.
-                     * Downsampled 4x -- 960x544 RGBA is 2 MB, and a console
-                     * line is not -- which is still enough to recognise a
-                     * frame. */
-                    extern void host_browser_read_pixels(unsigned char *, int,
-                                                         int, int);
-                    static unsigned char px[240 * 136 * 4];
-                    host_browser_read_pixels(px, SCREEN_W, SCREEN_H, 4);
-                    static const char b64[] =
-                        "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz"
-                        "0123456789+/";
-                    char line[4097];
-                    uint32_t o = 0;
-                    host_log("  [dump] framebuffer %dx%d (4x downsample)\n",
-                             240, 136);
-                    for (size_t i = 0; i + 3 < sizeof(px); i += 4) {
-                        uint32_t v = ((uint32_t)px[i] << 16) |
-                                     ((uint32_t)px[i + 1] << 8) | px[i + 2];
-                        line[o++] = b64[(v >> 18) & 63];
-                        line[o++] = b64[(v >> 12) & 63];
-                        line[o++] = b64[(v >> 6) & 63];
-                        line[o++] = b64[v & 63];
-                        if (o >= 4096) { line[o] = 0; host_log("[dump] %s\n", line); o = 0; }
-                    }
-                    if (o) { line[o] = 0; host_log("[dump] %s\n", line); }
-                    /* And the two surfaces the engine composes with, RGBA,
-                     * 4x downsampled -- the framebuffer alone cannot say
-                     * whether a wrong-looking frame is the texture's fault. */
-                    {
-                        extern uint32_t g_u480_ptr, g_u600_ptr, g_csfb_ptr;
-                        if (g_csfb_ptr) {
-                            host_log("[dump] csfb 384x256\n");
-                            uint32_t o3 = 0;
-                            char l3[4097];
-                            for (uint32_t y = 0; y < 256; y += 2)
-                                for (uint32_t x = 0; x < 384; x += 2) {
-                                    const uint8_t *q = g_mem + g_csfb_ptr +
-                                                       (y * 384u + x) * 2u;
-                                    uint32_t v = (uint32_t)q[0] |
-                                                 ((uint32_t)q[1] << 8);
-                                    uint32_t r = (v >> 11) & 0x1f,
-                                             g2 = (v >> 5) & 0x3f,
-                                             b2 = v & 0x1f;
-                                    uint32_t rgb =
-                                        (((r << 3) | (r >> 2)) << 16) |
-                                        (((g2 << 2) | (g2 >> 4)) << 8) |
-                                        ((b2 << 3) | (b2 >> 2));
-                                    l3[o3++] = b64[(rgb >> 18) & 63];
-                                    l3[o3++] = b64[(rgb >> 12) & 63];
-                                    l3[o3++] = b64[(rgb >> 6) & 63];
-                                    l3[o3++] = b64[rgb & 63];
-                                    if (o3 >= 4096) { l3[o3] = 0;
-                                        host_log("[dump] %s\n", l3); o3 = 0; }
-                                }
-                            if (o3) { l3[o3] = 0; host_log("[dump] %s\n", l3); }
-                        }
-                        const struct { const char *nm; uint32_t p, w, h; } u[2] = {
-                            { "upload480", g_u480_ptr, 480, 320 },
-                            { "upload600", g_u600_ptr, 600, 320 },
-                        };
-                        for (int k = 0; k < 2; k++) {
-                            if (!u[k].p) continue;
-                            host_log("[dump] %s %ux%u\n", u[k].nm, u[k].w, u[k].h);
-                            uint32_t o2 = 0;
-                            char l2[4097];
-                            for (uint32_t y = 0; y < u[k].h; y += 4)
-                                for (uint32_t x = 0; x < u[k].w; x += 4) {
-                                    const uint8_t *q = g_mem + u[k].p +
-                                        (y * u[k].w + x) * 4u;
-                                    uint32_t v = ((uint32_t)q[0] << 16) |
-                                                 ((uint32_t)q[1] << 8) | q[2];
-                                    l2[o2++] = b64[(v >> 18) & 63];
-                                    l2[o2++] = b64[(v >> 12) & 63];
-                                    l2[o2++] = b64[(v >> 6) & 63];
-                                    l2[o2++] = b64[v & 63];
-                                    if (o2 >= 4096) { l2[o2] = 0;
-                                        host_log("[dump] %s\n", l2); o2 = 0; }
-                                }
-                            if (o2) { l2[o2] = 0; host_log("[dump] %s\n", l2); }
-                        }
-                    }
-                    host_log("[dump] end\n");
-                }
+        if (g_ok_frames)
+            host_log("  average over %d frame(s): %llu instructions\n",
+                     g_ok_frames,
+                     (unsigned long long)(g_total_insns / (uint64_t)g_ok_frames));
 #endif
-            }
-        }
+
     } else if (only_entry) {
         /* One entry point only, so a differential run covers a single guest
          * function from entry to return rather than concatenating five of them
          * into one trace file. */
-        run_result rr = run_entry_arg("entry", only_entry, 0, budget);
+        run_result rr = run_entry_arg("entry", only_entry, 0, g_budget);
         report_run(&rr);
     } else if (do_init_array) {
         if (!g_img.init_array) {
@@ -963,7 +1175,7 @@ int main(int argc, char **argv)
                 label[0] = 'c'; label[1] = 't'; label[2] = 'o'; label[3] = 'r';
                 label[4] = '['; label[5] = (char)('0' + (i % 10)); label[6] = ']';
                 label[7] = 0;
-                run_result rr = run_entry_arg(label, fn, 0, budget);
+                run_result rr = run_entry_arg(label, fn, 0, g_budget);
                 report_run(&rr);
                 if (rr.reason == HALT_TRAP)
                     break;
@@ -978,7 +1190,7 @@ int main(int argc, char **argv)
          * null VM is still informative: it shows how far the module gets
          * before it first needs the JNI layer. */
         uint32_t jni = find_symbol("JNI_OnLoad");
-        run_result rr = run_entry_arg("JNI_OnLoad", jni, g_javavm_ptr, budget);
+        run_result rr = run_entry_arg("JNI_OnLoad", jni, g_javavm_ptr, g_budget);
         report_run(&rr);
     }
 
@@ -990,18 +1202,7 @@ int main(int argc, char **argv)
     if (dump_path)
         dump_guest(dump_path);   /* after the run, so it shows the end state */
 
-    /* ---- report ---- */
-    if (do_profile)
-        report_profile(60);
-    timers_report();
-    imports_report(20);
-    jni_report(15);
-    gl_report(70);
-
-    uint32_t at = 0;
-    const char *near = elf_nearest_sym(&g_img, g_cpu.r[15], &at);
-    host_log("\nfinal pc=%08x (%s+0x%x)\n", g_cpu.r[15],
-             near ? near : "?", near ? g_cpu.r[15] - at : 0);
+    spike_finish();
     return 0;
 }
 

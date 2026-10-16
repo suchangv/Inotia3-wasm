@@ -169,13 +169,17 @@ static uint32_t heap_alloc(uint32_t want)
 static void heap_bad_free(uint32_t ptr, const char *why)
 {
     static int warned;
-    if (warned++ < 20)
-        host_log("  [heap] free(%08x): %s (from %s, caller %08x)\n", ptr, why,
-                 g_current_import, g_cpu.r[14]);
-        if (warned <= 2) {
-            recent_dump();
-            guest_backtrace(why);
-        }
+    if (warned >= 20)
+        return;
+    warned++;
+    host_log("  [heap] free(%08x): %s (from %s, caller %08x)\n", ptr, why,
+             g_current_import, g_cpu.r[14]);
+    /* The first couple also get the history: the question a rejected pointer
+     * raises is where it came from, and that is a few host calls back. */
+    if (warned <= 2) {
+        recent_dump();
+        guest_backtrace(why);
+    }
 }
 
 static void heap_free(uint32_t ptr)

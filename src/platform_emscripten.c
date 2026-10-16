@@ -14,6 +14,7 @@
 #include "guest.h"
 #include "compat.h"
 #include "platform.h"
+#include "input.h"
 
 #include <stdio.h>
 #include <stdlib.h>
@@ -165,6 +166,14 @@ void host_browser_read_pixels(unsigned char *out, int w, int h, int step)
         }
     }
 }
+int g_browser_fixed;
+EM_JS(void, spike_read_fixed_js, (void), {
+    if (typeof Module !== 'undefined' && Module.spikeFixed)
+        _spike_set_fixed(1);
+});
+void spike_set_fixed(int n) { g_browser_fixed = n; }
+void host_browser_read_fixed(void) { spike_read_fixed_js(); }
+
 EM_JS(void, spike_read_dump_js, (void), {
     if (typeof Module !== 'undefined' && Module.spikeDumpScreen)
         _spike_set_dump_screen(1);
@@ -229,6 +238,142 @@ int host_browser_gl_setup(void)
     host_log("gl: WebGL context ready, canvas %dx%d\n", g_fb_w, g_fb_h);
     return 1;
 }
+
+
+/* ---- the main loop -------------------------------------------------------
+ *
+ * The engine runs one tick per requestAnimationFrame rather than in a
+ * synchronous for-loop, so the page stays responsive and the canvas updates
+ * continuously.
+ *
+ * emscripten_set_main_loop_arg takes void(*)(void*), so the tick needs a thunk
+ * -- casting an int(*)(void) to it would happen to work at runtime and be
+ * undefined behaviour.
+ *
+ * simulate_infinite_loop = 0, which means main() returns normally and the rAF
+ * chain outlives it. That is safe here and was checked rather than assumed: the
+ * generated glue has noExitRuntime=true (from -sEXIT_RUNTIME=0), so
+ * keepRuntimeAlive() is a constant true and _proc_exit never sets ABORT. The
+ * throwing variant exists to unwind a stack that would otherwise exit, which is
+ * not the situation.
+ */
+static int (*g_tick)(void);
+
+static void spike_tick_thunk(void *arg)
+{
+    (void)arg;
+    if (!g_tick())
+        emscripten_cancel_main_loop();
+}
+
+void host_browser_main_loop(int (*tick)(void))
+{
+    g_tick = tick;
+    emscripten_set_main_loop_arg(spike_tick_thunk, NULL, 0, 0);
+}
+
+/* ---- pointer input -------------------------------------------------------
+ *
+ * Listeners are installed from JS rather than through
+ * emscripten_set_touch*_callback / emscripten_set_mouse*_callback, for three
+ * concrete reasons:
+ *
+ *   - emscripten's touch struct is the union of e.touches and e.changedTouches,
+ *     so a touch that has *ended* is still in it, and isChanged/onTarget do not
+ *     cleanly separate ended from moved. Driving off the event type is simpler
+ *     and correct.
+ *   - a touch callback registered on the document gets Chrome's default
+ *     *passive* listener, where preventDefault() is ignored and the page
+ *     scrolls instead of dragging.
+ *   - returning false from a touch callback lets Chrome synthesise
+ *     compatibility mouse events after every tap, so the same finger would
+ *     arrive twice, on two different slots. Pointer events have no such
+ *     duplication.
+ *
+ * One path covers mouse, touch and pen, which is all the engine needs -- it
+ * only ever sees five anonymous slots.
+ *
+ * Coordinates: pointer positions are CSS pixels relative to the canvas, and the
+ * canvas backing store is 960x544, so they are scaled by
+ * canvas.width / rect.width. That ratio already accounts for devicePixelRatio;
+ * multiplying by it as well would double-apply it. It is computed per event
+ * rather than cached because the shell's Fullscreen button CSS-resizes the
+ * canvas.
+ *
+ * move/up are registered on the document, not the canvas: a drag that leaves
+ * the canvas would otherwise never deliver its release and the engine would
+ * keep a finger held down forever. blur/visibilitychange release everything,
+ * for the case where the pointer stops existing rather than lifting.
+ */
+int g_browser_fixed;
+
+EM_JS(void, spike_input_install_js, (void), {
+    var canvas = document.getElementById('canvas');
+    if (!canvas) { console.error('[input] no #canvas'); return; }
+    /* Without this the browser claims touch gestures for scrolling/zooming and
+     * the drags never reach us. */
+    canvas.style.touchAction = 'none';
+
+    function toEngine(e) {
+        var r = canvas.getBoundingClientRect();
+        if (!r.width || !r.height) return null;
+        var x = (e.clientX - r.left) * (canvas.width  / r.width);
+        var y = (e.clientY - r.top)  * (canvas.height / r.height);
+        if (x < 0) x = 0; else if (x > 960) x = 960;
+        if (y < 0) y = 0; else if (y > 544) y = 544;
+        return [x | 0, y | 0];
+    }
+
+    function send(kind, e) {
+        var p = toEngine(e);
+        if (!p) return;
+        var t = e.timeStamp || performance.now();
+        if (kind === 0)      _spike_input_down(e.pointerId, p[0], p[1], t);
+        else if (kind === 1) _spike_input_move(e.pointerId, p[0], p[1], t);
+        else                 _spike_input_up(e.pointerId, p[0], p[1], t);
+    }
+
+    canvas.addEventListener('pointerdown', function (e) {
+        if (e.button !== 0 && e.pointerType === 'mouse') return;
+        e.preventDefault();
+        if (canvas.setPointerCapture) canvas.setPointerCapture(e.pointerId);
+        send(0, e);
+    }, { passive: false });
+
+    document.addEventListener('pointermove', function (e) {
+        e.preventDefault();
+        send(1, e);
+    }, { passive: false });
+
+    document.addEventListener('pointerup', function (e) { send(2, e); });
+    document.addEventListener('pointercancel', function (e) { send(2, e); });
+
+    function releaseAll() { _spike_input_release_all(); }
+    window.addEventListener('blur', releaseAll);
+    document.addEventListener('visibilitychange', function () {
+        if (document.hidden) releaseAll();
+    });
+    console.log('[input] pointer listeners installed');
+});
+
+void host_browser_input_init(void)
+{
+    spike_input_install_js();
+}
+
+/* The JS side calls these; EM_JS reaches C by symbol name, so they must be
+ * exported too (see -sEXPORTED_FUNCTIONS in tools/build.sh).
+ *
+ * They only queue -- the guest is entered at frame boundaries, from spike_tick,
+ * never from a DOM handler. */
+void spike_input_down(int id, int x, int y, double t_ms);
+void spike_input_move(int id, int x, int y, double t_ms);
+void spike_input_up(int id, int x, int y, double t_ms);
+void spike_input_release_all(void);
+void spike_input_down(int id, int x, int y, double t_ms) { input_push_down(id, x, y, t_ms); }
+void spike_input_move(int id, int x, int y, double t_ms) { input_push_move(id, x, y, t_ms); }
+void spike_input_up(int id, int x, int y, double t_ms)   { input_push_up(id, x, y, t_ms); }
+void spike_input_release_all(void)                       { input_release_all(); }
 
 /* ---- instruction tracing -------------------------------------------------
  * Emscripten has a filesystem (MEMFS by default), so unlike the freestanding

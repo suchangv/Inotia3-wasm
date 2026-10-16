@@ -1,7 +1,7 @@
 // Read the run's options from the page URL, so a headless run can vary them
 // without a rebuild.
 //
-//   spike.html?frames=3000&gltrace=200&dump=1
+//   spike.html?frames=3000&gltrace=200&dump=1&fixed=1
 //
 // The C side reads these out of Module at startup (see platform_emscripten.c),
 // so they have to be set before the module runs -- which is what --pre-js
@@ -20,4 +20,5 @@
   if (q.has('frames'))  M.spikeFrames = num('frames');
   if (q.has('gltrace')) M.spikeGlTrace = num('gltrace');
   if (q.has('dump'))    M.spikeDumpScreen = num('dump');
+  if (q.has('fixed'))   M.spikeFixed = num('fixed');
 })();

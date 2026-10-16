@@ -35,7 +35,7 @@ find_wasm_ld() {
     return 1
 }
 
-COMMON="src/util.c src/elf_loader.c src/cpu.c src/imports.c src/host_libc.c src/jni.c src/gl.c src/patches.c src/timers.c src/asset_zip.c"
+COMMON="src/util.c src/elf_loader.c src/cpu.c src/imports.c src/host_libc.c src/jni.c src/gl.c src/patches.c src/timers.c src/asset_zip.c src/input.c"
 COMMON_BROWSER="$COMMON"
 
 build_native() {
@@ -136,7 +136,7 @@ build_browser() {
         -sMIN_WEBGL_VERSION=2 -sMAX_WEBGL_VERSION=2 \
         -sEXIT_RUNTIME=0 \
         -sEXPORTED_RUNTIME_METHODS=ccall,cwrap \
-        -sEXPORTED_FUNCTIONS=_main,_spike_set_frames,_spike_set_dump_screen,_spike_set_gl_trace \
+        -sEXPORTED_FUNCTIONS=_main,_spike_set_frames,_spike_set_dump_screen,_spike_set_gl_trace,_spike_set_fixed,_spike_input_down,_spike_input_move,_spike_input_up,_spike_input_release_all \
         $PRELOAD \
         -o build/spike.html
     echo "   -> build/spike.html (serve this directory and open the page)"

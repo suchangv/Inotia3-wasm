@@ -27,3 +27,7 @@ profiles/
 
 # Third-party dependency checkouts (see docs/REUSE.md).
 vendor/
+
+# Framebuffer dumps from src/gl.c (SPIKE_DUMP_FB=1); debugging output, not
+# source. 44 of these were committed by accident.
+*.raw

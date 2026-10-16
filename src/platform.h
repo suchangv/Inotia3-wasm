@@ -31,9 +31,24 @@ void host_browser_set_size(int w, int h);
 void host_browser_read_frames(void);
 void host_browser_read_dump(void);
 void host_browser_read_gl_trace(void);
+void host_browser_read_fixed(void);
 extern int g_browser_dump_screen;
 extern int g_browser_gl_trace;
 void host_browser_read_pixels(unsigned char *out, int w, int h, int step);
+
+/* Browser build only: hand the engine's tick function to requestAnimationFrame.
+ *
+ * Does not return: main() must return straight after this so the rAF chain owns
+ * the page. `tick` returns 0 when the run is over. */
+void host_browser_main_loop(int (*tick)(void));
+
+/* Browser build only: start delivering pointer events. Call after the canvas
+ * exists and before the first tick, so the first frame can already see input. */
+void host_browser_input_init(void);
+
+/* Browser build only: ?fixed=1, a fixed 16 ms step instead of real elapsed
+ * time. Read at startup. */
+extern int g_browser_fixed;
 
 /* Per-instruction trace sink, written from inside the interpreter loop.
  * Format is a contract with tools/oracle.py. */
