@@ -64,7 +64,7 @@ host layer — fetch, WebGL, IDBFS — lands.)
 
 ```sh
 tools/build.sh native          # -> build/spike
-tools/build.sh wasm            # -> build/spike.wasm
+tools/build.sh wasm            # -> build/spike_freestanding.wasm
 
 mkdir -p game && cp /path/to/libgame.so game/
 ./build/spike game/libgame.so --init-array --all --trace

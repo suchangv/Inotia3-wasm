@@ -22,9 +22,9 @@ import { performance } from 'node:perf_hooks';
 const SO_PATH = process.argv[2] || 'game/libgame.so';
 const FRAMES = parseInt(process.argv[3] || '0', 10);
 
-const wasmBytes = readFileSync('build/spike.wasm');
+const wasmBytes = readFileSync('build/spike_freestanding.wasm');
 const soBytes = readFileSync(SO_PATH);
-console.log(`wasm   : build/spike.wasm (${wasmBytes.length} bytes)`);
+console.log(`wasm   : build/spike_freestanding.wasm (${wasmBytes.length} bytes)`);
 console.log(`image  : ${SO_PATH} (${soBytes.length} bytes)`);
 console.log(`engine : node ${process.version} / V8\n`);
 

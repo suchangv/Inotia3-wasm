@@ -486,8 +486,12 @@ one more undefined reference evidently remains. Dump the wasm's import section
 This only affects the throughput-measurement target. The numbers above were
 measured before the break and remain valid, but re-measuring needs this fixed.
 
-Also note: **`build.sh wasm` and `build.sh browser` both write
-`build/spike.wasm`** and clobber each other's output.
+Also note: `build.sh wasm` used to write `build/spike.wasm`, the same name the
+browser build gives its emscripten module, so the two silently clobbered each
+other -- running the throughput build after the browser build left the page
+dying at instantiation with `Import #2 "host": module is not an object or
+function`. The freestanding target now writes `build/spike_freestanding.wasm`;
+the browser triple keeps the `spike.*` names the page URL depends on.
 
 ---
 

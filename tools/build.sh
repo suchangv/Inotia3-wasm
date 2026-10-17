@@ -11,7 +11,7 @@
 # into the picture only when the browser host layer (fetch, WebGL, IDBFS) lands.
 #
 #   tools/build.sh native   -> build/spike
-#   tools/build.sh wasm     -> build/spike.wasm
+#   tools/build.sh wasm     -> build/spike_freestanding.wasm
 #   tools/build.sh both
 
 set -e
@@ -75,8 +75,8 @@ build_wasm() {
         -Wl,--initial-memory=$((192 * 1024 * 1024)) \
         -Wl,--max-memory=$((1024 * 1024 * 1024)) \
         $COMMON src/platform_wasm.c src/main.c \
-        -o build/spike.wasm
-    echo "   -> build/spike.wasm"
+        -o build/spike_freestanding.wasm
+    echo "   -> build/spike_freestanding.wasm"
 }
 
 # The browser build: emscripten plus gl4es, which is the real port. See
@@ -129,6 +129,12 @@ build_browser() {
     # it. Debug builds add --profiling-funcs so those frames have names.
     DBG=""
     [ -n "$SPIKE_DEBUG" ] && DBG="-g --profiling-funcs -sASSERTIONS=2"
+    # The output basename owns the whole browser triple: -o build/spike.html
+    # makes emscripten emit build/spike.{js,wasm,data} alongside it. The
+    # freestanding target therefore must NOT be called build/spike.wasm, or
+    # whichever build ran last silently replaces the other's module and the
+    # page dies at instantiation with "Import #2 host: module is not an object
+    # or function". See build_wasm(), which writes spike_freestanding.wasm.
     $EMCC -O2 -I src $DBG --pre-js tools/trap.js --pre-js tools/page-options.js \
         $COMMON_BROWSER src/gl4es_bridge.c src/platform_emscripten.c src/main.c \
         "$GL4ES/libGL.a" \
