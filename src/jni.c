@@ -32,6 +32,7 @@
 #include "timers.h"
 #include "asset_zip.h"
 #include "platform.h"
+#include "sound.h"
 #include "text.h"
 
 /* The archive the engine reads its assets out of, and where inside them they
@@ -862,6 +863,64 @@ int jni_host_call(const char *name, uint32_t *args, int nargs, uint32_t *ret_lo,
                     if (bh && bh->kind == H_ARRAY && bh->guest && bh->elem == 1)
                         text_draw(g_mem + bh->guest, (int) bh->len, (int) args[5]);
                     *ret_lo = 0;
+                    st->implemented = 1; return 1;
+                }
+
+                /* ---- the Java-side sound player --------------------------
+                 *
+                 * All of the game's audio arrives through these nine static
+                 * methods (see sound.c). They are not a fallback: libgame.so
+                 * also carries a native C2S media layer, but in this build
+                 * every CS_mda* entry point is a two-instruction stub
+                 * returning 0, so the engine's own player dies at
+                 * CS_mdaClipCreate and this is the only live path.
+                 *
+                 * Signatures, from the parent port's java.c ids 27-35:
+                 *   SoundCreate(String, Z)I  -> handle >= 1, 0 on failure
+                 *   SoundPrepare(I)I         SoundDestroy(I)I
+                 *   SoundPlay(I, Z)I         SoundPause(I)I
+                 *   SoundResume(I)I          SoundStop(I)I
+                 *   SoundGetVolume(I)I       SoundSetVolume(II)I
+                 * The engine checks these as signed (CS_mdaSoundCreate wants
+                 * a non-negative result), so a failure has to leave r0 with
+                 * the sign bit set. */
+                if (strcmp(n, "SoundCreate") == 0) {
+                    char name[160];
+                    jni_read_text_arg(args[3], name, sizeof(name));
+                    *ret_lo = (uint32_t) sound_create(name, (int) args[4]);
+                    st->implemented = 1; return 1;
+                }
+                if (strcmp(n, "SoundPrepare") == 0) {
+                    *ret_lo = (uint32_t) sound_prepare((int) args[3]);
+                    st->implemented = 1; return 1;
+                }
+                if (strcmp(n, "SoundPlay") == 0) {
+                    *ret_lo = (uint32_t) sound_play((int) args[3], (int) args[4]);
+                    st->implemented = 1; return 1;
+                }
+                if (strcmp(n, "SoundPause") == 0) {
+                    *ret_lo = (uint32_t) sound_pause((int) args[3]);
+                    st->implemented = 1; return 1;
+                }
+                if (strcmp(n, "SoundResume") == 0) {
+                    *ret_lo = (uint32_t) sound_resume((int) args[3]);
+                    st->implemented = 1; return 1;
+                }
+                if (strcmp(n, "SoundStop") == 0) {
+                    *ret_lo = (uint32_t) sound_stop((int) args[3]);
+                    st->implemented = 1; return 1;
+                }
+                if (strcmp(n, "SoundDestroy") == 0) {
+                    *ret_lo = (uint32_t) sound_destroy((int) args[3]);
+                    st->implemented = 1; return 1;
+                }
+                if (strcmp(n, "SoundSetVolume") == 0) {
+                    *ret_lo = (uint32_t) sound_set_volume((int) args[3],
+                                                          (int) args[4]);
+                    st->implemented = 1; return 1;
+                }
+                if (strcmp(n, "SoundGetVolume") == 0) {
+                    *ret_lo = (uint32_t) sound_get_volume((int) args[3]);
                     st->implemented = 1; return 1;
                 }
             }

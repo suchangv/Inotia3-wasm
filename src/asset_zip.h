@@ -20,6 +20,14 @@ typedef struct _IO_FILE FILE;
 int asset_zip_find(FILE *f, const char *entry_name, uint32_t *out_offset,
                    uint32_t *out_length);
 
+/* The same lookup by *logical* name: the engine names a resource without the
+ * ".jpg" the packer appends to files that are already compressed
+ * ("MainMenu.png" -> "assets/common/game_res/MainMenu.png.jpg", and a real
+ * Ogg Vorbis stream is stored as "BGM1.ogg.jpg"). Both spellings are tried.
+ * Returns 0 and fills offset/length on success. Implemented in host_libc.c,
+ * next to the path hook that resolves the same names for the engine itself. */
+int asset_lookup(const char *name, uint32_t *out_offset, uint32_t *out_length);
+
 /* The one archive every asset lives in. Defined in asset_zip.c; the JNI layer
  * and the File::GetFullPathName hook both need it. */
 #define ASSET_ARCHIVE "assets.apk"

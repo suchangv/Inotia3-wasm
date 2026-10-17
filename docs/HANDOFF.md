@@ -284,6 +284,47 @@ per the ground rule that diagnostics do not stay.
 
 ---
 
+### Progress since that (2026-10-18, the sound)
+
+**The game has audio.** The menu's looping music and the UI effects play in the
+browser, from the game's own Ogg Vorbis files, with the engine's own loop and
+volume arguments.
+
+The path is the same shape as the text one, and it is *not* the one the .so
+looks like it has. libgame.so carries a native C2S media layer
+(`CS_mdaClipCreate` and friends, reached from `SOUNDPLAYER_Play`), but in this
+build every `CS_mda*` entry point is a two-instruction stub returning 0, so
+that path dies at the first call. What the engine actually uses is the Java
+surface: `SOUNDSYSTEM_Create` -> `CS_mdaSoundCreate` -> `jSoundCreate` ->
+`WrapperJinterface.SoundCreate`, and eight more methods for
+prepare/play/pause/resume/stop/volume/destroy -- which on Android is
+MediaPlayer and SoundPool. `src/sound.c` is that player, and
+`tools/sound.js` (linked with `--js-library`) is its backend in the browser:
+WebAudio, with the browser's own Vorbis decoder.
+
+Nothing is decoded in the port. The engine preloads **160** sounds at boot
+(~10 MB of Vorbis, one handle per asset, kept for the life of the process), so
+the bytes stay compressed and are decoded only when played -- at
+`SoundPrepare` for the small effects, at `SoundPlay` for the background music
+-- with a play that arrives mid-decode remembered and started when the decode
+lands. That single deferral is the one behavioural difference from Android,
+where SoundPool hands out an already-decoded sample. The native runner gets the
+same handle bookkeeping with a null backend, so the engine behaves identically
+in both hosts; only the audio hardware differs.
+
+Two details worth knowing:
+
+* **The assets resolve through the engine's own logical names.** `SoundCreate`
+  is called with `"BGM1.ogg"`, not a path, and the file is stored as
+  `assets/common/game_res/BGM1.ogg.jpg` -- the packer renames
+  already-compressed files so aapt stores them instead of deflating them
+  again. `asset_lookup()` (host_libc.c) already knew that convention for
+  images and now resolves sounds through it too.
+* **The volume is 0..100, not a fraction** -- confirmed from the guest:
+  `SoundSetVolume(160 "Title.ogg", 100)` on the first music play.
+
+---
+
 ## What this is
 
 A browser port of Inotia 3 that runs the original ARM `libgame.so` — no Android,
@@ -332,12 +373,18 @@ src/
   host_libc.c      bionic shims, the guest heap, file I/O, the path hook
   patches.c        deliberate modifications to the guest binary
   timers.c         the Java-side software timer table
+  text.c           the Java-side text rasteriser (the engine draws no glyphs)
+  sound.c          the Java-side sound player (the .so's own one is stubbed)
+  input.c          touch, as device coordinates
   platform_*.c     host services: native / wasm-freestanding / emscripten
   main.c           the runner
 tools/
   build.sh             native | wasm | browser
   build_gl4es.sh       fetch and build gl4es into vendor/ (gitignored)
   gen_gl4es_protos.sh  regenerate gl4es_protos.h
+  sound.js             the browser's WebAudio backend for sound.c
+  page-options.js      browser CPU/GL options (they have to run before init)
+  trap.js              unpack a wasm trap into named frames
   run_browser.sh       serve build/ and screenshot with headless Chrome
   run_wasm.mjs         node driver for the freestanding build
   oracle.py            Unicorn differential oracle
@@ -415,10 +462,9 @@ conditions you meant it to run under.**
 **Nothing blocks reaching gameplay. These are the loose ends.**
 
 Gameplay is confirmed in both hosts — the native runner and the browser — with
-the map, the character, the HUD, the minimap and the text drawn. What is left is
-adjacent:
+the map, the character, the HUD, the minimap, the text and the sound. What is
+left is adjacent:
 
-- **Audio.** The engine opens its audio files; nothing is mixed yet.
 - **The opening event leaves only on SKIP, and it needs two presses.** The class
   confirm drops into `GAMESTATE_nState` 13 (a black screen with a **SKIP**
   control at the top right, UI centre `(449,17)`). One SKIP press is not enough:
@@ -625,24 +671,24 @@ threads.
 
 ### Known break: the freestanding wasm target
 
-`tools/build.sh wasm` builds, but `node tools/run_wasm.mjs` fails with
-`Import #0 "env": module is not an object or function`. The cause is the pattern
-this port keeps meeting: **with `--allow-undefined` an undefined symbol becomes
-an import from `env` rather than a link error**, and the failure surfaces at
-instantiation with no hint of which symbol. `asset_zip.c` was guarded for
-`WASM_FREESTANDING` after `jni.c` started calling into it; a stub was added, and
-one more undefined reference evidently remains. Dump the wasm's import section
-(parse section id 2) to name it.
+`tools/build.sh wasm` builds, and `node tools/run_wasm.mjs` now gets past
+instantiation. Two symbols used to leave the link as `env.*` imports --
+`host_file_get_full_path_name` and `host_parse_offset_len_path`: the dispatcher
+that calls them (`host_import_call`) is compiled in both builds, but their
+definitions sat inside the desktop-only block -- and with `--allow-undefined`
+an undefined symbol becomes an import from `env` rather than a link error, so
+the only sign was `Import #0 "env": module is not an object or function` at
+instantiation, with nothing naming the symbol. They have freestanding stubs now.
 
-This only affects the throughput-measurement target. The numbers above were
-measured before the break and remain valid, but re-measuring needs this fixed.
-
-Also note: `build.sh wasm` used to write `build/spike.wasm`, the same name the
-browser build gives its emscripten module, so the two silently clobbered each
-other -- running the throughput build after the browser build left the page
-dying at instantiation with `Import #2 "host": module is not an object or
-function`. The freestanding target now writes `build/spike_freestanding.wasm`;
-the browser triple keeps the `spike.*` names the page URL depends on.
+It stops later instead, inside the guest heap: `memset` from
+`host_import_call`'s `calloc` faults "memory access out of bounds" during boot,
+which says the freestanding arena reaches past the memory the link reserves.
+That is the remaining work. It only affects the throughput-measurement target;
+the numbers above were measured before any of this and remain valid. Note also
+that `build.sh wasm` used to write `build/spike.wasm`, the same name the browser
+build gives its emscripten module, so the two silently clobbered each other --
+the freestanding target now writes `build/spike_freestanding.wasm`, and the
+browser triple keeps the `spike.*` names the page URL depends on.
 
 ---
 

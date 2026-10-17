@@ -1478,7 +1478,7 @@ void host_import_call(guest_import *im)
  * tried. Returns 0 on success. The archive's location is host_apk_path() in
  * asset_zip.c -- one place decides it, so the path handed back to the engine
  * in the "@offset|length|path" form names the same file the lookup opened. */
-static int asset_lookup(const char *name, uint32_t *out_offset, uint32_t *out_length)
+int asset_lookup(const char *name, uint32_t *out_offset, uint32_t *out_length)
 {
     FILE *f = fopen(host_apk_path(), "rb");
     if (!f)
@@ -1679,4 +1679,28 @@ void host_file_get_full_path_name(uint32_t name_ptr, uint32_t out_ptr,
     memcpy(g_mem + out_ptr, buf, n + 1);
     g_cpu.r[0] = 1;   /* the real function returns nonzero on success */
 }
-#endif
+#else /* WASM_FREESTANDING */
+
+/* The throughput build has no filesystem, and does not want one: it runs the
+ * same instruction stream as the other hosts with every path resolution
+ * failing, which is what a device with no storage looks like. These two still
+ * have to exist, though -- host_import_call() (compiled in both builds) calls
+ * them, so without stubs they leave the link as `env.*` imports (the
+ * freestanding link passes --allow-undefined), and the only sign of that is
+ * `Import #0 "env": module is not an object or function` at instantiation,
+ * with nothing naming the symbol. */
+void host_parse_offset_len_path(uint32_t out_ptr, uint32_t buf_ptr, uint32_t len)
+{
+    (void) out_ptr; (void) buf_ptr; (void) len;
+}
+
+void host_file_get_full_path_name(uint32_t name_ptr, uint32_t out_ptr,
+                                 uint32_t out_size, uint32_t mode)
+{
+    (void) name_ptr; (void) mode;
+    if (out_size > 0)
+        ST8(out_ptr, 0);
+    g_cpu.r[0] = 0;
+}
+
+#endif /* WASM_FREESTANDING */

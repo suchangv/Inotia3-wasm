@@ -35,7 +35,7 @@ find_wasm_ld() {
     return 1
 }
 
-COMMON="src/util.c src/elf_loader.c src/cpu.c src/imports.c src/host_libc.c src/jni.c src/gl.c src/patches.c src/timers.c src/asset_zip.c src/input.c src/text.c"
+COMMON="src/util.c src/elf_loader.c src/cpu.c src/imports.c src/host_libc.c src/jni.c src/gl.c src/patches.c src/timers.c src/asset_zip.c src/input.c src/text.c src/sound.c"
 COMMON_BROWSER="$COMMON"
 
 build_native() {
@@ -136,6 +136,7 @@ build_browser() {
     # page dies at instantiation with "Import #2 host: module is not an object
     # or function". See build_wasm(), which writes spike_freestanding.wasm.
     $EMCC -O2 -I src $DBG --pre-js tools/trap.js --pre-js tools/page-options.js \
+        --js-library tools/sound.js \
         $COMMON_BROWSER src/gl4es_bridge.c src/platform_emscripten.c src/main.c \
         "$GL4ES/libGL.a" \
         -sFULL_ES2=1 -sALLOW_MEMORY_GROWTH=1 -sSTACK_SIZE=8388608 \

@@ -49,8 +49,8 @@
  * same wrap function.
  */
 #include <stdint.h>
-#include <string.h>
 
+#include "compat.h"    /* the string helpers, declared for freestanding */
 #include "guest.h"
 #include "jni.h"
 #include "text.h"
