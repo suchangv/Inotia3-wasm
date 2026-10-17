@@ -953,6 +953,15 @@ static void spike_dump_ui_controls(void)
         }
     }
 
+    /* handleCletEvent only reaches UICONTROLLIST_Event for event 0x18 when
+     * *globalA == 0 and IsIfreeEvent() is non-zero. Probe both: whichever is
+     * false is the reason a tap goes nowhere. */
+    {
+        uint32_t ifree = elf_find_symbol(&g_img, "IsIfreeEvent");
+        host_log("  [ui]   IsIfreeEvent() = %u\n",
+                 ifree ? spike_call1(ifree, 0) : 0xffffffffu);
+    }
+
     /* Which coordinate space does the hit-test actually live in? Asking the
      * engine's own UICONTROL_IsInEventArea, rather than assuming, settles it:
      * the touch arrives in 960x544, the controls are laid out in 480x320, and

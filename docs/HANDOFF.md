@@ -297,8 +297,29 @@ So:
   alone — it is callback plus whatever `MAINMENU_Process` does on the next tick,
   presumably driven by a latch the callback sets.
 
-That last point is the thread to pull. The two concrete options, cheapest
-first:
+One more measurement, and it narrows the last hop a lot. `handleCletEvent`
+reaches `UICONTROLLIST_Event` for event 0x18 only through this chain:
+
+```
+cmp  r7, #0x18            ; event is 0x18
+ldrb r3, [globalA]        ; must be 0
+bl   IsIfreeEvent         ; measured: returns 1, so this passes
+ldrb r3, [globalB]
+ldrh r3, [r3]
+cmp  r3, #0x5
+bne  -> UICONTROLLIST_Event      ; *globalB != 5: straight there
+beq  -> counter <= 9 ? swallow the event and set the counter to 10 : UICONTROLLIST_Event
+```
+
+`IsIfreeEvent()` returning 1 rules out the popup gate. What is left is the
+`*globalB == 5` branch and its counter: if that is the path taken, the first
+tap is swallowed by design and the second should work — but two taps in a row
+were tried and neither registered, so either the counter is reset between ticks
+or `*globalB` is something else entirely. Reading `*globalB` and that counter at
+runtime is the next single measurement, and both are reachable by the same
+`spike_call*` technique already in the file.
+
+The two implementation options, cheapest first:
 
 1. **Send touches in UI space.** Scale x by 480/960 and y by 320/544 in the
    input layer before dispatching, so the engine's own hit-test sees the point
