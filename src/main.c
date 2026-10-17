@@ -107,6 +107,7 @@ static int spike_boot(void);
 static int spike_tick(void);
 static int spike_tick_browser(void);
 static void spike_finish(void);
+static uint32_t spike_call1(uint32_t fn, uint32_t a0);
 
 
 /* Guest address of the jlong sysTime[1] handed to nativeInit(). The guest reads
@@ -697,6 +698,38 @@ static int spike_boot(void)
      * nothing ever fires, which looks exactly like the engine idling. */
     g_clock = (int64_t)LD32(g_sys_time_addr) |
               ((int64_t)LD32(g_sys_time_addr + 4) << 32);
+
+    /* ---- skip the Com2uS Hub ------------------------------------------
+     *
+     * TITLE_Event -- the title screen's "any touch to continue" handler --
+     * re-decides on every tap where to go:
+     *
+     *     if (GetHubFirstLoginState() == 1 || HUBINSTALL_Check() != 1)
+     *         STATE_Set(5);      // gameplay
+     *     else
+     *         STATE_Set(3);      // the Hub join screen
+     *
+     * State 3 is Com2uS's social/login screen. There is no Hub here and no way
+     * to complete it, so a tap on the title lands there and the game goes no
+     * further -- which is what "Touch to Start does nothing" actually is.
+     *
+     * The PS Vita port traced this end to end (source/patch.c, Corrida 87) and
+     * found the real escape: pressing the Hub's own "Later" button runs
+     * STATE_Set(5) and HUBINSTALL_Save(0), persisting "the Hub has been seen".
+     * Doing that here before the first frame makes TITLE_Event's gate resolve
+     * to state 5 on its own, without ever building the Hub UI. */
+    {
+        uint32_t save = find_symbol("HUBINSTALL_Save");
+        uint32_t check = find_symbol("HUBINSTALL_Check");
+        if (save) {
+            spike_call1(save, 0);
+            host_log("  [hub] HUBINSTALL_Save(0) -> HUBINSTALL_Check()=%u\n",
+                     check ? spike_call1(check, 0) : 0u);
+        } else {
+            host_log("  [hub] HUBINSTALL_Save not found -- the title screen will "
+                     "send taps to the Hub join screen\n");
+        }
+    }
 
     g_native_render = find_symbol(
         "Java_com_com2us_wrapper_WrapperRenderer_nativeRender");
