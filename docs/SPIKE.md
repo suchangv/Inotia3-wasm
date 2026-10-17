@@ -310,8 +310,10 @@ repeats.
   `Rd` (bits[15:12]). Because that field is zero for `MUL`, every product went to
   `r0`. `__aeabi_uidivmod`'s `mul r3,r2,r0` then clobbered the quotient, so the
   remainder of `0x78da % 31` was wrong and zlib rejected the valid header.
-  Long-multiply forms were already correct (`RdLo`/`RdHi` *are* bits[15:12] and
-  [19:16]), which is why this hid.
+  The long-multiply forms (`RdLo`/`RdHi` *are* bits[15:12] and [19:16]) hid
+  this at the time, but they were **not** in fact correct — see the 2026-10-17
+  entry below. The claim that they were "already correct" is the note that
+  kept the next bug hidden for a day.
 
 **Formatting**
 
@@ -341,3 +343,58 @@ check site is `0x01103d6c`–`0x01103d7e`; the next step is either a bounded pro
 there, or — better — teaching `tools/oracle.py` to perform `memcpy`/`memset`/
 `memcmp` so the differential compares *inside* `inflate` instead of stopping at
 its first host crossing.
+
+## Session log — 2026-10-17, the touch that did nothing
+
+**Symptom.** The game reaches its main menu and draws it correctly, but no touch
+ever activates a control: `state` at +0x0 of the entry under the tap stayed 0
+through every click, and the screen never changed.
+
+**What it was not.** The instrumentation (a synthetic pointer DOWN+UP injected
+through the real `nativeEvent` path, plus a few register probes) showed the whole
+input chain working: the tap reaches `handleCletEvent`, the `0x106e5ce` gate
+(`*globalA == 0 && IsIfreeEvent()`) *is* taken, and `UICONTROLLIST_Event` and
+`UICONTROL_IsInEventArea` run. The engine's own hit-test even returns 1 for the
+correctly-scaled point (233,141). So the routing, the callbacks and the control
+rectangles were all fine; the coordinate the engine fed its own hit-test was not.
+
+**Root cause.** `EventHandler_Wrapper` (`0x010daff4`) scales the tap before the
+hit-test: x by `g_zoom_rate_horizontal_inv` (0.5) and y by
+`g_zoom_rate_vertical_inv`. A probe at the two `__fixdfsi` results read `r0=0xe9`
+(233) for x and **`r0=0` for y**, while the two doubles going into `__muldf3`
+were correct — `0.5` and `0x3FE2D2D2D3A88913` (0.588, i.e. 320/544). That is the
+shape that matters: the *state* was right and the *arithmetic* was wrong.
+
+`__muldf3(240.0, 0.588)` really did return `0x2050000000000000` — a denormal-ish
+`2^-506` — instead of `0x4061A5A5A66E0082`. Feeding the guest's own `__muldf3`
+six operand pairs directly (a temporary ARM-mode `spike_call*`, since the libgcc
+helpers are the ARM-mode exceptions to this otherwise-Thumb-2 image) showed the
+pattern: `467*0.5`, `240*0.5`, `240*1.0` were exact, but `240*0.75` became
+`0x4040000000000000` (32.0) and `240*0.588` collapsed. The failures were exactly
+the pairs whose mantissas needed both halves of a 64-bit product.
+
+- **ARM long-multiply routing.** The multiply block split `MUL`/`MLA` from
+  `UMULL`/`UMLAL`/`SMULL`/`SMLAL` on **bit22**, but the ARM encoding uses
+  **bit23** for that split; bit22 is only the *signed* flag of the long forms
+  (`UMULL`/`UMLAL` have bit22 = 0, like `MUL`/`MLA`). Every `umull`/`umlal`
+  therefore ran down the 32-bit path: it wrote only the low word to
+  bits[19:16] and left the high word untouched, so all of `__muldf3`,
+  `__divdf3` and `__fixdfsi` computed garbage whenever a product needed its high
+  half. `-W` nothing; it is a silent wrong-answer, which is why it survived a
+  menu, rendering, and (uselessly) `difftest.sh`.
+
+Note the shape, because it repeats: **the engine state was correct and the
+interpreter was wrong.** Two prior sessions had attributed the dead touch to the
+engine (a popup gate, a missing orientation getter, "the engine expects touches
+already in UI space"); a single register probe at the multiply's result settled
+it in one line.
+
+**Also corrected here.** The 2026-10-16 entry asserted the long-multiply forms
+were "already correct". They were not; only the `MUL`/`MLA` destination field
+had been fixed, and the routing bug above meant the long branch was dead code
+for `UMULL`/`UMLAL`. That false note is what let this one hide.
+
+**After the fix.** A tap at (467,240) → (233,141) in UI space now fires
+`MAINMENU_EventNewgame`: the UI list changes from the 9-entry main menu to the
+5-entry slot screen (`MAINMENU_EventSlot` callbacks), while a no-tap control run
+stays on the 9-entry menu. The UI acts on touch.

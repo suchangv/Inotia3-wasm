@@ -134,6 +134,27 @@ it left the result register alone.
 The previous handoff's "immediate next task" (the `@assets.ap` parse) is **done**;
 its text is kept below only for the history of how it was found.
 
+### Progress since that (2026-10-17, the touch bug)
+
+**The UI acts on a touch.** A tap on NEW GAME advances the screen: the 9-control
+main menu is replaced by the 5-control slot screen (`MAINMENU_EventSlot`
+callbacks), while a no-tap control run stays on the menu. The blocker was in the
+*interpreter*, not the engine. `cpu.c` split `MUL`/`MLA` from the long
+multiplies on bit22 of the ARM encoding, where the split bit is **bit23** — bit22
+is only the *signed* flag of `UMULL`/`UMLAL`/`SMULL`/`SMLAL`, which are zero for
+`UMULL`/`UMLAL` exactly like `MUL`/`MLA`. Every `umull`/`umlal` therefore ran
+down the 32-bit path and wrote only the low word, so `__muldf3` lost the high
+half of its product. `EventHandler_Wrapper` scales a tap's y by
+`g_zoom_rate_vertical_inv` (0.588); `240 * 0.588` came back as `2^-506`, the y of
+every tap collapsed to 0, and no control was ever hit. Full write-up in
+`docs/SPIKE.md`, "the touch that did nothing".
+
+That invalidates the engine-side theories recorded further down (`IsIfreeEvent`,
+the orientation getter, "the engine wants touches already in UI space"): the
+engine state was correct throughout. The two measurements that found it were the
+`__fixdfsi` results of the two scales — x gave 233, y gave 0 — and a direct
+`__muldf3` unit call from the frame boundary.
+
 ---
 
 ## What this is
@@ -263,11 +284,15 @@ conditions you meant it to run under.**
 
 ## The immediate next task
 
-**Make the UI act on a touch.** Everything around it now has a measured answer;
-what is left is the last hop.
+**Get past the slot screen and into gameplay, then take it to the browser.**
 
-What the probe in `spike_dump_ui_controls()` established (all of it callable
-again by setting nothing — it runs 20 frames after the menu appears):
+The touch hop that headed this section is done (see the progress note above and
+`docs/SPIKE.md`): a tap on NEW GAME now fires `MAINMENU_EventNewgame` and swaps
+the 9-control main menu for the 5-control slot screen. What is left is the screen
+*after* that.
+
+What the probe in `spike_dump_ui_controls()` reports (it runs 20 frames after the
+menu appears, with no flag needed):
 
 ```
 [ui] UI_listControl count=9 entries=019d311c  original=480x320
@@ -277,63 +302,40 @@ again by setting nothing — it runs 20 frames after the menu appears):
 [ui]   hit(233,141) = 1     hit(467,240) = 0
 ```
 
-So:
+So, with the arithmetic fixed:
 
-- **The UI lives in 480x320**, the canvas is 960x544. The scale is not uniform
-  — x2 across, 544/320 = 1.7 down.
+- **The UI lives in 480x320**, the canvas is 960x544, and the split is
+  non-uniform — x2 across, 544/320 = 1.7 down. The engine applies that itself in
+  `EventHandler_Wrapper` from the `g_zoom_rate_*` globals, so the input layer must
+  **not** pre-scale. The earlier plan to "send touches in UI space" would now
+  double-scale; it was only ever attractive because the engine's own scale was
+  broken.
 - **A correctly-scaled touch hits.** `UICONTROL_IsInEventArea` — the engine's own
   hit-test — returns 1 for (233,141) and 0 for the raw (467,240). The control
-  rectangles and the hit-test are therefore fine.
-- **The scaling is not being applied.** `SGL_ChangeOrientationPosition` branches
-  on `SGL_GetScreenOrientation() == 1` to decide whether to rescale, and that
-  returns **0** here. Neither this port nor the Vita port implements an
-  orientation getter, so 0 is the engine's own default — which suggests the
-  non-scaling branch is correct for this build and the touch is simply expected
-  to arrive already in UI space.
-- **The controls' callbacks are named**, and directly resolvable:
-  `MAINMENU_EventNewgame` / `_Continue` / `_Credit` / `_TermsOfUse`. Calling
-  `MAINMENU_EventNewgame()` from the frame boundary returns cleanly but does
-  **not** advance the screen, so the button's full action is not the callback
-  alone — it is callback plus whatever `MAINMENU_Process` does on the next tick,
-  presumably driven by a latch the callback sets.
+  rectangles and the hit-test were never the problem.
+- **The controls' callbacks are named**: `MAINMENU_EventNewgame` / `_Continue` /
+  `_Credit` / `_TermsOfUse` on the menu, `MAINMENU_EventSlot` on the slot screen.
+  Calling `MAINMENU_EventNewgame()` from the frame boundary returns cleanly but
+  does **not** advance the screen: the advance needs the callback *plus* the next
+  `MAINMENU_Process` tick. Inject a real event through `nativeEvent` instead of
+  calling the callback.
 
-One more measurement, and it narrows the last hop a lot. `handleCletEvent`
-reaches `UICONTROLLIST_Event` for event 0x18 only through this chain:
+The tap injector and the bounded register probe that found the bug were removed
+again, per the ground rule that diagnostics do not stay. To rebuild the injector:
+once the menu is up, call `spike_dispatch_event(INPUT_DOWN, 1, (x << 16) | y, 1)`
+and then the same with `INPUT_UP` — that is the real `nativeEvent` →
+`EventHandler_Wrapper` → `handleCletEvent` path.
 
-```
-cmp  r7, #0x18            ; event is 0x18
-ldrb r3, [globalA]        ; must be 0
-bl   IsIfreeEvent         ; measured: returns 1, so this passes
-ldrb r3, [globalB]
-ldrh r3, [r3]
-cmp  r3, #0x5
-bne  -> UICONTROLLIST_Event      ; *globalB != 5: straight there
-beq  -> counter <= 9 ? swallow the event and set the counter to 10 : UICONTROLLIST_Event
-```
+### Superseded: the engine-side theories (all wrong)
 
-`IsIfreeEvent()` returning 1 rules out the popup gate. What is left is the
-`*globalB == 5` branch and its counter: if that is the path taken, the first
-tap is swallowed by design and the second should work — but two taps in a row
-were tried and neither registered, so either the counter is reset between ticks
-or `*globalB` is something else entirely. Reading `*globalB` and that counter at
-runtime is the next single measurement, and both are reachable by the same
-`spike_call*` technique already in the file.
-
-The two implementation options, cheapest first:
-
-1. **Send touches in UI space.** Scale x by 480/960 and y by 320/544 in the
-   input layer before dispatching, so the engine's own hit-test sees the point
-   it expects. Cheap, and it is what the numbers above say the engine wants —
-   but verify that nothing else reads the touch in device space first.
-2. **Do the hit-test ourselves**, the way the Vita port does for its D-pad menu
-   navigation: on a tap, walk `UI_listControl`, call `UICONTROL_IsInEventArea`
-   for each entry, and invoke the matching callback. This bypasses whatever the
-   engine's own routing is missing, and the probe already proves the hit-test
-   returns the right answer.
-
-Either way, watch `state` at +0x0 of the entry under the tap: it stayed 0
-through every click tried so far, so a non-zero value is the signal that the
-press actually registered.
+Kept only so the reasoning is not repeated. The `handleCletEvent` chain that was
+being blamed is real — event 0x18 passes through `*globalA == 0`, `IsIfreeEvent()`
+(measured 1) and the `*globalB == 5` counter branch on the way to
+`UICONTROLLIST_Event` — but the event reached the list the whole time. Nothing
+swallowed it; the y coordinate it arrived with was 0 by the time the `__muldf3`
+inside `EventHandler_Wrapper` was done. Reading `*globalB` and the counter would
+have explained nothing, and the "two implementation options" below were both
+unnecessary.
 
 Method that has worked on this codebase, and the one to repeat:
 
@@ -572,16 +574,23 @@ These are the ones the PS Vita port had already solved; the lesson is to read
 9. The ARM branch target is **PC + 8**, not PC + 4.
 10. A `va_list` is a plain pointer to the argument list — not the AAPCS struct,
     and not the flat array the other formatting entry points take.
-11. **ARM `MUL`/`MLA`: the destination is bits[19:16], not the data-processing
-    `Rd` (bits[15:12]).** bits[15:12] is the MLA *accumulator*, and zero for
-    `MUL`. Because the field is almost always zero in compiler output, the old
-    code wrote every product into `r0` and left the real destination stale.
-    This went unseen until `__aeabi_uidivmod` (`mul r3,r2,r0`) computed the
-    remainder: `r0` was clobbered with the dividend, so `0x78da % 31` returned
-    `0x78d6` instead of `0`, and zlib rejected the valid PNG header. Fixing this
-    is what moved the failure from "incorrect header check" to the real deflate
-    error. **The long forms (`UMULL` etc.) were already correct** — there
-    bits[15:12] *is* `RdLo` — which is why the bug was easy to miss.
+11. **ARM multiply: two independent field mistakes, both silent.**
+    `MUL`/`MLA`'s destination is bits[19:16] (the data-processing `Rn` field),
+    not `Rd` (bits[15:12]) — bits[15:12] is the MLA *accumulator* and zero for
+    `MUL`. Because that field is almost always zero in compiler output, the old
+    code wrote every product into `r0` and left the real destination stale; it
+    went unseen until `__aeabi_uidivmod` (`mul r3,r2,r0`) computed the remainder,
+    where `r0` was clobbered with the dividend, so `0x78da % 31` returned `0x78d6`
+    instead of `0` and zlib rejected the valid PNG header.
+    The 64-bit forms were **not** in fact fine. The block split `MUL`/`MLA` from
+    `UMULL`/`UMLAL`/`SMULL`/`SMLAL` on **bit22**, but the ARM encoding splits
+    them on **bit23**; bit22 is only the *signed* flag of the long forms, and it
+    is 0 for `UMULL`/`UMLAL` exactly as for `MUL`/`MLA`. So every long multiply
+    ran the 32-bit path, wrote only its low word to bits[19:16] and left the high
+    word untouched, corrupting every `__muldf3`/`__fixdfsi` result whose product
+    needed its high half. It was invisible until input: it made
+    `EventHandler_Wrapper`'s y scale (`240 * 0.588`) come out as `2^-506`, so
+    every tap's y collapsed to 0 and no control could be hit.
 12. **ARM `CLZ` was not decoded at all** — it shares the data-processing space
     and fell through to `CMN r15,Rm`, a silent no-op. `__udivsi3` is built on it,
     so every unsigned division was wrong. Now matched explicitly
@@ -658,6 +667,16 @@ These are the ones the PS Vita port had already solved; the lesson is to read
 instructions. `MUL` was wrong from the start and none of them touch it. Widen it
 (a synthetic entry per instruction family, or a captured `inflate` prologue)
 before trusting any decoder change.
+
+As of 2026-10-17 it does not even get that far: every entry reports DIVERGENCE
+with the oracle running 0 instructions and stopping at the first import it cannot
+reproduce (`__aeabi_atexit`). It resumes from the C side's dump point, which for
+these entries is an import stub rather than the entry, so it compares nothing.
+This reproduces with the multiply fix reverted (pre-existing, not the decoder),
+and fixing it is the next harness task. Until then, verify a decoder change by
+calling the guest function directly with known operands — which is how the
+`umull`/`umlal` routing fix above was verified (`__muldf3` against six operand
+pairs).
 
 ---
 

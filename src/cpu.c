@@ -804,9 +804,18 @@ int cpu_run(uint32_t entry, uint32_t sp, uint64_t budget)
                 uint32_t rm = ins & 0xf, rs = (ins >> 8) & 0xf;
 
                 if (kind == 0) {
-                    /* MUL/MLA (bit22=0) and UMULL/UMLAL/SMULL/SMLAL (bit22=1) */
+                    /* Multiply. bit23 splits the 32-bit forms (MUL/MLA, bit23=0)
+                     * from the 64-bit ones (UMULL/UMLAL/SMULL/SMLAL, bit23=1);
+                     * inside the latter, bit22 is the signed flag. Testing bit22
+                     * for the split, as this used to, put UMULL and UMLAL on the
+                     * 32-bit path: it stored only the low word and left the high
+                     * word (bits[19:16]) untouched, so any soft-float multiply
+                     * whose operands needed both mantissa halves came back with a
+                     * corrupt mantissa -- __muldf3(240.0, 0.588) returned 2^-506,
+                     * which is why EventHandler_Wrapper's y scale collapsed to 0
+                     * and no touch could ever land on a control. */
                     uint32_t acc = (ins >> 21) & 1, set = (ins >> 20) & 1;
-                    if (!((ins >> 22) & 1)) {
+                    if (!((ins >> 23) & 1)) {
                         /* MUL/MLA. The destination lives in bits[19:16] -- the
                          * data-processing Rn field -- while bits[15:12] is the
                          * MLA accumulator (and zero for MUL). Reusing the
@@ -825,14 +834,12 @@ int cpu_run(uint32_t entry, uint32_t sp, uint64_t budget)
                     } else {
                         uint64_t r;
                         if ((ins >> 22) & 1) {
-                            /* bit22 in this family means signed for the
-                             * long forms; distinguish by bits[6:5] */
-                        }
-                        if (((ins >> 5) & 3) == 1 || ((ins >> 5) & 3) == 3) {
+                            /* SMULL/SMLAL: sign-extend both operands. */
                             int64_t a = (int64_t)(int32_t)R[rm] * (int32_t)R[rs];
                             if (acc) a += (int64_t)(((uint64_t)R[rn] << 32) | R[rd]);
                             r = (uint64_t)a;
                         } else {
+                            /* UMULL/UMLAL. */
                             r = (uint64_t)R[rm] * R[rs];
                             if (acc) r += ((uint64_t)R[rn] << 32) | R[rd];
                         }
