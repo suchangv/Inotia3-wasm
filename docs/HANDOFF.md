@@ -263,51 +263,74 @@ conditions you meant it to run under.**
 
 ## The immediate next task
 
-**Make the UI act on a touch.**
+**Make the UI act on a touch.** Everything around it now has a measured answer;
+what is left is the last hop.
 
-The event reaches the engine: `nativeEvent` is called with the right type, slot
-and coordinates (verified from `[event]` in the log), `EventHandler_Wrapper`
-runs, and `handleCletEvent(0x18, ...)` is entered. What does not happen is
-anything downstream of that — neither the title screen nor the main menu
-reacts, and the whole `nativeEvent` call retires only ~1000 instructions.
+What the probe in `spike_dump_ui_controls()` established (all of it callable
+again by setting nothing — it runs 20 frames after the menu appears):
 
-`handleCletEvent` is where to look. It already does real work — it calls
-`SGL_ChangeOrientationPosition`, `IsInAtPopupButton`, and `jGetOriginalWidth` /
-`jGetOriginalHeight` to rescale the coordinates — so the question is what it
-hands the event to afterwards and why that consumer never acts. Two hypotheses
-worth testing in order:
+```
+[ui] UI_listControl count=9 entries=019d311c  original=480x320
+[ui]   [0] state=0 centre=(240,142) size=(233,48) click=010ba031   <- NEW GAME
+[ui]   [1] ...                                                     <- CONTINUE
+[ui]   SGL screen=480x320 device=960x544 orientation=0
+[ui]   hit(233,141) = 1     hit(467,240) = 0
+```
 
-1. **The coordinates are being mangled.** `jGetOriginalWidth/Height` read
-   globals written by `jSetOriginalSize`; if those are still zero the scale is
-   garbage and every hit-test misses. Log the two values and the transformed
-   coordinates that actually reach the hit-test.
-2. **The event is queued and the consumer is starved.** The engine has an
-   event/input queue (`INPUTQUEUE_Put` and friends). If `handleCletEvent` feeds
-   a queue that nothing drains on this path, the event vanishes silently.
+So:
 
-A cheaper parallel route, given the title is currently skipped anyway: the menu
-is drawn from `UI_listControl` (the 44-byte `UICONTROL` array the Vita port
-reads for its D-pad navigation — `state` @+0x0, `centerX/Y` @+0xc/+0x10,
-`width/height` @+0x14/+0x18, click callback @+0x28). Dumping it while the menu
-is up gives the real button rectangles *and* a way to invoke a button's click
-callback directly, which would separate "the coordinates miss" from "the click
-never reaches the button" in one run.
+- **The UI lives in 480x320**, the canvas is 960x544. The scale is not uniform
+  — x2 across, 544/320 = 1.7 down.
+- **A correctly-scaled touch hits.** `UICONTROL_IsInEventArea` — the engine's own
+  hit-test — returns 1 for (233,141) and 0 for the raw (467,240). The control
+  rectangles and the hit-test are therefore fine.
+- **The scaling is not being applied.** `SGL_ChangeOrientationPosition` branches
+  on `SGL_GetScreenOrientation() == 1` to decide whether to rescale, and that
+  returns **0** here. Neither this port nor the Vita port implements an
+  orientation getter, so 0 is the engine's own default — which suggests the
+  non-scaling branch is correct for this build and the touch is simply expected
+  to arrive already in UI space.
+- **The controls' callbacks are named**, and directly resolvable:
+  `MAINMENU_EventNewgame` / `_Continue` / `_Credit` / `_TermsOfUse`. Calling
+  `MAINMENU_EventNewgame()` from the frame boundary returns cleanly but does
+  **not** advance the screen, so the button's full action is not the callback
+  alone — it is callback plus whatever `MAINMENU_Process` does on the next tick,
+  presumably driven by a latch the callback sets.
+
+That last point is the thread to pull. The two concrete options, cheapest
+first:
+
+1. **Send touches in UI space.** Scale x by 480/960 and y by 320/544 in the
+   input layer before dispatching, so the engine's own hit-test sees the point
+   it expects. Cheap, and it is what the numbers above say the engine wants —
+   but verify that nothing else reads the touch in device space first.
+2. **Do the hit-test ourselves**, the way the Vita port does for its D-pad menu
+   navigation: on a tap, walk `UI_listControl`, call `UICONTROL_IsInEventArea`
+   for each entry, and invoke the matching callback. This bypasses whatever the
+   engine's own routing is missing, and the probe already proves the hit-test
+   returns the right answer.
+
+Either way, watch `state` at +0x0 of the entry under the tap: it stayed 0
+through every click tried so far, so a non-zero value is the signal that the
+press actually registered.
 
 Method that has worked on this codebase, and the one to repeat:
 
 1. **Read the PS Vita port first.** `../source/patch.c` documents ~100 corridas
    of exactly these problems, and `../source/wr_touch.c` is the input state
-   machine. Its offsets are for a different APK build, but our `.so` exports
-   most of these globals in `.dynsym` (see below), so they resolve by name.
+   machine — its menu navigation reads this same `UI_listControl`. Its offsets
+   are for a different APK build, but our `.so` exports most of these globals in
+   `.dynsym` (see below), so they resolve by name.
 2. **Probe by symbol, log on change only.** `spike_probe_loader()` is the model:
    it reads `INITSTATE_nState` / `LoadFrameCnt` / `MEM_nUsedPoolSize` /
    `GAMELOADER_pText` and logs only when one changes. That turned "stuck on a
    screen" into the literal string `"File installation error (0)"` in one run.
 3. **Call guest functions from the frame boundary.** `spike_call1()` /
-   `spike_call2()` / `spike_call4()` do this; they are how
+   `spike_call2()` / `spike_call3()` / `spike_call4()` do this; they are how
    `RES_LoadToHeap("i_character.dat")` and `LZMA_Decode()` were each cleared in
-   one step, and how the state machine was driven directly. Never from a DOM
-   callback — `g_cpu` and `g_budget` are single globals.
+   one step, how the state machine was driven directly, and how the hit-test was
+   checked against candidate coordinates. Never from a DOM callback — `g_cpu`
+   and `g_budget` are single globals.
 4. **Screenshot with `watch_run.mjs`, not `--screenshot`.** Headless
    `--virtual-time-budget` cannot get far enough into a run to see anything
    past the first splash.

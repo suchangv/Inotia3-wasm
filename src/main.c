@@ -102,6 +102,7 @@ static int      g_trace_on;
 static int      g_use_fixed_step = 1;  /* 16 ms per tick, not real elapsed      */
 static double   g_last_now_ms;
 static int      g_entered_menu;
+static int      g_menu_frame;
 
 static int spike_load(const char *path);
 static int spike_boot(void);
@@ -732,16 +733,6 @@ static int spike_boot(void)
         }
     }
 
-    /* TEMP: jump straight to state 5 (gameplay) so the path after the title
-     * can be exercised without a browser click. */
-    if (getenv("SPIKE_ENTER_GAME")) {
-        uint32_t ss = find_symbol("STATE_Set");
-        if (ss) {
-            spike_call1(ss, 5);
-            host_log("  [test] STATE_Set(5) called\n");
-        }
-    }
-
     g_native_render = find_symbol(
         "Java_com_com2us_wrapper_WrapperRenderer_nativeRender");
     if (!g_native_render) {
@@ -827,6 +818,20 @@ static uint32_t spike_call4(uint32_t fn, uint32_t a0, uint32_t a1, uint32_t a2,
     return g_cpu.r[0];
 }
 
+static uint32_t spike_call3(uint32_t fn, uint32_t a0, uint32_t a1, uint32_t a2)
+{
+    if (!fn)
+        return 0;
+    g_cpu.r[13] = GUEST_STACK_TOP - 0x1000;
+    g_cpu.r[14] = RETURN_SENTINEL;
+    for (int i = 0; i < 13; i++)
+        g_cpu.r[i] = 0;
+    g_cpu.r[0] = a0; g_cpu.r[1] = a1; g_cpu.r[2] = a2;
+    g_cpu.cpsr = 0x10;
+    cpu_run(fn | 1u, g_cpu.r[13], g_insn_count + g_budget / 4);
+    return g_cpu.r[0];
+}
+
 /* Ask RES_LoadToHeap for the first install record by name. It is the single
  * gate every install path funnels through, and it reports its failures as
  * -1/-2/-3, so its return value says whether the failure is "the resource is
@@ -893,6 +898,85 @@ static void spike_dump_install_records(void)
     }
 }
 
+/* The live UI control table.
+ *
+ * `UI_listControl` is a struct instance (not a pointer to one): count at +0xc,
+ * a pointer to the entry array at +0x10, entries 0x2c bytes apart, and per
+ * entry centreX/Y at +0xc/+0x10, width/height at +0x14/+0x18 and the click
+ * callback at +0x28. The PS Vita port reads exactly this for its D-pad menu
+ * navigation (source/wr_touch.c).
+ *
+ * Dumping it answers the question a screenshot cannot: where the engine thinks
+ * its buttons are, as opposed to where they are drawn.
+ */
+static void spike_dump_ui_controls(void)
+{
+    uint32_t lc = elf_find_symbol(&g_img, "UI_listControl");
+    if (!lc) { host_log("  [ui] UI_listControl not found\n"); return; }
+    uint32_t n = LD32(lc + 0xc);
+    uint32_t arr = LD32(lc + 0x10);
+    uint32_t ow = elf_find_symbol(&g_img, "jGetOriginalWidth");
+    uint32_t oh = elf_find_symbol(&g_img, "jGetOriginalHeight");
+    uint32_t sw = elf_find_symbol(&g_img, "SGL_GetScreenWidth");
+    uint32_t sh = elf_find_symbol(&g_img, "SGL_GetScreenHeight");
+    uint32_t dw = elf_find_symbol(&g_img, "SGL_GetDeviceWidth");
+    uint32_t dh = elf_find_symbol(&g_img, "SGL_GetDeviceHeight");
+    host_log("  [ui] UI_listControl count=%u entries=%08x  original=%ux%u\n",
+             n, arr, ow ? spike_call1(ow, 0) : 0u, oh ? spike_call1(oh, 0) : 0u);
+    host_log("  [ui]   SGL screen=%ux%u device=%ux%u orientation=%u\n",
+             sw ? spike_call1(sw, 0) : 0u, sh ? spike_call1(sh, 0) : 0u,
+             dw ? spike_call1(dw, 0) : 0u, dh ? spike_call1(dh, 0) : 0u,
+             elf_find_symbol(&g_img, "SGL_GetScreenOrientation")
+                 ? spike_call1(elf_find_symbol(&g_img, "SGL_GetScreenOrientation"), 0) : 0u);
+    if (!arr || arr >= GUEST_MEM_SIZE || n > 64)
+        return;
+    for (uint32_t i = 0; i < n; i++) {
+        uint32_t e = arr + i * 0x2cu;
+        if (e + 0x2c > GUEST_MEM_SIZE) break;
+        host_log("  [ui]   [%u] state=%08x centre=(%d,%d) size=(%d,%d) "
+                 "click=%08x\n", i, LD32(e),
+                 (int)LD32(e + 0xc), (int)LD32(e + 0x10),
+                 (int)LD32(e + 0x14), (int)LD32(e + 0x18),
+                 LD32(e + 0x28));
+    }
+    /* Drive the list's own event handler with a correctly-scaled point. If a
+     * control activates, the UI path works and the problem is only the
+     * coordinate transform in front of it. */
+    {
+        uint32_t ev = elf_find_symbol(&g_img, "UICONTROLLIST_Event");
+        uint32_t before0 = LD32(arr);
+        if (ev) {
+            spike_call4(ev, lc, 0x18, 233, 141);
+            host_log("  [ui]   UICONTROLLIST_Event(list,0x18,233,141): "
+                     "control0 state %08x -> %08x\n",
+                     before0, LD32(arr));
+        }
+    }
+
+    /* Which coordinate space does the hit-test actually live in? Asking the
+     * engine's own UICONTROL_IsInEventArea, rather than assuming, settles it:
+     * the touch arrives in 960x544, the controls are laid out in 480x320, and
+     * the scale between them is not uniform (x2 across, 544/320 = 1.7 down). */
+    {
+        uint32_t isin = elf_find_symbol(&g_img, "UICONTROL_IsInEventArea");
+        uint32_t e0 = arr + 0x0cu;   /* centreX of entry 0 happens to be here */
+        if (isin) {
+            const struct { const char *what; int x, y; } pts[] = {
+                { "raw touch scaled /2,/1.7", 233, 141 },
+                { "raw touch",                467, 240 },
+                { "control centre",           240, 142 },
+                { "centre*2",                 480, 284 },
+            };
+            for (unsigned k = 0; k < sizeof(pts) / sizeof(pts[0]); k++)
+                host_log("  [ui]   hit(%-24s %3d,%3d) = %u\n", pts[k].what,
+                         pts[k].x, pts[k].y,
+                         spike_call3(isin, arr, (uint32_t)pts[k].x,
+                                     (uint32_t)pts[k].y));
+            (void)e0;
+        }
+    }
+}
+
 /* Which STATE_* the engine is in, by name.
  *
  * STATE_nState is not exported, but STATE_fpEnter is -- and it holds the
@@ -949,6 +1033,17 @@ static void spike_probe_loader(void)
     uint32_t used = pu ? LD32(pu) : 0;
     uint32_t total = pt ? LD32(pt) : 0;
     uint32_t text = tx ? LD32(tx) : 0;
+    /* Must run before the change-detection early-return below, or it only
+     * advances on frames where the loader state happened to change -- which is
+     * none of them once loading is done. */
+    if (g_entered_menu) {
+        g_menu_frame++;
+        /* Repeat, so a click between two dumps shows up as a changed
+         * control state -- which is the difference between "the hit-test
+         * missed" and "the event never got that far". */
+        if (g_menu_frame % 200 == 0 && g_menu_frame <= 2000)
+            spike_dump_ui_controls();
+    }
     if (state == g_probe_prev.state && load_frame == g_probe_prev.load_frame &&
         used == g_probe_prev.pool_used && text == g_probe_prev.ptext)
         return;

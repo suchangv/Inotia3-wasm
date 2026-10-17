@@ -113,6 +113,9 @@ async function main() {
     type, x, y, button: 'left', clickCount: 1,
     buttons: type === 'mouseReleased' ? 0 : 1,
   });
+  const clicks = Number(process.env.CLICKS || 1);
+  for (let k = 0; k < clicks; k++) {
+    if (k) await sleep(1500);
   await mouse('mousePressed', cx, cy);
   // HOLD lets the press land in one engine tick and the release in a later
   // one. A tap entirely inside a single tick is fine for the input protocol
@@ -120,7 +123,8 @@ async function main() {
   // and act on the release need the two separated.
   await sleep(Number(process.env.HOLD || 80));
   await mouse('mouseReleased', cx, cy);
-  console.log(`clicked, waiting ${WAIT}s`);
+  }
+  console.log(`clicked x${clicks}, waiting ${WAIT}s`);
   await sleep(WAIT * 1000);
 
   const r = await send('Page.captureScreenshot', { format: 'png' });
