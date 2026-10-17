@@ -31,6 +31,7 @@
 #include "compat.h"
 #include "timers.h"
 #include "asset_zip.h"
+#include "platform.h"
 
 /* The archive the engine reads its assets out of, and where inside them they
  * live. The archive's *path* comes from host_apk_path() -- see asset_zip.c --
@@ -586,9 +587,14 @@ int jni_host_call(const char *name, uint32_t *args, int nargs, uint32_t *ret_lo,
                     st->implemented = 1; return 1;
                 }
                 if (strcmp(n, "GetUserDir") == 0) {
-                    /* Where the engine puts saves. A directory that exists is
-                     * enough; the browser build backs it with IndexedDB. */
-                    *ret_lo = jni_host_new_string("/data");
+                    /* Where the engine installs its files and puts saves. The
+                     * trailing slash is load-bearing: the engine concatenates
+                     * the package name straight onto it, so "/data" gives
+                     * "/datacom.com2us...", every GAMELOADER_Install fails, and
+                     * the game parks on "File installation error (0)" forever
+                     * (INITSTATE_nState==3, a terminal state). The Vita port
+                     * returns "ux0:data/" for exactly this reason. */
+                    *ret_lo = jni_host_new_string(host_app_data_dir("com.com2us.inotia3.google.global"));
                     st->implemented = 1; return 1;
                 }
                 if (strcmp(n, "GetApkFilePath") == 0 ||

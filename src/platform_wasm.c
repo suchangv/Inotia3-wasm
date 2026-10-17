@@ -316,6 +316,9 @@ uint32_t host_guest_mmap(uint32_t size)
 
 /* Nothing to install: a bad guest access faults the wasm instance, and the
  * driver reports the guest PC from the exported state. */
+const char *host_app_data_dir(const char *package)
+{ (void)package; return "data/"; }
+
 void host_install_crash_handler(void) { }
 
 /* Instruction tracing writes to a file, which does not exist here. Kept as

@@ -1316,9 +1316,33 @@ void host_import_call(guest_import *im)
     }
     case IMPL_open: {
         guest_path(a0, g_path_buf, sizeof(g_path_buf));
-        /* Host and guest both speak stdio; O_RDONLY etc. are compatible
-         * enough that "open for read" is all this needs to decide. */
-        FILE *f = fopen(g_path_buf, "rb");
+        /* Honour the flags. This used to open "rb" unconditionally, which was
+         * invisible while the port only ever read: the first thing that writes
+         * is GAMELOADER_ProcessInstall, and with every create turned into a
+         * read-only open it could not produce a single file. The install then
+         * reports "File installation error (0)", INITSTATE_nState goes to 3 -- a
+         * terminal state with no exit -- and the game sits on the loading screen
+         * forever.
+         *
+         * O_* values are the ARM Linux ones the guest was compiled against. */
+        uint32_t flags = a1;
+        int wr  = (flags & 3u) != 0;        /* O_WRONLY / O_RDWR */
+        int app = (flags & 0x400u) != 0;    /* O_APPEND */
+        int cre = (flags & 0x40u) != 0;     /* O_CREAT  */
+        int tr  = (flags & 0x200u) != 0;    /* O_TRUNC  */
+        const char *mode;
+        if (app)              mode = wr ? "ab" : "ab";
+        else if (cre && wr)   mode = (tr || (flags & 0x80u)) ? "wb" : "r+b";
+        else if (tr)          mode = "wb";
+        else if (wr)          mode = "r+b";
+        else                  mode = "rb";
+        FILE *f = fopen(g_path_buf, mode);
+        /* A create whose "r+b" did not find an existing file still has to
+         * create one; fopen cannot express "create if missing, else update". */
+        if (!f && cre) {
+            f = fopen(g_path_buf, "wb");
+            if (f) { fclose(f); f = fopen(g_path_buf, "r+b"); }
+        }
         note_open(g_path_buf, f != NULL);
         /* Returns 0 on failure, not -1. That is wrong for open(2) -- 0 is a
          * valid descriptor -- but it is what this port did before there was a
@@ -1594,8 +1618,16 @@ void host_file_get_full_path_name(uint32_t name_ptr, uint32_t out_ptr,
         snprintf(buf, sizeof(buf),
                  "/sdcard/Android/data/%s/files/%s",
                  "com.com2us.inotia3.google.global", name);
-    } else if (mode == 0) {
-        snprintf(buf, sizeof(buf), "/data%s/%s",
+    } else if (mode == 0 || mode == 4) {
+        /* Mode 4 is the install target: RES_MoveToFileEx opens the
+         * destination with FILE_Open(name, 4, 1) before writing it, and
+         * GAMELOADER_Install then reopens the same name with mode 8. Both are
+         * "somewhere under the app's writable directory", the same place mode
+         * 0 means -- built from the host's own user dir rather than a
+         * hardcoded prefix, because the engine concatenates the package name
+         * onto that directly and the separator has to come from somewhere. */
+        snprintf(buf, sizeof(buf), "%s%s/%s",
+                 host_app_data_dir("com.com2us.inotia3.google.global"),
                  "com.com2us.inotia3.google.global", name);
     }
 
@@ -1616,7 +1648,13 @@ void host_file_get_full_path_name(uint32_t name_ptr, uint32_t out_ptr,
      * host can actually find -- the resolved archive path, not a bare
      * "assets.apk" that only exists when the working directory happens to be
      * the game directory. */
-    if (!strchr(buf, '@')) {
+    /* Write intent must not be redirected into the archive. Modes 4 and 8 are
+     * how the engine installs its data files; falling back to an archive
+     * offset for those hands File::Open a read-only path, the create fails,
+     * and GAMELOADER_ProcessInstall reports "File installation error" -- which
+     * parks the game on the loading screen forever. */
+    int write_intent = (mode == 4 || mode == 8);
+    if (!write_intent && !strchr(buf, '@')) {
         FILE *probe = fopen(buf, "rb");
         if (probe) {
             fclose(probe);

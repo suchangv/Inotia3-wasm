@@ -205,12 +205,12 @@ static int g_stop_at_resume;
  * tool that quietly does nothing.
  *
  * Returns the reason to report. */
-static int spike_resume_if_stopped(int reason, uint64_t g_budget);
+static int spike_resume_if_stopped(int reason, uint64_t budget);
 
 /* `arg0` is placed in r0 before the entry runs -- JNI_OnLoad expects the
  * JavaVM* there, and the native* entry points expect a JNIEnv*. */
 static run_result run_entry_arg(const char *what, uint32_t entry, uint32_t arg0,
-                                uint64_t g_budget)
+                                uint64_t budget)
 {
     run_result r;
     r.what = what;
@@ -235,7 +235,7 @@ static run_result run_entry_arg(const char *what, uint32_t entry, uint32_t arg0,
 
     uint64_t before = g_insn_count;
     double t0 = host_now();
-    r.reason = cpu_run(entry, g_cpu.r[13], g_insn_count + g_budget);
+    r.reason = cpu_run(entry, g_cpu.r[13], g_insn_count + budget);
     cpu_trace_final();
 
     r.reason = spike_resume_if_stopped(r.reason, g_budget);
@@ -263,7 +263,7 @@ static run_result run_entry_env(const char *what, uint32_t entry, uint64_t g_bud
  * `timer_id` is the opaque handle the guest registered through SetTimer and
  * must be passed back unchanged -- see timers.h. */
 static run_result run_native_render(uint32_t entry, uint32_t timer_id,
-                                    uint64_t g_budget)
+                                    uint64_t budget)
 {
     run_result r;
     r.what = "nativeRender";
@@ -714,6 +714,181 @@ static int spike_boot(void)
 }
 
 
+
+/* ---- loader progress ----------------------------------------------------
+ *
+ * The PS Vita port spent several corridas working out why the game sat on the
+ * loading screen forever (source/patch.c, Corrida 45-48): INITSTATE_nState
+ * reaches 3, a terminal "Memory error" state with no exit transition, when
+ * GAMELOADER_ProcessInstall or ProcessPreLoad fails -- and the engine then
+ * redraws the same message every tick forever, which is exactly what "stuck on
+ * Now Loading" looks like from outside.
+ *
+ * Its cause was a sign-bit bug that this port does not have (its heap sat at
+ * 0x8xxxxxxx, so `-1 < pointer` was false; ours is at 0x02000000). But the
+ * same state machine is running here, so the same numbers answer the same
+ * question -- and unlike the Vita build, every one of these globals is in
+ * .dynsym, so they can be read by name instead of by hardcoded offset.
+ *
+ * Logged only when something changes, so a healthy run says nothing.
+ */
+static struct {
+    uint32_t state, load_frame, pool_used, pool_total, ptext;
+    int ready;
+} g_probe_prev;
+
+/* Call a guest function that takes one integer and returns one. Used only from
+ * the frame boundary, like everything else that enters the guest. */
+static uint32_t spike_call1(uint32_t fn, uint32_t a0)
+{
+    if (!fn)
+        return 0;
+    g_cpu.r[13] = GUEST_STACK_TOP - 0x1000;
+    g_cpu.r[14] = RETURN_SENTINEL;
+    for (int i = 0; i < 13; i++)
+        g_cpu.r[i] = 0;
+    g_cpu.r[0] = a0;
+    g_cpu.cpsr = 0x10;
+    cpu_run(fn | 1u, g_cpu.r[13], g_insn_count + g_budget / 4);
+    return g_cpu.r[0];
+}
+
+static uint32_t spike_call2(uint32_t fn, uint32_t a0, uint32_t a1)
+{
+    if (!fn)
+        return 0;
+    g_cpu.r[13] = GUEST_STACK_TOP - 0x1000;
+    g_cpu.r[14] = RETURN_SENTINEL;
+    for (int i = 0; i < 13; i++)
+        g_cpu.r[i] = 0;
+    g_cpu.r[0] = a0;
+    g_cpu.r[1] = a1;
+    g_cpu.cpsr = 0x10;
+    cpu_run(fn | 1u, g_cpu.r[13], g_insn_count + g_budget / 4);
+    return g_cpu.r[0];
+}
+
+static uint32_t spike_call4(uint32_t fn, uint32_t a0, uint32_t a1, uint32_t a2,
+                            uint32_t a3)
+{
+    if (!fn)
+        return 0;
+    g_cpu.r[13] = GUEST_STACK_TOP - 0x1000;
+    g_cpu.r[14] = RETURN_SENTINEL;
+    for (int i = 0; i < 13; i++)
+        g_cpu.r[i] = 0;
+    g_cpu.r[0] = a0; g_cpu.r[1] = a1; g_cpu.r[2] = a2; g_cpu.r[3] = a3;
+    g_cpu.cpsr = 0x10;
+    cpu_run(fn | 1u, g_cpu.r[13], g_insn_count + g_budget);
+    return g_cpu.r[0];
+}
+
+/* Ask RES_LoadToHeap for the first install record by name. It is the single
+ * gate every install path funnels through, and it reports its failures as
+ * -1/-2/-3, so its return value says whether the failure is "the resource is
+ * not there" or something further down. */
+static void spike_probe_res_load(const char *name)
+{
+    uint32_t fn = elf_find_symbol(&g_img, "RES_LoadToHeap");
+    if (!fn)
+        return;
+    uint32_t str = guest_heap_alloc(96);
+    uint32_t lenp = guest_heap_alloc(8);
+    size_t n = 0;
+    while (name[n] && n < 95) { ST8(str + n, (uint8_t)name[n]); n++; }
+    ST8(str + n, 0);
+    ST32(lenp, 0);
+    uint32_t r = spike_call2(fn, str, lenp);
+    const uint8_t *d = (r && r < GUEST_MEM_SIZE) ? (g_mem + r) : NULL;
+    host_log("  [res] RES_LoadToHeap(\"%s\") -> %08x (%d), length=%u, "
+             "first bytes %02x %02x %02x %02x %02x %02x %02x %02x\n",
+             name, r, (int)r, LD32(lenp),
+             d ? d[0] : 0, d ? d[1] : 0, d ? d[2] : 0, d ? d[3] : 0,
+             d ? d[4] : 0, d ? d[5] : 0, d ? d[6] : 0, d ? d[7] : 0);
+    /* The install path's next step is LZMA_Decode on the payload after the
+     * format byte. Calling it here says whether the decode itself is what
+     * fails, rather than the file write that follows. */
+    uint32_t lz = elf_find_symbol(&g_img, "LZMA_Decode");
+    if (lz && d && d[0] == 1) {
+        uint32_t outp = guest_heap_alloc(8), lenp2 = guest_heap_alloc(8);
+        ST32(outp, 0);
+        ST32(lenp2, 0);
+        uint32_t ok = spike_call4(lz, r + 1, LD32(lenp) - 1, outp, lenp2);
+        host_log("  [res] LZMA_Decode() -> %u, out=%08x len=%u\n",
+                 ok, LD32(outp), LD32(lenp2));
+    }
+}
+
+/* The install table, once. Each 7-byte record is { u16 text id, ..., u8 flags }
+ * and GAMELOADER_ProcessInstall reads the name through MEMORYTEXT_GetText_E --
+ * so resolving the ids here names the exact record that fails. */
+static void spike_dump_install_records(void)
+{
+    uint32_t base = elf_find_symbol(&g_img, "INSTALLBASE_pData");
+    uint32_t cnt  = elf_find_symbol(&g_img, "INSTALLBASE_nRecordCount");
+    uint32_t sz   = elf_find_symbol(&g_img, "INSTALLBASE_nRecordSize");
+    uint32_t gettext = elf_find_symbol(&g_img, "MEMORYTEXT_GetText_E");
+    if (!base || !cnt || !sz)
+        return;
+    uint32_t p = LD32(base);
+    uint32_t n = LD16(cnt) ? ((int16_t)(LD8(cnt) | (LD8(cnt + 1) << 8))) : 0;
+    uint32_t stride = LD16(sz) ? ((int16_t)(LD8(sz) | (LD8(sz + 1) << 8))) : 0;
+    host_log("  [install] %u records, stride %u, at %08x\n", n, stride, p);
+    if (!p || !stride || p >= GUEST_MEM_SIZE)
+        return;
+    for (uint32_t i = 0; i < n && i < 24; i++) {
+        uint32_t r = p + i * stride;
+        if (r + stride > GUEST_MEM_SIZE)
+            break;
+        uint32_t id = LD16(r);
+        uint32_t flags = LD8(r + 6);
+        uint32_t name = gettext ? spike_call1(gettext, id) : 0;
+        host_log("  [install]   [%u] id=%u flags=%02x name=%08x \"%s\"\n",
+                 i, id, flags, name,
+                 (name && name < GUEST_MEM_SIZE) ? (const char *)(g_mem + name) : "");
+    }
+}
+
+static void spike_probe_loader(void)
+{
+    static uint32_t st, lf, pu, pt, tx, ib_n, ib_p, ib_s, sb_n;
+    if (!g_probe_prev.ready) {
+        st = elf_find_symbol(&g_img, "INITSTATE_nState");
+        lf = elf_find_symbol(&g_img, "INITSTATE_LoadFrameCnt");
+        pu = elf_find_symbol(&g_img, "MEM_nUsedPoolSize");
+        pt = elf_find_symbol(&g_img, "MEM_nTotalPoolSize");
+        tx = elf_find_symbol(&g_img, "GAMELOADER_pText");
+        ib_n = elf_find_symbol(&g_img, "INSTALLBASE_nRecordCount");
+        ib_s = elf_find_symbol(&g_img, "INSTALLBASE_nRecordSize");
+        ib_p = elf_find_symbol(&g_img, "INSTALLBASE_pData");
+        sb_n = elf_find_symbol(&g_img, "SYMBOLBASE_nRecordCount");
+        g_probe_prev.ready = 1;
+        g_probe_prev.state = g_probe_prev.load_frame = 0xffffffffu;
+    }
+    uint32_t state = st ? LD8(st) : 0xffffffffu;
+    uint32_t load_frame = lf ? LD32(lf) : 0;
+    uint32_t used = pu ? LD32(pu) : 0;
+    uint32_t total = pt ? LD32(pt) : 0;
+    uint32_t text = tx ? LD32(tx) : 0;
+    if (state == g_probe_prev.state && load_frame == g_probe_prev.load_frame &&
+        used == g_probe_prev.pool_used && text == g_probe_prev.ptext)
+        return;
+    if (state == 1 && g_probe_prev.state != 1) {
+        spike_dump_install_records();
+        spike_probe_res_load("i_character.dat");
+    }
+    g_probe_prev.state = state;
+    g_probe_prev.load_frame = load_frame;
+    g_probe_prev.pool_used = used;
+    g_probe_prev.ptext = text;
+    host_log("  [loader] state=%u frame=%u pool=%u/%u text=\"%.160s\" "
+             "INSTALLBASE(n=%u size=%u p=%08x) SYMBOLBASE(n=%u)\n",
+             state, load_frame, used, total,
+             (text && text < GUEST_MEM_SIZE) ? (const char *)(g_mem + text) : "",
+             ib_n ? LD16(ib_n) : 0u, ib_s ? LD16(ib_s) : 0u,
+             ib_p ? LD32(ib_p) : 0u, sb_n ? LD16(sb_n) : 0u);
+}
+
 /* ---- input -------------------------------------------------------------
  *
  * nativeEvent(JNIEnv *env, jobject clazz, int type, int p1, int p2,
@@ -913,6 +1088,8 @@ static int spike_tick(void)
 
     uint32_t due[TIMER_MAX];
     int ndue = timers_due(g_clock, due, TIMER_MAX);
+    if (ndue)
+        spike_probe_loader();
 
     uint64_t d0 = g_gl_draw_calls;
     uint64_t x0 = 0;
@@ -997,7 +1174,13 @@ int main(int argc, char **argv)
     uint32_t only_entry = 0;
     int frames = 1;
     int timer_id = 0;
-    uint64_t budget = 200u * 1000u * 1000u;
+    /* Instruction budget for one guest entry. It is a runaway guard, not a
+     * frame target -- and GAMELOADER_ProcessInstall legitimately runs the whole
+     * install synchronously inside one call: twelve LZMA-decoded data files,
+     * several hundred million instructions together. Too small a budget stops
+     * the run in the middle of the install, which looks exactly like the engine
+     * hanging. */
+    uint64_t budget = 3000u * 1000u * 1000u;
     int do_init_array = 0, do_jni = 0, do_profile = 1, trace = 0, do_boot = 0;
     (void)timer_id;   /* parsed but never used: the ids come from timers_due() */
 

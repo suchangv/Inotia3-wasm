@@ -27,6 +27,7 @@
 #include <time.h>
 #include <signal.h>
 #include <string.h>
+#include <sys/stat.h>
 #include <unistd.h>
 
 /* ---- crash reporting -----------------------------------------------------
@@ -97,6 +98,21 @@ static void install_segv_handler(void)
 }
 
 /* Called from main() before any guest code runs. */
+/* Relative on the desktop: the engine only needs somewhere writable, and
+ * /data would need root. MEMFS resolves the same relative path under "/". */
+const char *host_app_data_dir(const char *package)
+{
+    static int once;
+    if (!once) {
+        once = 1;
+        mkdir("./data", 0777);                      /* EEXIST is fine */
+        char pkg[128];
+        snprintf(pkg, sizeof(pkg), "./data/%s", package);
+        mkdir(pkg, 0777);
+    }
+    return "./data/";
+}
+
 void host_install_crash_handler(void);
 void host_install_crash_handler(void) { install_segv_handler(); }
 

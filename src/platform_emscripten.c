@@ -20,6 +20,7 @@
 #include <stdlib.h>
 #include <stdarg.h>
 #include <string.h>
+#include <sys/stat.h>
 #include <emscripten.h>
 #include <emscripten/html5.h>
 #include <GLES2/gl2.h>
@@ -239,6 +240,25 @@ int host_browser_gl_setup(void)
     return 1;
 }
 
+
+/* ---- app storage ---------------------------------------------------------
+ *
+ * MEMFS starts with almost nothing, so the directory has to be made before the
+ * engine writes into it. Only the base is created here; the engine mkdirs the
+ * per-package directory itself, through the shim.
+ */
+const char *host_app_data_dir(const char *package)
+{
+    static int once;
+    if (!once) {
+        once = 1;
+        mkdir("/data", 0777);                       /* EEXIST is fine */
+        char pkg[128];
+        snprintf(pkg, sizeof(pkg), "/data/%s", package);
+        mkdir(pkg, 0777);
+    }
+    return "/data/";
+}
 
 /* ---- the main loop -------------------------------------------------------
  *
