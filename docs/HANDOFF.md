@@ -3,20 +3,30 @@
 Everything needed to continue this work. Read this first; `docs/SPIKE.md` has the
 running engineering log and `docs/REUSE.md` the dependency research.
 
-**State as of 2026-10-17 (evening): the game reaches its main menu in the
-browser.**
+**State as of 2026-10-17 (night): the game reaches gameplay — world map, character
+and HUD — in the native runner and in the browser.**
 
 ```
-boot -> Google Play splash -> com2uS splash -> "Now Loading" -> title -> MAIN MENU
+boot -> splash -> "Now Loading" -> MAIN MENU
+     -> NEW GAME -> save-slot screen -> class screen
+     -> opening event (SKIP) -> GAMEPLAY
 ```
 
 The main menu is fully rendered — NEW GAME / CONTINUE / OST & CREDIT / MORE
-GAMES, the NOTICE and HIVE corners, every button's ornate frame. That means the
-whole chain below it works: asset install, LZMA unpacking, PNG decode, fonts,
-UI rendering, the state machine, and the renderer.
+GAMES, the NOTICE and HIVE corners, every button's ornate frame — and gameplay
+draws the village map, the character, an NPC, the minimap and the button ring.
+The chain above runs end to end in both hosts: asset install, **the game
+loader's 34 stages**, LZMA unpacking, PNG decode, fonts, UI rendering, the state
+machine, and the renderer.
 
-**The one blocker left: touches reach the engine but the UI does not act on
-them.** See "The immediate next task".
+Reaching gameplay is two steps. The class confirm drops into the opening event
+(`GAMESTATE_nState` 13 — a black screen with a **SKIP** control at the top
+right), and two presses on SKIP land in the play state (`GAMESTATE_nState` 2,
+where every "return to gameplay" path lands), which draws the map. One SKIP
+press is not enough, and taps elsewhere never leave the event.
+
+**Nothing blocks reaching gameplay.** See "The immediate next task" for the
+loose ends (audio, the save round-trip, and the unusable `difftest.sh`).
 
 ### What is already proven
 
@@ -58,7 +68,7 @@ clicking, and `HOLD=<ms>` to separate press from release.
 **Headless `--screenshot` cannot reach the menu**: `--virtual-time-budget`
 expires after a couple of dozen engine ticks. Use `watch_run.mjs`, which drives
 a real browser and screenshots at intervals. At the current interpreter speed
-the menu arrives around frame 2800, i.e. ~2.5 minutes in.
+the menu arrives around frame 990, i.e. ~1.5 minutes in.
 
 `main()` is split into `spike_load` / `spike_boot` / `spike_tick` /
 `spike_finish`. The CLI keeps a synchronous loop over `spike_tick`; the browser
@@ -155,6 +165,32 @@ engine state was correct throughout. The two measurements that found it were the
 `__fixdfsi` results of the two scales — x gave 233, y gave 0 — and a direct
 `__muldf3` unit call from the frame boundary.
 
+### Progress since that (2026-10-17, the loader-skip hang)
+
+**The game enters gameplay.** Tapping a save slot then hung the run — one frame
+burned the whole 3e9-instruction budget — and the loop turned out to be a
+consequence of the *runner*, not the engine. The forced handoff to the menu in
+`spike_probe_loader` fired on the transition into `INITSTATE_nState == 2`, but 2
+is the **loading** state from its first frame, so the handoff skipped all 34
+`GAMELOADER_ProcessLoad` stages — including `CHARSYSTEM_Create` at stage 5. That
+left `CHARSYSTEM_pPool` NULL, and the first save-slot tap died in
+`CHARSYSTEM_RemoveMap`, which walks that pool unconditionally: a null base made
+it read the zero page as characters, and `CHAR_Destroy` then drained a bogus
+two-node actor list in `ACTPOOL_FreeList` forever.
+
+The fix waits for the counter the loader stops at (`INITSTATE_LoadFrameCnt ==
+0x22`) — the same point the engine itself leaves the load, where the Vita port's
+Corrida 87 puts its handoff. The chain then runs `NEW GAME → MAINMENU_EventSlot →
+STATEMAINMENU_EnterSelectClass → STATE_Set(7) → STATE_ProcessGame` (the opening
+event, `GAMESTATE_nState` 13) → two SKIP presses → the play state
+(`GAMESTATE_nState` 2), which draws the map. Full write-up in `docs/SPIKE.md`,
+"the slot screen that never left".
+
+Two things worth knowing from this: the `frame=N` in the `[loader]` log line
+**is** the load stage (`INITSTATE_LoadFrameCnt` doubles as the GAMELOADER stage
+counter), and `--tap=frame,x,y` (device pixels) drives the whole chain in a
+headless native run.
+
 ---
 
 ## What this is
@@ -242,7 +278,8 @@ tools/build.sh native             # -> build/spike        (fast iteration)
 ```
 
 Flags: `--boot` (constructors → JNI_OnLoad → nativePreInit → nativeInit →
-UserAgreeCallback → resumes → nativeRender frames) · `--frames=N` · `--trace`
+UserAgreeCallback → resumes → nativeRender frames) · `--frames=N` ·
+`--tap=frame,x,y` (inject a tap at a frame; device pixels) · `--trace`
 (last 96 instructions, dumped on a fault) · `--jni-verbose` · `--oracle` ·
 `--dump-guest=FILE` · `--trace-insns=FILE` · `--watch=ADDR`
 
@@ -284,47 +321,69 @@ conditions you meant it to run under.**
 
 ## The immediate next task
 
-**Get past the slot screen and into gameplay, then take it to the browser.**
+**Nothing blocks reaching gameplay. These are the loose ends.**
 
-The touch hop that headed this section is done (see the progress note above and
-`docs/SPIKE.md`): a tap on NEW GAME now fires `MAINMENU_EventNewgame` and swaps
-the 9-control main menu for the 5-control slot screen. What is left is the screen
-*after* that.
+Gameplay is confirmed in both hosts — the native runner and the browser — with
+the map, the character, the HUD and the minimap drawn. What is left is adjacent:
 
-What the probe in `spike_dump_ui_controls()` reports (it runs 20 frames after the
-menu appears, with no flag needed):
+- **Audio.** The engine opens its audio files; nothing is mixed yet.
+- **The opening event leaves only on SKIP, and it needs two presses.** The class
+  confirm drops into `GAMESTATE_nState` 13 (a black screen with a **SKIP**
+  control at the top right, UI centre `(449,17)`). One SKIP press is not enough:
+  two SKIP presses (any spacing tried, ~200..1000 frames apart) reach the play
+  state `GAMESTATE_nState` 2, which draws the map; taps elsewhere never leave it.
+  A device probably also ends it on a timer or on a tap anywhere; if the port
+  needs that, the event system (`EVTSYSTEM_*`) is where to look.
+- **A save slot.** After entering play the log still shows `save0.dat` missing.
+  That may be correct (nothing is saved until the player saves), but confirm a
+  new-game save round-trips.
+- **`tools/difftest.sh`** — the oracle is still unusable; see "The differential
+  oracle" below.
+
+To reproduce the native chain (device pixels, one tap per line):
 
 ```
-[ui] UI_listControl count=9 entries=019d311c  original=480x320
-[ui]   [0] state=0 centre=(240,142) size=(233,48) click=010ba031   <- NEW GAME
-[ui]   [1] ...                                                     <- CONTINUE
-[ui]   SGL screen=480x320 device=960x544 orientation=0
-[ui]   hit(233,141) = 1     hit(467,240) = 0
+tools/build.sh native
+./build/spike game/libgame.so --boot --frames=6500 --no-profile \
+    --tap=1500,467,240 \
+    --tap=2000,480,151 \
+    --tap=2400,136,459 \
+    --tap=2800,480,359 \
+    --tap=5000,860,60 \
+    --tap=5600,860,60
 ```
 
-So, with the arithmetic fixed:
+And the screen geometry, straight from `spike_dump_ui_controls()`:
+
+```
+main menu     (9 controls): [0]     centre=(240,142)   size=(233,48)  click=010ba031  <- NEW GAME
+slot screen   (5 controls): [0..2]  centre=(240,89/171/253) size=(288,80) click=010bb779
+class screen (11 controls): [0..5]  centre=(68..408,270) size=(68,50)  click=010bc671
+                            [9]     centre=(240,211)   size=(100,40)  click=010bc665  <- confirm
+opening event (2 controls): [1]     centre=(449,17)    size=(80,50)                  <- SKIP
+```
 
 - **The UI lives in 480x320**, the canvas is 960x544, and the split is
   non-uniform — x2 across, 544/320 = 1.7 down. The engine applies that itself in
   `EventHandler_Wrapper` from the `g_zoom_rate_*` globals, so the input layer must
-  **not** pre-scale. The earlier plan to "send touches in UI space" would now
-  double-scale; it was only ever attractive because the engine's own scale was
-  broken.
-- **A correctly-scaled touch hits.** `UICONTROL_IsInEventArea` — the engine's own
-  hit-test — returns 1 for (233,141) and 0 for the raw (467,240). The control
-  rectangles and the hit-test were never the problem.
-- **The controls' callbacks are named**: `MAINMENU_EventNewgame` / `_Continue` /
-  `_Credit` / `_TermsOfUse` on the menu, `MAINMENU_EventSlot` on the slot screen.
-  Calling `MAINMENU_EventNewgame()` from the frame boundary returns cleanly but
-  does **not** advance the screen: the advance needs the callback *plus* the next
-  `MAINMENU_Process` tick. Inject a real event through `nativeEvent` instead of
-  calling the callback.
+  **not** pre-scale. Device coords are `2 * UI.x` across and `UI.y / 0.588` down,
+  which is what `--tap` takes and what `tools/click_at.mjs` maps the browser
+  clicks onto.
+- **A tap has to go through `nativeEvent`, not the callback.** Calling
+  `MAINMENU_EventNewgame()` from the frame boundary returns cleanly but does not
+  advance the screen: the advance needs the callback *plus* the next `Process`
+  tick. `--tap` injects `INPUT_DOWN` then `INPUT_UP` through the real path.
+- **The handoff fires on `INITSTATE_LoadFrameCnt == 0x22`**, not on the enter of
+  the loading state — see the progress note. `INITSTATE_LoadFrameCnt` is the
+  loader stage, so a change to the loader length would move this number.
+- **A game screen is not the outer state.** `STATE_fpProcess` stays
+  `STATE_ProcessGame` throughout; the screens are `GAMESTATE_nState`, switched by
+  `GAMESTATE_SetState`. `2` is the play state (the target of every "return to
+  gameplay" path); `13` is the opening event.
 
-The tap injector and the bounded register probe that found the bug were removed
-again, per the ground rule that diagnostics do not stay. To rebuild the injector:
-once the menu is up, call `spike_dispatch_event(INPUT_DOWN, 1, (x << 16) | y, 1)`
-and then the same with `INPUT_UP` — that is the real `nativeEvent` →
-`EventHandler_Wrapper` → `handleCletEvent` path.
+The register probes used to find the loader-skip hang were removed again, per the
+ground rule that diagnostics do not stay; `src/cpu.c` is byte-identical to
+`530571b`.
 
 ### Superseded: the engine-side theories (all wrong)
 

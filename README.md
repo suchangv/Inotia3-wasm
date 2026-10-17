@@ -64,15 +64,22 @@ host layer — fetch, WebGL, IDBFS — lands.)
 
 ```sh
 tools/build.sh native          # -> build/spike
-tools/build.sh wasm            # -> build/spike_freestanding.wasm
+tools/build.sh browser         # -> build/spike.{html,js,wasm,data}
 
 mkdir -p game && cp /path/to/libgame.so game/
-./build/spike game/libgame.so --init-array --all --trace
+./build/spike game/libgame.so --boot --frames=4200 --no-profile
+
+# drive the menus headlessly -- device (canvas) pixels, one tap per line
+./build/spike game/libgame.so --boot --frames=4200 --no-profile \
+    --tap=1500,467,240 --tap=2000,480,151 \
+    --tap=2400,136,459 --tap=2800,480,359
 ```
 
-Options: `--init-array` run static constructors · `--jni` call `JNI_OnLoad` ·
-`--all` both · `--budget=N` instruction cap · `--no-profile` · `--trace` record
-the last 96 instructions and dump them on a fault.
+Options: `--boot` run the game's own startup (JNI, assets, frames) ·
+`--frames=N` stop after N frames · `--tap=frame,x,y` inject a tap at a frame ·
+`--init-array` run static constructors · `--jni` call `JNI_OnLoad` · `--all`
+both · `--no-profile` · `--trace` record the last 96 instructions and dump them
+on a fault.
 
 ## Game files are not in this repository
 
@@ -82,10 +89,11 @@ distributed here.
 
 ## Status
 
-Working: ELF load and relocation, the full import table, the guest heap, and
-Thumb-1 execution to the point where the static constructors run real engine
-code. In progress: the ARM decoder, which sits on the path of every host
-crossing. Not started: JNI, GLES1, audio, assets, the browser host.
+The game boots to its main menu and, with a tap, into gameplay — asset install,
+the game loader's 34 stages, LZMA unpacking, PNG decode, fonts, UI rendering and
+the renderer all run. The interpreter covers Thumb-1 and ARM; the import table,
+the JNI environment, the guest heap and the GLES1 state layer are in place.
+Audio is not wired up. The browser host builds and reaches the menu.
 
-Details, including the five interpreter bugs found so far and how, are in
-[`docs/SPIKE.md`](docs/SPIKE.md).
+Details — the interpreter bugs found and how, plus the current state — are in
+[`docs/HANDOFF.md`](docs/HANDOFF.md) and [`docs/SPIKE.md`](docs/SPIKE.md).

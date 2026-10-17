@@ -104,12 +104,34 @@ static double   g_last_now_ms;
 static int      g_entered_menu;
 static int      g_menu_frame;
 
+/* Scripted taps for the CLI: --tap=frame,x,y, repeatable; x/y are *device*
+ * (canvas) pixels, exactly what the page passes. The native runner otherwise
+ * has no way to press a button, and the browser is far too slow to iterate
+ * against -- this is what drives the menu -> slot -> class -> game chain in a
+ * headless run. The taps are injected at the frame boundary, before that
+ * frame's input poll, so they take the same path a real pointer event does. */
+static struct { int frame, x, y; } g_taps[16];
+static int g_ntaps;
+static int g_tap_next;
+
 static int spike_load(const char *path);
 static int spike_boot(void);
 static int spike_tick(void);
 static int spike_tick_browser(void);
 static void spike_finish(void);
 static uint32_t spike_call1(uint32_t fn, uint32_t a0);
+static void spike_dispatch_event(int type, int p1, int p2, int touch_count);
+
+static void spike_scripted_taps(void)
+{
+    while (g_tap_next < g_ntaps && g_taps[g_tap_next].frame <= g_frames_done) {
+        int x = g_taps[g_tap_next].x, y = g_taps[g_tap_next].y;
+        host_log("  [tap] frame %d at device (%d,%d)\n", g_frames_done, x, y);
+        spike_dispatch_event(INPUT_DOWN, 1, (x << 16) | y, 1);
+        spike_dispatch_event(INPUT_UP,   1, (x << 16) | y, 1);
+        g_tap_next++;
+    }
+}
 
 
 /* Guest address of the jlong sysTime[1] handed to nativeInit(). The guest reads
@@ -1060,7 +1082,7 @@ static void spike_probe_loader(void)
         spike_dump_install_records();
         spike_probe_res_load("i_character.dat");
     }
-    /* Once the install finishes, hand off to the Menu state directly.
+    /* Once the game loader finishes, hand off to the Menu state directly.
      *
      * This is the same thing the PS Vita port does, for the same reason: the
      * title screen's "any touch to continue" handler re-decides on every tap
@@ -1070,9 +1092,15 @@ static void spike_probe_loader(void)
      * entered, so the title is never on the path at all. Ours does the same at
      * the equivalent point: the load completing.
      *
-     * This is not a substitute for making the title's own tap work; it is the
-     * step that shows whether everything downstream of it renders. */
-    if (state == 2 && g_probe_prev.state != 2 && !g_entered_menu) {
+     * The trigger has to be the load *finishing*, not the load *beginning*.
+     * `state == 2` is the loading state from its first frame, so firing on the
+     * transition into it skipped all 34 loader stages -- including
+     * CHARSYSTEM_Create at stage 5 -- and left CHARSYSTEM_pPool NULL. The
+     * first save-slot tap then died in CHARSYSTEM_RemoveMap, which walks that
+     * pool unconditionally (null base -> the null guard region read as
+     * characters -> an endless create/destroy loop in ACTPOOL_FreeList).
+     * INITSTATE_LoadFrameCnt is the counter the loader stops at (0x22). */
+    if (state == 2 && load_frame >= 0x22 && !g_entered_menu) {
         uint32_t ss = elf_find_symbol(&g_img, "STATE_Set");
         if (ss) {
             g_entered_menu = 1;
@@ -1265,6 +1293,7 @@ static int spike_tick(void)
 {
     /* Input first, then the timers, so the engine sees this frame's input
      * during this frame's render. Same order as the Vita port's loop. */
+    spike_scripted_taps();
     input_poll();
 
     /* ---- the clock ----
@@ -1441,6 +1470,17 @@ int main(int argc, char **argv)
             host_log("--probe needs a GUEST_CHECK build\n");
 #endif
         }
+        else if (strncmp(argv[i], "--tap=", 6) == 0) {
+            /* Format: --tap=frame,x,y (device pixels). See g_taps. */
+            int fr = 0, tx = 0, ty = 0;
+            if (sscanf(argv[i] + 6, "%d,%d,%d", &fr, &tx, &ty) == 3 &&
+                g_ntaps < (int)(sizeof(g_taps) / sizeof(g_taps[0]))) {
+                g_taps[g_ntaps].frame = fr;
+                g_taps[g_ntaps].x = tx;
+                g_taps[g_ntaps].y = ty;
+                g_ntaps++;
+            }
+        }
         else if (strcmp(argv[i], "--oracle") == 0)
             g_oracle_mode = 1;
         else if (strncmp(argv[i], "--dump-guest=", 13) == 0)
@@ -1476,7 +1516,8 @@ int main(int argc, char **argv)
 #endif
 #if !defined(WASM_FREESTANDING)
     if (!path) {
-        host_log("usage: spike <libgame.so> [--all] [--g_budget=N] [--no-profile]\n");
+        host_log("usage: spike <libgame.so> [--boot] [--frames=N] [--tap=frame,x,y]\n"
+                 "             [--all] [--g_budget=N] [--no-profile]\n");
         return 2;
     }
 #endif

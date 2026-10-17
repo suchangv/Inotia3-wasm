@@ -35,9 +35,9 @@ diffed against this one instruction by instruction.
 | Differential oracle | **working** — `tools/difftest.sh`, all entries identical |
 | Boot sequence | **completes** — ctors, JNI_OnLoad, nativePreInit, nativeInit, both resumes, nativeRender |
 | Assets | **working** — offsets delivered, `File::Open` opens the archive, bytes are mmapped |
-| PNG decode | **in progress** — zlib header validated; `inflate` fails in the Huffman body |
-| First real frame | **blocked** — on PNG `inflate`, see below |
-| Browser host | not started |
+| PNG decode | **done** — menu art and world textures decode |
+| First real frame | **done** — the menu and gameplay both render |
+| Browser host | **working** — reaches the menu and gameplay; see HANDOFF |
 
 `ctor[3]` now reaches the import stubs and the host crossings count is
 non-zero (16 across the constructors: `__aeabi_atexit`, `memcpy`, `malloc`,
@@ -398,3 +398,59 @@ for `UMULL`/`UMLAL`. That false note is what let this one hide.
 `MAINMENU_EventNewgame`: the UI list changes from the 9-entry main menu to the
 5-entry slot screen (`MAINMENU_EventSlot` callbacks), while a no-tap control run
 stays on the 9-entry menu. The UI acts on touch.
+
+## Session log — 2026-10-17, the slot screen that never left
+
+**Symptom.** With the touch fix in, tapping a save slot hung the run: one frame
+consumed the entire 3e9-instruction budget and stopped the loop. No trap, no
+output change — the menu was still the last thing drawn.
+
+**Where the time went.** Dropping `--no-profile` answered it in one run:
+`ACT_Initialize` 673M instructions, `ACTPOOL_PopHead` and `ACTPOOL_Free` 551M
+each, `ACTPOOL_AddHead` and `ACTPOOL_FreeList` 367M each. A PC histogram (one
+sample per ~4M instructions, temp) put the whole loop inside 18 instructions of
+the actor-pool API. A guest backtrace at the stop named the chain:
+`STATEMAINMENU_EnterSelectClass → MAP_Load → CHARSYSTEM_RemoveMap →
+CHARSYSTEM_Free → CHAR_Destroy → ACTPOOL_FreeList`.
+
+**Root cause.** `ACTPOOL_FreeList` pops nodes off a list until the head is NULL.
+A probe at its loop point showed the head oscillating between `0x448` and
+`0x17f0` and never NULL — both are in the **null-guard** region, not the heap.
+`CHARSYSTEM_RemoveMap` reads the character array through `*CHARSYSTEM_pPool`
+with no NULL check, and `CHARSYSTEM_pPool` was **0**, so the walk started at
+guest address 0, read the zero page as characters, and called `CHARSYSTEM_Free`
+on garbage whose `+0x1e0` "actor list" was two low-memory words that
+`ACTPOOL_Free` kept re-linking into a two-node cycle. A GUEST_CHECK write-watch
+on `CHARSYSTEM_pPool` confirmed it was **never** written.
+
+**The real bug: the runner skipped the game loader.** `CHARSYSTEM_pPool` is
+created by `GAMELOADER_ProcessLoad`, stage 5 of 34, driven from the init state.
+The runner's forced handoff to the menu (`spike_probe_loader`) fired on the
+transition into `INITSTATE_nState == 2` — but 2 is the *loading* state from its
+very first frame, so the handoff happened before a single stage ran. (The
+counter in the `[loader]` line, `INITSTATE_LoadFrameCnt`, **is** the loader's
+own stage: it climbs 1..34, and the engine leaves the load by calling
+`STATE_Set(4)` when it reaches 0x22.) The fix waits for `0x22`.
+
+**After the fix.** `NEW GAME → slot → class → confirm` enters the game
+(`GAMESTATE_nState` 13, the opening event) and the run no longer trips the
+budget. `--tap=frame,x,y` drives that headlessly; see HANDOFF.
+
+**Then the event.** The class confirm lands on the opening *event*: a black
+screen with a **SKIP** control at the top right (`GAMESTATE_nState` 13). It is
+`GAMESTATE_EnterEvent`, and it builds a two-entry `UICONTROLLIST` — a
+full-screen "advance" control and the SKIP button at UI centre `(449,17)`, size
+`(80,50)`. Only SKIP leaves it, and it takes **two** SKIP presses: one press
+alone does nothing, taps elsewhere do nothing, but two SKIPs (spacings from
+~200 to ~1000 frames all worked) move to `GAMESTATE_nState` 2 and the draw count
+jumps from 5 to 32 quads per frame. `GAMESTATE` 2 is the play state —
+`SetState(2)` is what every "return to gameplay" path calls — and
+`SGL_FrameBufferToScreen` then composites the offscreen frame each tick at ~98%
+painted. The browser needed the same SKIP at device `(898,29)`; my first attempt
+used `(805,30)`, which is just outside the button's left edge at UI x 409, and it
+did nothing.
+
+**Note the shape, again.** The engine's own code was correct; the *harness* was
+wrong (it took a policy shortcut at the wrong moment). Two sessions' worth of
+"is the interpreter broken?" is a reminder to check what the runner did before
+suspecting the guest.
