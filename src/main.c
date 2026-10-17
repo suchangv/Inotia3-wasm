@@ -937,8 +937,20 @@ static int spike_tick(void)
     for (int i = 0; i < g_nimports; i++)
         x1 += g_imports[i].calls;
 
-    if (reason == HALT_BAD_PC)
-        host_log("  frame %3d : pc ran to %08x\n", g_frames_done, g_cpu.r[15]);
+    if (reason == HALT_BAD_PC) {
+        host_log("  frame %3d : pc ran to %08x (lr=%08x)\n",
+                 g_frames_done, g_cpu.r[15], g_cpu.r[14]);
+        /* A null PC means the guest called through a null function pointer --
+         * the signature of a subsystem that was never initialised. LR names the
+         * call site, and the stack scan names the chain above it. */
+        if (g_cpu.r[15] == 0) {
+            uint32_t at = 0;
+            const char *nm = elf_nearest_sym(&g_img, g_cpu.r[14] & ~1u, &at);
+            host_log("  [null-call] caller %s+0x%x\n",
+                     nm ? nm : "?", nm ? (g_cpu.r[14] & ~1u) - at : 0);
+            guest_backtrace("null call");
+        }
+    }
     host_log("  frame %3d : %9llu instrs  %7.2f ms  %6.2f MIPS"
              "  timers=%d draw=%llu host_calls=%llu  -> %s\n",
              g_frames_done, (unsigned long long)frame_insns,

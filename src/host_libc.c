@@ -43,6 +43,9 @@ typedef struct {
 #define HDR_SZ   ((uint32_t)((sizeof(blk_hdr) + 7u) & ~7u))
 #define ALIGN8(n) (((n) + 7u) & ~7u)
 
+/* Written into a freed block's first word. See heap_free(). */
+#define HEAP_POISON 0xDEADBEEFu
+
 /* The import currently being serviced. A shim that rejects its arguments has
  * the caller's LR to report, but that names the guest instruction and not the
  * API -- and "free() was called with a bad pointer" reads very differently
@@ -200,6 +203,20 @@ static void heap_free(uint32_t ptr)
         return;
     }
     h->size |= BLK_FREE;
+    /* Clobber the first word of the payload.
+     *
+     * A freed block is not the caller's memory any more, and leaving it
+     * readable makes a use-after-free silently return stale data -- which is
+     * worse than crashing, because it looks like a wrong answer from live code.
+     * Real allocators do this too: dlmalloc's smallest bins put the free-list
+     * link in the first word of the payload, which is why code that reads a
+     * freed node's first field usually gets away with it on Android and not
+     * here.
+     *
+     * The engine has exactly such a read: TM_Run removes a dead timer, frees
+     * the node, and then re-examines that node's id. Left intact, the id still
+     * matches, so it frees the same node again -- forever. */
+    *(uint32_t *)(g_mem + ptr) = HEAP_POISON;
 
     /* Coalesce forward.
      *

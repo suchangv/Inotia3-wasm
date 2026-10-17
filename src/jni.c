@@ -91,6 +91,32 @@ static uint32_t handle_new(int kind)
     return 0;
 }
 
+/* Reuse an existing handle for the same thing, or 0.
+ *
+ * JNI guarantees that the methodID for a given (class, name, signature) is the
+ * same id every time, and the engine leans on that: it resolves the same
+ * handful of methods on every frame, thousands of times over a run. Minting a
+ * fresh handle per call fills the 512-entry table, and then the guest gets a
+ * null methodID -- which is what "the game stops on some screen" turned out to
+ * be. Any field left NULL is not matched on. */
+static uint32_t handle_find(int kind, const char *cls, const char *name,
+                            const char *sig)
+{
+    for (int i = 1; i < JNI_MAX_HANDLES; i++) {
+        jni_handle *o = &g_handles[i];
+        if (o->kind != kind)
+            continue;
+        if (cls && strcmp(o->cls, cls))
+            continue;
+        if (name && strcmp(o->name, name))
+            continue;
+        if (sig && strcmp(o->sig, sig))
+            continue;
+        return JNI_HANDLE_BASE | (uint32_t)i;
+    }
+    return 0;
+}
+
 static jni_handle *handle_of(uint32_t h)
 {
     if ((h & 0xF0000000u) != JNI_HANDLE_BASE)
@@ -249,6 +275,9 @@ static jni_stat *stat_for(const char *name)
 
 static uint32_t do_FindClass(const char *name)
 {
+    uint32_t found = handle_find(H_CLASS, name, NULL, NULL);
+    if (found)
+        return found;
     uint32_t h = handle_new(H_CLASS);
     jni_handle *o = handle_of(h);
     size_t n = 0;
@@ -348,10 +377,18 @@ int jni_host_call(const char *name, uint32_t *args, int nargs, uint32_t *ret_lo,
     }
     if (strcmp(fn, "GetMethodID") == 0 || strcmp(fn, "GetStaticMethodID") == 0) {
         jni_handle *c = handle_of(a1);
-        uint32_t h = handle_new(H_METHOD);
-        jni_handle *m = handle_of(h);
         read_guest_str(a2, s2, sizeof(s2));
         read_guest_str(a3, s3, sizeof(s3));
+        if (c) {
+            uint32_t found = handle_find(H_METHOD, c->cls, s2, s3);
+            if (found) {
+                *ret_lo = found;
+                st->implemented = 1;
+                return 1;
+            }
+        }
+        uint32_t h = handle_new(H_METHOD);
+        jni_handle *m = handle_of(h);
         if (c) memcpy(m->cls, c->cls, sizeof(m->cls));
         size_t n = 0;
         while (s2[n] && n < sizeof(m->name) - 1) { m->name[n] = s2[n]; n++; }
@@ -363,10 +400,18 @@ int jni_host_call(const char *name, uint32_t *args, int nargs, uint32_t *ret_lo,
     }
     if (strcmp(fn, "GetFieldID") == 0 || strcmp(fn, "GetStaticFieldID") == 0) {
         jni_handle *c = handle_of(a1);
-        uint32_t h = handle_new(H_FIELD);
-        jni_handle *f = handle_of(h);
         read_guest_str(a2, s2, sizeof(s2));
         read_guest_str(a3, s3, sizeof(s3));
+        if (c) {
+            uint32_t found = handle_find(H_FIELD, c->cls, s2, s3);
+            if (found) {
+                *ret_lo = found;
+                st->implemented = 1;
+                return 1;
+            }
+        }
+        uint32_t h = handle_new(H_FIELD);
+        jni_handle *f = handle_of(h);
         if (c) memcpy(f->cls, c->cls, sizeof(f->cls));
         size_t n = 0;
         while (s2[n] && n < sizeof(f->name) - 1) { f->name[n] = s2[n]; n++; }

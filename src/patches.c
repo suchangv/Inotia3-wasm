@@ -149,22 +149,41 @@ static int patch_vm_caches(const guest_image *img)
                 continue;
             uint32_t x = h3 & 7;
 
-            /* ldr rY, [rX] -- the vtable, again with no displacement. */
-            uint32_t h4 = LD16(pc + k + 4);
-            if ((h4 & 0xF800) != 0x6800 || ((h4 >> 3) & 7) != x ||
-                ((h4 >> 6) & 0x1f) != 0)
-                continue;
-            uint32_t y = h4 & 7;
-
-            /* ldr rZ, [rY, #imm] -- a method out of that vtable. */
-            uint32_t h5 = LD16(pc + k + 6);
-            if ((h5 & 0xF800) != 0x6800 || ((h5 >> 3) & 7) != y)
-                continue;
-            uint32_t z = h5 & 7;
-
-            /* blx rZ -- and it has to actually be called. */
-            uint32_t h6 = LD16(pc + k + 8);
-            if ((h6 & 0xFF87) != 0x4780 || ((h6 >> 3) & 0xf) != z)
+            /* ldr rY, [rX] -- the vtable, again with no displacement -- then a
+             * method out of it, then a call through that.
+             *
+             * These three are not always adjacent: the call's own arguments
+             * are loaded in between. CS_MercurySetIsUsingStaging puts
+             * `ldr r2,[pc]` (the JNI version) between the vtable load and the
+             * method load, and requiring strict adjacency missed it -- which
+             * left a cached JavaVM slot null and made the guest branch through
+             * a null GetEnv partway through the splash. Allow a small window,
+             * scanning forward, but still require the `blx`: a cached JavaVM
+             * exists to be called through, and that is what separates it from
+             * an intrusive list head. */
+            uint32_t y = 0, z = 0;
+            int matched = 0;
+            for (uint32_t j = k + 4; j <= k + 12 && !matched; j += 2) {
+                uint32_t h4 = LD16(pc + j);
+                if ((h4 & 0xF800) != 0x6800 || ((h4 >> 3) & 7) != x ||
+                    ((h4 >> 6) & 0x1f) != 0)
+                    continue;
+                y = h4 & 7;
+                for (uint32_t m = j + 2; m <= j + 6 && !matched; m += 2) {
+                    uint32_t h5 = LD16(pc + m);
+                    if ((h5 & 0xF800) != 0x6800 || ((h5 >> 3) & 7) != y)
+                        continue;
+                    z = h5 & 7;
+                    for (uint32_t n = m + 2; n <= m + 6; n += 2) {
+                        uint32_t h6 = LD16(pc + n);
+                        if ((h6 & 0xFF87) != 0x4780 || ((h6 >> 3) & 0xf) != z)
+                            continue;
+                        matched = 1;
+                        break;
+                    }
+                }
+            }
+            if (!matched)
                 continue;
 
             found++;
