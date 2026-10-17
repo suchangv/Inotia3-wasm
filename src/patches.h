@@ -28,9 +28,11 @@ int patches_replace_with_import(const guest_image *img, const char *symbol,
 
 /* The frame period the engine is asked to run at, in ms. APPINFO_Initialize
  * hardcodes 66 ms (15 fps); patches_apply rewrites that immediate to this
- * unless it is 0 or 66. Set from --frame-ms= on the command line and from
- * ?framems= in the browser. See patch_frame_period() in patches.c for why this
- * is a knob and what to check after moving it. */
+ * unless it is 0 or 66. It is 0 by default, because the engine's frame period
+ * is the game's speed -- the world advances once per frame -- so moving it
+ * accelerates the game. Set from --frame-ms= on the command line and from
+ * ?framems= in the browser, to measure rather than to ship. See
+ * patch_frame_period() in patches.c. */
 extern int g_frame_period_ms;
 
 #endif /* PATCHES_H */

@@ -193,31 +193,45 @@ headless native run.
 
 ### Progress since that (2026-10-18, the frame rate)
 
-**Gameplay runs at 58.5 fps in the browser** (13.5 before), and the two causes
-were unrelated:
+**Gameplay now holds the engine's own rate in the browser: 15.0 engine frames per
+second, up from 11.9.** Three causes, none of them the interpreter:
 
 * **The host log sink.** The generated page's `Module.print` appended every
   engine log line to `<textarea id="output">` and then forced
   `scrollTop = scrollHeight` — a DOM reflow per frame on a string that only
   grows (237,364 characters by the time gameplay started). It cost 47.6 ms of
-  every 60 ms animation frame on the idle menu. `tools/page-options.js` now
-  routes `Module.print`/`printErr` to the console, where emscripten binds its
-  stdout sink once at module init, before `--pre-js` runs. Boot to the menu went
-  89 s -> 23 s, and to gameplay it is now ~12 s.
-* **The engine's own frame period.** `MainProcess`, the callback `g_MainTimer`
-  dispatches, re-arms itself at `APPINFO_nTimer - (work it just did)`, and
-  `APPINFO_Initialize` hardcodes `APPINFO_nTimer = 66 ms` — 15 fps, by design,
-  on every path through that function. `patches.c` now rewrites that immediate
-  (scanning for it by symbol, not by address) to 16 ms, and takes the value from
-  `--frame-ms=N` / `?framems=N` because moving it changes how fast the world
-  moves, not just how often it is drawn. Evidence that it is the right knob and
-  not a speed hack, the interpreter's headroom per frame, and the remaining work
-  (the worst frames, not the average) are all in
-  [`docs/PERFORMANCE.md`](PERFORMANCE.md).
+  every 60 ms animation frame on the idle menu, where the engine itself does
+  0.26 ms. `tools/page-options.js` now routes `Module.print`/`printErr` to the
+  console: emscripten binds its stdout sink once, at module init, and `--pre-js`
+  runs before that. Boot to the menu went 89 s -> 23 s, and the *page* went from
+  17 fps to its full 60.
+* **The port's own clock was 20% slow.** `g_use_fixed_step = !g_browser_fixed`
+  inverted the `?fixed=1` flag, so the browser was pinned to a deterministic
+  16 ms tick even though the comment next to it says the browser runs on real
+  elapsed time; and `g_clock += (int64_t)dt` then truncated each ~16.7 ms tick to
+  16 ms. That matters because the engine re-arms itself at 66 ms and the timer
+  fires on the first tick whose clock has passed it: 16 ms steps put the engine's
+  frame on the 5th tick (80 ms, 12.5 fps), ~16.7 ms steps on the 4th (66.8 ms,
+  15.0 fps). Fixed both; the native CLI keeps the fixed step, so every recorded
+  measurement is unchanged (`--frames=6500` still gives 1271 frames).
+* **The engine's own frame period — not touched.** `MainProcess`, the callback
+  `g_MainTimer` dispatches, re-arms at `APPINFO_nTimer - (work it just did)`, and
+  `APPINFO_Initialize` hardcodes `APPINFO_nTimer = 66 ms`: 15 fps by design, on
+  every path through that function. Raising it was measured (16 ms gives 6165
+  engine frames instead of 1271 over the same 104 s, for ~16% more instructions)
+  and the machinery is in `patches.c` behind `--frame-ms=N` / `?framems=N`, but
+  it is **off by default**: the world advances once per `MainProcess` frame and
+  that same frame is what draws, so a faster frame period accelerates the game
+  rather than smoothing it.
 
-Neither of these was the interpreter: a gameplay frame is ~2.1 M instructions,
-12.2 ms in the browser and 7.6 ms natively, and at 66 ms per frame it was 15% of
-the wall clock.
+The engine's rate is now met with ~5x headroom: 2,150,383 instructions and
+12.77 ms per engine frame in the browser, 168 MIPS, 19% of the wall clock, and a
+66.8 ms budget. The measurements, the 60 fps experiment, and what is left (boot
+time; the profiler being on by default) are in
+[`docs/PERFORMANCE.md`](PERFORMANCE.md).
+
+Text still does not render — the opening event's dialogue box comes up empty —
+and audio is still not wired up. Both are next, and both are separate from this.
 
 ---
 

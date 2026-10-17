@@ -92,6 +92,7 @@ static guest_image g_img;
 static uint32_t g_native_render;   /* Java_...WrapperRenderer_nativeRender   */
 static uint32_t g_native_event;    /* Java_...WrapperRenderer_nativeEvent    */
 static int64_t  g_clock;           /* the guest's clock, ms -- sysTime[]      */
+static double   g_clock_frac;      /* the sub-millisecond part carried over   */
 static uint64_t g_budget;          /* per-cpu_run instruction budget          */
 static int      g_frames_max;      /* 0 = run until something stops it        */
 static int      g_frames_done;
@@ -1314,7 +1315,21 @@ static int spike_tick(void)
         if (real > 0.0)
             dt = real > 250.0 ? 250.0 : real;
     }
-    g_clock += (int64_t)dt;
+    /* g_clock is the guest's millisecond clock, so the fraction of a
+     * millisecond has to be carried, not dropped. A real tick in the browser is
+     * ~16.7 ms; truncating that to 16 every tick ran the whole game clock 4%
+     * slow, and that is enough for the engine to feel: it re-arms itself at
+     * 66 ms and fires on the first tick whose clock has passed that, so 16 ms
+     * steps land on the 5th tick (80 ms, 12.5 fps) where 16.7 ms steps land on
+     * the 4th (66.8 ms, 15.0 fps -- the 15.15 fps the engine asks for).
+     *
+     * This is exactly zero work in the deterministic case: dt is 16.0 under
+     * --frames style fixed-step runs, so the fraction stays 0 and every
+     * recorded native measurement is unaffected. */
+    g_clock_frac += dt;
+    int64_t dt_whole = (int64_t)g_clock_frac;
+    g_clock_frac -= (double)dt_whole;
+    g_clock += dt_whole;
     ST32(g_sys_time_addr, (uint32_t)g_clock);
     ST32(g_sys_time_addr + 4, (uint32_t)(g_clock >> 32));
 
@@ -1536,8 +1551,15 @@ int main(int argc, char **argv)
      * restores the deterministic 16 ms step for headless runs.
      *
      * The CLI keeps the fixed step unconditionally: the differential oracle and
-     * every recorded run depend on it. */
-    { extern int g_browser_fixed; g_use_fixed_step = !g_browser_fixed; }
+     * every recorded run depend on it.
+     *
+     * Note the sense of the flag: `?fixed=1` *sets* the fixed step, which is
+     * what its name and the paragraph above say, so the browser default here is
+     * the real clock. Writing this as `!g_browser_fixed` inverted both and left
+     * the browser pinned to a 16 ms tick -- which then quantised the engine's
+     * own 66 ms re-arm onto the 5th tick (80 ms, 12.5 fps) instead of the 4th
+     * (66.8 ms, 15 fps). */
+    { extern int g_browser_fixed; g_use_fixed_step = g_browser_fixed != 0; }
 #endif
 
     int rc = spike_load(path);

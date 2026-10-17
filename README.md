@@ -79,10 +79,12 @@ Options: `--boot` run the game's own startup (JNI, assets, frames) ·
 `--frames=N` stop after N frames · `--tap=frame,x,y` inject a tap at a frame ·
 `--init-array` run static constructors · `--jni` call `JNI_OnLoad` · `--all`
 both · `--no-profile` · `--trace` record the last 96 instructions and dump them
-on a fault · `--frame-ms=N` the frame period the engine is asked to run at (the
-engine hardcodes 66 ms = 15 fps; the port asks for 16 ms = 60 fps -- see
-[docs/PERFORMANCE.md](docs/PERFORMANCE.md) before moving it). In the browser the
-same knob is `?framems=N`.
+on a fault · `--frame-ms=N` the frame period the engine is asked to run at. The
+engine hardcodes 66 ms (15 fps) and that is the game's speed, so this is off by
+default and is a measurement tool, not a setting -- see
+[docs/PERFORMANCE.md](docs/PERFORMANCE.md). In the browser the same knob is
+`?framems=N`, and `?fixed=1` forces the deterministic 16 ms tick that headless
+verification uses.
 
 ## Game files are not in this repository
 
@@ -96,11 +98,13 @@ The game boots to its main menu and, with a tap, into gameplay — asset install
 the game loader's 34 stages, LZMA unpacking, PNG decode, fonts, UI rendering and
 the renderer all run. The interpreter covers Thumb-1 and ARM; the import table,
 the JNI environment, the guest heap and the GLES1 state layer are in place.
-Audio is not wired up. The browser host builds and reaches the menu, and in
-gameplay it now runs one engine frame per animation frame — 58.5 fps measured,
-up from 13.5 — after fixing the host log sink and raising the engine's own frame
-period; see [`docs/PERFORMANCE.md`](docs/PERFORMANCE.md) for the measurements and
-for what is left in the worst frames.
+Audio is not wired up: `SOUNDSYSTEM_Process` is called every frame and there is
+no host backend behind it. In the browser, gameplay now holds the engine's own
+rate — 15.0 engine frames per second, on a page running at 60 ticks/s, with the
+interpreter using 19% of the wall clock — where it was 11.9 before, and text
+still does not render (the opening event's dialogue box comes up empty). See
+[`docs/PERFORMANCE.md`](docs/PERFORMANCE.md) for the measurements and for what is
+left.
 
 Details — the interpreter bugs found and how, plus the current state — are in
 [`docs/HANDOFF.md`](docs/HANDOFF.md) and [`docs/SPIKE.md`](docs/SPIKE.md).

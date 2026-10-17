@@ -256,25 +256,31 @@ int patches_replace_with_import(const guest_image *img, const char *symbol,
  * the 200 ms cloud-backup throttle keeps its own value.
  *
  * This is a deliberate deviation from the shipped engine, so it is also the
- * one patch here that is a *behaviour* change rather than a repair, and it is
- * a knob rather than a constant for exactly that reason:
+ * one patch here that is a *behaviour* change rather than a repair -- which is
+ * why it is **off by default** and why it is a knob rather than a constant:
  *
- *     spike ... --frame-ms=66      # the engine's own pacing (15 fps)
- *     spike.html?framems=66        # same, in the browser
+ *     spike ... --frame-ms=16      # try 60 fps
+ *     spike.html?framems=16        # same, in the browser
  *
- * It stays correct only while the game's logic advances with the clock rather
- * than per frame. The evidence points that way -- MainProcess stamps
- * CHECKTIME_nCurrentTime every frame for the rest of the engine to read, the
- * item/buff deadlines are `now + 15 ms` / `now + 30 ms`, and the loader
- * advances its stages on the game clock rather than on a frame count (8 ticks,
- * 128 ms, per stage at both 16 ms and 66 ms frames) -- but what this changes is
- * how fast the world moves, so the check is to play it. If the game runs fast
- * forward, this is the line to turn off.
+ * The default (0) leaves the engine's own value in place, because the engine's
+ * frame period *is* the game's speed: the world advances once per MainProcess
+ * frame, and 66 ms frames are also what the view is drawn at, so there is no
+ * way to redraw more often without the game running faster. Fidelity wins;
+ * the knob is here to measure, not to ship.
  *
- * 0 means "leave the engine alone", and so does 66, which is what it already
- * is set to.
+ * Which of those two things 66 ms is -- the rate the world advances, or just a
+ * redraw throttle -- is not settled by measurement. For the clock, the evidence
+ * is that MainProcess stamps CHECKTIME_nCurrentTime every frame for the rest of
+ * the engine to read, that the item/buff deadlines are `now + 15 ms` /
+ * `now + 30 ms`, and that the loader's stages advance on the game clock rather
+ * than on a frame count (8 ticks, 128 ms, per stage at both 16 ms and 66 ms
+ * frames). Against it: a gameplay frame costs the same 2.1 M instructions at
+ * 66 ms as at 16 ms, which is what per-frame logic looks like. Until that is
+ * settled, the safe default is the engine's own pacing.
+ *
+ * 0 means "leave the engine alone", and so does 66, which is what it is set to.
  */
-int g_frame_period_ms = 16;
+int g_frame_period_ms = 0;
 
 /* Thumb-2 BL (T1): hw1 = 11110 S imm10, hw2 = 11 J1 1 J2 imm11.
  * Returns the target with its Thumb bit set, or 0 if this is not a BL. */

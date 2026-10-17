@@ -21,9 +21,9 @@
   if (q.has('gltrace')) M.spikeGlTrace = num('gltrace');
   if (q.has('dump'))    M.spikeDumpScreen = num('dump');
   if (q.has('fixed'))   M.spikeFixed = num('fixed');
-  // The engine's frame period, in ms. 66 is the engine's own value (15 fps);
-  // the port asks for 16 (60 fps) unless the page says otherwise. Moving this
-  // changes how fast the game's world moves -- see src/patches.c.
+  // The engine's frame period, in ms. Off unless the page asks: the engine's
+  // own 66 ms is the game's speed, and lowering it accelerates the game. This
+  // exists to measure that, not to ship it -- see src/patches.c.
   if (q.has('framems')) M.spikeFrameMs = num('framems');
 
   // Do not let stdout go into the shell's <textarea id="output">.

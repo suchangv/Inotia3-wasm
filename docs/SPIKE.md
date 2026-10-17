@@ -461,7 +461,8 @@ suspecting the guest.
 
 The complaint was "no sound, broken fonts, and performance bad enough that it is
 almost unplayable". Only the third was investigated here, and it turned out to
-have two causes, neither of them the interpreter.
+be three things, none of them the interpreter: one host bug, one clock bug in
+the port, and one design decision in the engine that the port should respect.
 
 **The measurement that made the difference was an A/B, not a profile.** The CPU
 profile of the *idle menu* put ~81% of samples inside emscripten's `print`, in
@@ -473,49 +474,80 @@ mid-run (from the page, via `Page.addScriptToEvaluateOnNewDocument`) took the
 animation-frame callback from 47.6 ms to 3.4 ms and the page from 17 to 59.7 fps;
 boot to the menu went 89 s -> 23 s. Silencing `console.log` alone changed
 *nothing*, at 0.081 ms per call, which is what separates "logging is slow" from
-"this particular sink is slow" — worth remembering, because the wrong conclusion
+"this particular sink is slow" -- worth remembering, because the wrong conclusion
 here would have been to throttle the log lines instead of fixing the sink.
 
-**Then the engine's own pacing.** With the host fixed, gameplay still ran 11.9
-engine frames per second out of 60 ticks: `[settimer]` traces showed the engine
-asking for `interval = 66` every time, and disassembly of `MainProcess` gave the
-formula — `deadline = now + APPINFO_nTimer`, `interval = deadline - now2` floored
-at 10 (120 when no input is queued, 100 while `gAppSleepInfo` is set).
-`APPINFO_nTimer` is written only by `APPINFO_SetTimer`, and
-`APPINFO_Initialize` calls it with `movs r0, #0x42` (66 ms = 15 fps) on every
-path, right after reading its environment file. The other two callers pass 0xc8
-(200 ms) for cloud backup.
+**Then the engine's own pacing, which is where the session went wrong first.**
+With the host fixed, gameplay still ran 11.9 engine frames per second out of 60
+ticks: `[settimer]` traces showed the engine asking for `interval = 66` every
+time, and disassembly of `MainProcess` gave the formula -- `deadline = now +
+APPINFO_nTimer`, `interval = deadline - now2` floored at 10 (120 while
+`STATE_nState == 0`, 100 while `gAppSleepInfo` is set). `APPINFO_nTimer` is
+written only by `APPINFO_SetTimer`, and `APPINFO_Initialize` calls it with
+`movs r0, #0x42` (66 ms = 15 fps) on every path, right after reading its
+environment file. The other two callers pass 0xc8 (200 ms) for cloud backup.
 
-Two dead ends are worth recording, because both looked promising:
+The next step was wrong and is worth recording as such: the conclusion drawn was
+"the engine wants 15 fps but the port should want 60", so `patches.c` grew a
+patch that rewrites that immediate to 16 ms. It works -- 1271 engine frames over
+a 6500-tick run becomes 6165 for ~16% more instructions in total -- but it is a
+*speed-up of the game*, not a smoother version of it: the world advances once per
+`MainProcess` frame and that same frame is what draws. The patch is still in
+`patches.c`, off by default, behind `--frame-ms=N` / `?framems=N`, because it is
+the cheapest way to measure the ceiling and to settle the open question below.
+
+Two dead ends from the same stretch, because both looked promising:
 
 * The read is `APPINFO_nTimer` at guest `0xd5bfe8`, reached through GOT slot
   `0x140600`. Reading that slot by its *address*, though, gives garbage: `.got`,
   `.data` and `.data.rel.ro` have `Off = Addr - 0x1000`, unlike `.text` and
   `.rodata` where they are equal. That cost a round of "the frame period is a
   code byte?" confusion.
-* A temporary poke of the value in the runner settled it in one run: 66 -> 1271
-  engine frames per 6500-tick run, 33 -> 2087, 16 -> 6165. One `movs` immediate,
-  4.8x the frame rate, 16% more instructions in total.
+* The 120 ms branch is **not** "the input queue is empty" -- it is
+  `STATE_nState == 0`, i.e. no state set yet. During gameplay the interval is
+  the computed 66 ms.
 
-**Locating the 16 ms knob was the easy part; trusting it is the open question.**
-The engine's world may advance with the clock or once per frame, and if it is per
-frame then 16 ms frames run the game at ~4x speed. The loader's stage timing
-argues for the clock: in a fixed-step run each stage takes 8 ticks (128 ms) at
-*both* 16 ms and 66 ms frames, where a frame-counted stage would have taken 5
-ticks at one and 40 at the other. `MainProcess` also stamps `CHECKTIME_nCurrentTime`
-each frame for the rest of the engine to read, and `CHECKTIME_Initialize` seeds
-the item/buff/life deadlines at `now + 15` / `now + 30`. Suggestive, not proof —
-so the patch takes its value from `--frame-ms=N` / `?framems=N` and
-`docs/PERFORMANCE.md` says what playing it should look like.
+**What was actually broken: the browser was delivering 12.0 fps where the engine
+had asked for 15.15.** The frame period was never the port's to change; the port
+was failing to honour it. Because the engine re-arms at 66 ms and the timer fires
+on the first tick whose clock has passed that deadline, the tick step decides
+where 66 ms lands, and there were two bugs in it:
 
-**Where the interpreter actually stands at 60 fps** (browser, gameplay): 58.5
-engine frames/s, 2,143,247 instructions and 12.21 ms per frame, 176 MIPS, 71% of
-wall clock — 1.37x headroom in a 16.67 ms budget, and 2.2x natively (7.6 ms).
-The average is fine; the worst frame was 4.4 M instructions (25 ms), and that is
-what Tier 1 in `docs/PERFORMANCE.md` is for.
+* `g_use_fixed_step = !g_browser_fixed` **inverted** the `?fixed=1` flag; the
+  comment right above it says the browser runs on real elapsed time and
+  `?fixed=1` restores the 16 ms step, and the code did the opposite, so the
+  browser was pinned to 16 ms. 66 ms then lands on the 5th tick (80 ms,
+  12.5 fps).
+* `g_clock += (int64_t)dt` **truncated** each tick to whole milliseconds, so even
+  a correct ~16.7 ms tick ran the guest clock 4% slow.
+
+With both fixed the engine's frame lands on the 4th tick (66.8 ms, 15.0 fps),
+which is the 15.15 the engine asks for. Measured after the fix, in gameplay:
+15.0 engine fps over 1200 ticks, the page at 60.0 ticks/s, the menu up in ~17 s.
+The write-up, including why 12.5 is the signature of a 16 ms step, is in
+`docs/PERFORMANCE.md`.
+
+The native CLI keeps the fixed step unconditionally -- the differential oracle
+and every recorded run depend on it -- so the deterministic numbers are unchanged
+by all of this: `--frames=6500` still reports
+`average over 1271 frame(s): 390385 instructions`. That is the regression check
+to run after touching `main.c`'s tick.
+
+**Where the interpreter actually stands** (browser, gameplay, engine's own
+pacing): 2,150,383 instructions and 12.77 ms per engine frame, 168 MIPS, 19% of
+the wall clock against a 66.8 ms budget -- about 5x headroom, and the worst
+observed gameplay frame (~4.4 M instructions, ~26 ms) fits inside it. So at the
+game's own rate there is no interpreter problem at all. The 60 fps experiment is
+still recorded, because it is the answer to "how much is left if 60 is ever
+wanted": 16.67 ms a frame, 1.31x average headroom, and the worst frames over
+budget.
 
 **Two process notes.** `tools/difftest.sh` currently fails before it compares
-anything — the oracle side runs 0 instructions — and it fails identically with
+anything -- the oracle side runs 0 instructions -- and it fails identically with
 this session's changes stashed, so it is an environment problem, not a
 regression. And `data/.../hubcheck.sav` is rewritten by the game on every run;
 restore it before committing anything else.
+
+**Still open, and not performance:** text does not render (the opening event's
+dialogue box comes up empty) and audio is not wired up. `SOUNDSYSTEM_Process` is
+called every frame from `MainProcess` with no host backend behind it.

@@ -183,7 +183,7 @@ void spike_set_dump_screen(int n) { g_browser_dump_screen = n; }
 void host_browser_read_dump(void) { spike_read_dump_js(); }
 
 /* The engine's frame period, overridable from the page (Module.spikeFrameMs).
- * Changing it changes how fast the world moves -- see patches.c. */
+ * Off by default: moving it changes how fast the world moves -- see patches.c. */
 extern int g_frame_period_ms;
 EM_JS(void, spike_read_frame_ms_js, (void), {
     if (typeof Module !== 'undefined' && Module.spikeFrameMs)
