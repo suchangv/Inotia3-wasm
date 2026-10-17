@@ -191,6 +191,34 @@ Two things worth knowing from this: the `frame=N` in the `[loader]` log line
 counter), and `--tap=frame,x,y` (device pixels) drives the whole chain in a
 headless native run.
 
+### Progress since that (2026-10-18, the frame rate)
+
+**Gameplay runs at 58.5 fps in the browser** (13.5 before), and the two causes
+were unrelated:
+
+* **The host log sink.** The generated page's `Module.print` appended every
+  engine log line to `<textarea id="output">` and then forced
+  `scrollTop = scrollHeight` — a DOM reflow per frame on a string that only
+  grows (237,364 characters by the time gameplay started). It cost 47.6 ms of
+  every 60 ms animation frame on the idle menu. `tools/page-options.js` now
+  routes `Module.print`/`printErr` to the console, where emscripten binds its
+  stdout sink once at module init, before `--pre-js` runs. Boot to the menu went
+  89 s -> 23 s, and to gameplay it is now ~12 s.
+* **The engine's own frame period.** `MainProcess`, the callback `g_MainTimer`
+  dispatches, re-arms itself at `APPINFO_nTimer - (work it just did)`, and
+  `APPINFO_Initialize` hardcodes `APPINFO_nTimer = 66 ms` — 15 fps, by design,
+  on every path through that function. `patches.c` now rewrites that immediate
+  (scanning for it by symbol, not by address) to 16 ms, and takes the value from
+  `--frame-ms=N` / `?framems=N` because moving it changes how fast the world
+  moves, not just how often it is drawn. Evidence that it is the right knob and
+  not a speed hack, the interpreter's headroom per frame, and the remaining work
+  (the worst frames, not the average) are all in
+  [`docs/PERFORMANCE.md`](PERFORMANCE.md).
+
+Neither of these was the interpreter: a gameplay frame is ~2.1 M instructions,
+12.2 ms in the browser and 7.6 ms natively, and at 66 ms per frame it was 15% of
+the wall clock.
+
 ---
 
 ## What this is

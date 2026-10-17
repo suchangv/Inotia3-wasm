@@ -454,3 +454,68 @@ did nothing.
 wrong (it took a policy shortcut at the wrong moment). Two sessions' worth of
 "is the interpreter broken?" is a reminder to check what the runner did before
 suspecting the guest.
+
+---
+
+## Session log — 2026-10-18, the frame rate that was not the interpreter
+
+The complaint was "no sound, broken fonts, and performance bad enough that it is
+almost unplayable". Only the third was investigated here, and it turned out to
+have two causes, neither of them the interpreter.
+
+**The measurement that made the difference was an A/B, not a profile.** The CPU
+profile of the *idle menu* put ~81% of samples inside emscripten's `print`, in
+the generated HTML shell, and 18% in `(program)`. The shell's `Module.print`
+appends each line to `<textarea id="output">` and then forces
+`scrollTop = scrollHeight`, so the engine's one-log-line-per-frame was one forced
+DOM reflow per frame on a string that grows all run. Detaching the textarea
+mid-run (from the page, via `Page.addScriptToEvaluateOnNewDocument`) took the
+animation-frame callback from 47.6 ms to 3.4 ms and the page from 17 to 59.7 fps;
+boot to the menu went 89 s -> 23 s. Silencing `console.log` alone changed
+*nothing*, at 0.081 ms per call, which is what separates "logging is slow" from
+"this particular sink is slow" — worth remembering, because the wrong conclusion
+here would have been to throttle the log lines instead of fixing the sink.
+
+**Then the engine's own pacing.** With the host fixed, gameplay still ran 11.9
+engine frames per second out of 60 ticks: `[settimer]` traces showed the engine
+asking for `interval = 66` every time, and disassembly of `MainProcess` gave the
+formula — `deadline = now + APPINFO_nTimer`, `interval = deadline - now2` floored
+at 10 (120 when no input is queued, 100 while `gAppSleepInfo` is set).
+`APPINFO_nTimer` is written only by `APPINFO_SetTimer`, and
+`APPINFO_Initialize` calls it with `movs r0, #0x42` (66 ms = 15 fps) on every
+path, right after reading its environment file. The other two callers pass 0xc8
+(200 ms) for cloud backup.
+
+Two dead ends are worth recording, because both looked promising:
+
+* The read is `APPINFO_nTimer` at guest `0xd5bfe8`, reached through GOT slot
+  `0x140600`. Reading that slot by its *address*, though, gives garbage: `.got`,
+  `.data` and `.data.rel.ro` have `Off = Addr - 0x1000`, unlike `.text` and
+  `.rodata` where they are equal. That cost a round of "the frame period is a
+  code byte?" confusion.
+* A temporary poke of the value in the runner settled it in one run: 66 -> 1271
+  engine frames per 6500-tick run, 33 -> 2087, 16 -> 6165. One `movs` immediate,
+  4.8x the frame rate, 16% more instructions in total.
+
+**Locating the 16 ms knob was the easy part; trusting it is the open question.**
+The engine's world may advance with the clock or once per frame, and if it is per
+frame then 16 ms frames run the game at ~4x speed. The loader's stage timing
+argues for the clock: in a fixed-step run each stage takes 8 ticks (128 ms) at
+*both* 16 ms and 66 ms frames, where a frame-counted stage would have taken 5
+ticks at one and 40 at the other. `MainProcess` also stamps `CHECKTIME_nCurrentTime`
+each frame for the rest of the engine to read, and `CHECKTIME_Initialize` seeds
+the item/buff/life deadlines at `now + 15` / `now + 30`. Suggestive, not proof —
+so the patch takes its value from `--frame-ms=N` / `?framems=N` and
+`docs/PERFORMANCE.md` says what playing it should look like.
+
+**Where the interpreter actually stands at 60 fps** (browser, gameplay): 58.5
+engine frames/s, 2,143,247 instructions and 12.21 ms per frame, 176 MIPS, 71% of
+wall clock — 1.37x headroom in a 16.67 ms budget, and 2.2x natively (7.6 ms).
+The average is fine; the worst frame was 4.4 M instructions (25 ms), and that is
+what Tier 1 in `docs/PERFORMANCE.md` is for.
+
+**Two process notes.** `tools/difftest.sh` currently fails before it compares
+anything — the oracle side runs 0 instructions — and it fails identically with
+this session's changes stashed, so it is an environment problem, not a
+regression. And `data/.../hubcheck.sav` is rewritten by the game on every run;
+restore it before committing anything else.

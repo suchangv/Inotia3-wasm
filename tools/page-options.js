@@ -21,4 +21,26 @@
   if (q.has('gltrace')) M.spikeGlTrace = num('gltrace');
   if (q.has('dump'))    M.spikeDumpScreen = num('dump');
   if (q.has('fixed'))   M.spikeFixed = num('fixed');
+  // The engine's frame period, in ms. 66 is the engine's own value (15 fps);
+  // the port asks for 16 (60 fps) unless the page says otherwise. Moving this
+  // changes how fast the game's world moves -- see src/patches.c.
+  if (q.has('framems')) M.spikeFrameMs = num('framems');
+
+  // Do not let stdout go into the shell's <textarea id="output">.
+  //
+  // The generated HTML defines Module.print as "console.log(...) and then
+  // append the line to the output textarea, then set scrollTop = scrollHeight".
+  // The engine logs one line per frame, so that is a forced DOM reflow per
+  // frame on a string that grows for the whole run -- the cost per line grows
+  // with the run. On the idle main menu, where the engine does 0.26 ms of work
+  // per frame, the requestAnimationFrame callback was taking 47.6 ms and the
+  // page ran at 17 fps; detaching the textarea mid-run took the same page to
+  // 3.4 ms and 60 fps. The loader went from 89 s to 23 s.
+  //
+  // emscripten binds its stdout sink once, at module init
+  // (`if(Module["print"])out=Module["print"]`), and --pre-js runs before that,
+  // so replacing the two here is what routes stdout to the console and
+  // nowhere else.
+  M.print = function (line) { console.log(line); };
+  M.printErr = function (line) { console.error(line); };
 })();

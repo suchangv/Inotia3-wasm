@@ -225,6 +225,108 @@ int patches_replace_with_import(const guest_image *img, const char *symbol,
     return 1;
 }
 
+/* --- the engine's frame period -------------------------------------------
+ *
+ * MainProcess -- the callback g_MainTimer dispatches -- is the engine's whole
+ * frame: update, then draw, then re-arm g_MainTimer at
+ *
+ *     interval = APPINFO_nTimer - (time the frame just took)     floor 10 ms
+ *
+ * (or a flat 120 ms when no input is queued, and 100 ms while
+ * gAppSleepInfo is set, which is the backgrounded case). APPINFO_nTimer is
+ * set once, by APPINFO_Initialize, to 0x42 = 66 ms -- immediately after it
+ * reads its environment file, on every path through that function.
+ *
+ * So the shipped engine asks for a 66 ms frame, and gets it: a 6500-tick run
+ * (104 s of game clock) contains 1271 engine frames. Only a handful of those
+ * are gameplay, and a gameplay frame is ~2.1 M guest instructions, which the
+ * interpreter here retires in ~8 ms natively and ~13 ms in the browser: at
+ * 66 ms per frame the interpreter is around 15% of the wall clock, and the
+ * frame rate is the engine's own choice, not the port's ceiling. kMips is not
+ * the thing to fix; this is.
+ *
+ * Rewriting that immediate to 16 ms gives 6165 engine frames over the same
+ * 104 s for 16% more instructions in total -- the engine does the same work,
+ * just at the rate a player (and a 60 Hz display) expects. See
+ * docs/PERFORMANCE.md for the measurement and for what to check by playing.
+ *
+ * Scanning for the constant rather than hardcoding an address keeps this
+ * honest against another APK build: if the pattern is not there, it says so
+ * instead of patching the wrong instruction. Only the normal path is touched;
+ * the 200 ms cloud-backup throttle keeps its own value.
+ *
+ * This is a deliberate deviation from the shipped engine, so it is also the
+ * one patch here that is a *behaviour* change rather than a repair, and it is
+ * a knob rather than a constant for exactly that reason:
+ *
+ *     spike ... --frame-ms=66      # the engine's own pacing (15 fps)
+ *     spike.html?framems=66        # same, in the browser
+ *
+ * It stays correct only while the game's logic advances with the clock rather
+ * than per frame. The evidence points that way -- MainProcess stamps
+ * CHECKTIME_nCurrentTime every frame for the rest of the engine to read, the
+ * item/buff deadlines are `now + 15 ms` / `now + 30 ms`, and the loader
+ * advances its stages on the game clock rather than on a frame count (8 ticks,
+ * 128 ms, per stage at both 16 ms and 66 ms frames) -- but what this changes is
+ * how fast the world moves, so the check is to play it. If the game runs fast
+ * forward, this is the line to turn off.
+ *
+ * 0 means "leave the engine alone", and so does 66, which is what it already
+ * is set to.
+ */
+int g_frame_period_ms = 16;
+
+/* Thumb-2 BL (T1): hw1 = 11110 S imm10, hw2 = 11 J1 1 J2 imm11.
+ * Returns the target with its Thumb bit set, or 0 if this is not a BL. */
+static uint32_t thumb_bl_target(uint32_t pc, uint16_t hw1, uint16_t hw2)
+{
+    if ((hw1 & 0xF800) != 0xF000 || (hw2 & 0xD000) != 0xD000)
+        return 0;
+    uint32_t s  = (hw1 >> 10) & 1;
+    uint32_t j1 = (hw2 >> 13) & 1;
+    uint32_t j2 = (hw2 >> 11) & 1;
+    uint32_t i1 = (~j1 ^ s) & 1;
+    uint32_t i2 = (~j2 ^ s) & 1;
+    uint32_t off = (s << 24) | (i1 << 23) | (i2 << 22) |
+                   ((uint32_t)(hw1 & 0x3ff) << 12) | ((uint32_t)(hw2 & 0x7ff) << 1);
+    /* off is S:I1:I2:imm10:imm11:0 -- 25 bits, bit 24 is the sign. */
+    int32_t soff = (int32_t)(off << 7) >> 7;
+    return (uint32_t)((int32_t)pc + 4 + soff) | 1u;
+}
+
+static void patch_frame_period(const guest_image *img)
+{
+    if (g_frame_period_ms <= 0 || g_frame_period_ms > 0xFF ||
+        g_frame_period_ms == 66) {
+        host_log("patches: frame period left at the engine's own 66 ms "
+                 "(%d fps)\n", 1000 / 66);
+        return;
+    }
+    uint32_t setter = elf_find_symbol(img, "APPINFO_SetTimer");
+    if (!setter) {
+        host_log("patches: APPINFO_SetTimer not found -- the engine keeps its "
+                 "own frame period\n");
+        return;
+    }
+    uint32_t lo = img->text_lo, hi = img->text_hi;
+
+    for (uint32_t pc = lo; pc + 6 < hi; pc += 2) {
+        uint32_t h = LD16(pc);
+        if ((h & 0xFF00) != 0x2000 || (h & 0xFF) != 0x42)  /* movs r0, #0x42 */
+            continue;
+        if ((thumb_bl_target(pc + 2, LD16(pc + 2), LD16(pc + 4)) & ~1u) !=
+            (setter & ~1u))
+            continue;
+        ST16(pc, 0x2000 | (g_frame_period_ms & 0xFF));
+        host_log("patches: frame period 66 ms -> %d ms (%d fps) "
+                 "(APPINFO_Initialize @ %08x)\n", g_frame_period_ms,
+                 1000 / g_frame_period_ms, pc);
+        return;
+    }
+    host_log("patches: APPINFO_SetTimer is never called with 66 ms -- frame "
+             "period left alone\n");
+}
+
 void patches_apply(const guest_image *img)
 {
     /* --- anti-tamper ---------------------------------------------------
@@ -287,6 +389,9 @@ void patches_apply(const guest_image *img)
      * GetFullPathName above. See host_libc.c. */
     patches_replace_with_import(img, "_Z27ParseOffsetAndLengthAndPathPiPci",
                                 "host/ParseOffsetAndLengthAndPath");
+
+    /* --- the frame period ------------------------------------------------ */
+    patch_frame_period(img);
 }
 
 /* Separate from patches_apply() because it depends on jni_guest_init(), which

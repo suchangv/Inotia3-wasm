@@ -1427,6 +1427,7 @@ int main(int argc, char **argv)
     host_browser_read_dump();
     host_browser_read_gl_trace();
     host_browser_read_fixed();
+    host_browser_read_frame_ms();
 #endif
     (void)0;
 
@@ -1454,6 +1455,8 @@ int main(int argc, char **argv)
             g_jni_verbose = 1;
         else if (strncmp(argv[i], "--frames=", 9) == 0)
             frames = (int)strtol(argv[i] + 9, NULL, 10);
+        else if (strncmp(argv[i], "--frame-ms=", 11) == 0)
+            g_frame_period_ms = (int)strtol(argv[i] + 11, NULL, 10);
         else if (strncmp(argv[i], "--timer=", 8) == 0)
             timer_id = (int)strtol(argv[i] + 8, NULL, 10);
         else if (strncmp(argv[i], "--stop-at=", 10) == 0)

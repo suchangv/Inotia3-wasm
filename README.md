@@ -79,7 +79,10 @@ Options: `--boot` run the game's own startup (JNI, assets, frames) ·
 `--frames=N` stop after N frames · `--tap=frame,x,y` inject a tap at a frame ·
 `--init-array` run static constructors · `--jni` call `JNI_OnLoad` · `--all`
 both · `--no-profile` · `--trace` record the last 96 instructions and dump them
-on a fault.
+on a fault · `--frame-ms=N` the frame period the engine is asked to run at (the
+engine hardcodes 66 ms = 15 fps; the port asks for 16 ms = 60 fps -- see
+[docs/PERFORMANCE.md](docs/PERFORMANCE.md) before moving it). In the browser the
+same knob is `?framems=N`.
 
 ## Game files are not in this repository
 
@@ -93,7 +96,11 @@ The game boots to its main menu and, with a tap, into gameplay — asset install
 the game loader's 34 stages, LZMA unpacking, PNG decode, fonts, UI rendering and
 the renderer all run. The interpreter covers Thumb-1 and ARM; the import table,
 the JNI environment, the guest heap and the GLES1 state layer are in place.
-Audio is not wired up. The browser host builds and reaches the menu.
+Audio is not wired up. The browser host builds and reaches the menu, and in
+gameplay it now runs one engine frame per animation frame — 58.5 fps measured,
+up from 13.5 — after fixing the host log sink and raising the engine's own frame
+period; see [`docs/PERFORMANCE.md`](docs/PERFORMANCE.md) for the measurements and
+for what is left in the worst frames.
 
 Details — the interpreter bugs found and how, plus the current state — are in
 [`docs/HANDOFF.md`](docs/HANDOFF.md) and [`docs/SPIKE.md`](docs/SPIKE.md).

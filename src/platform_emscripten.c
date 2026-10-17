@@ -182,6 +182,16 @@ EM_JS(void, spike_read_dump_js, (void), {
 void spike_set_dump_screen(int n) { g_browser_dump_screen = n; }
 void host_browser_read_dump(void) { spike_read_dump_js(); }
 
+/* The engine's frame period, overridable from the page (Module.spikeFrameMs).
+ * Changing it changes how fast the world moves -- see patches.c. */
+extern int g_frame_period_ms;
+EM_JS(void, spike_read_frame_ms_js, (void), {
+    if (typeof Module !== 'undefined' && Module.spikeFrameMs)
+        _spike_set_frame_ms(Module.spikeFrameMs | 0);
+});
+void spike_set_frame_ms(int n) { g_frame_period_ms = n; }
+void host_browser_read_frame_ms(void) { spike_read_frame_ms_js(); }
+
 void host_browser_set_size(int w, int h) { g_fb_w = w; g_fb_h = h; }
 
 int host_browser_gl_setup(void)
