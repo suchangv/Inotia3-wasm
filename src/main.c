@@ -101,6 +101,7 @@ static int      g_do_profile;
 static int      g_trace_on;
 static int      g_use_fixed_step = 1;  /* 16 ms per tick, not real elapsed      */
 static double   g_last_now_ms;
+static int      g_entered_menu;
 
 static int spike_load(const char *path);
 static int spike_boot(void);
@@ -731,6 +732,16 @@ static int spike_boot(void)
         }
     }
 
+    /* TEMP: jump straight to state 5 (gameplay) so the path after the title
+     * can be exercised without a browser click. */
+    if (getenv("SPIKE_ENTER_GAME")) {
+        uint32_t ss = find_symbol("STATE_Set");
+        if (ss) {
+            spike_call1(ss, 5);
+            host_log("  [test] STATE_Set(5) called\n");
+        }
+    }
+
     g_native_render = find_symbol(
         "Java_com_com2us_wrapper_WrapperRenderer_nativeRender");
     if (!g_native_render) {
@@ -882,6 +893,41 @@ static void spike_dump_install_records(void)
     }
 }
 
+/* Which STATE_* the engine is in, by name.
+ *
+ * STATE_nState is not exported, but STATE_fpEnter is -- and it holds the
+ * current state's entry function. Resolving that to a symbol is the difference
+ * between "the screen changed" and "the game moved to state 5 (gameplay)".
+ */
+static void spike_probe_state(void)
+{
+    static uint32_t prev;
+    static int ready;
+    uint32_t slot = ready ? 0 : elf_find_symbol(&g_img, "STATE_fpEnter");
+    if (!ready) {
+        ready = 1;
+        if (!slot) return;
+    }
+    uint32_t fn = LD32(slot);
+    static uint32_t prev_gs;
+    static uint32_t gs_slot, proc_slot;
+    if (!gs_slot) {
+        gs_slot = elf_find_symbol(&g_img, "GAMESTATE_nState");
+        proc_slot = elf_find_symbol(&g_img, "STATE_fpProcess");
+    }
+    uint32_t gs = gs_slot ? LD32(gs_slot) : 0xffffffffu;
+    if (fn != prev || gs != prev_gs) {
+        prev = fn;
+        prev_gs = gs;
+        uint32_t at = 0;
+        const char *nm = fn ? elf_nearest_sym(&g_img, fn & ~1u, &at) : NULL;
+        uint32_t pf = proc_slot ? LD32(proc_slot) : 0;
+        const char *pn = pf ? elf_nearest_sym(&g_img, pf & ~1u, &at) : NULL;
+        host_log("  [state] GAMESTATE_nState=%u STATE_fpEnter=%s STATE_fpProcess=%s\n",
+                 gs, nm ? nm : "-", pn ? pn : "-");
+    }
+}
+
 static void spike_probe_loader(void)
 {
     static uint32_t st, lf, pu, pt, tx, ib_n, ib_p, ib_s, sb_n;
@@ -909,6 +955,26 @@ static void spike_probe_loader(void)
     if (state == 1 && g_probe_prev.state != 1) {
         spike_dump_install_records();
         spike_probe_res_load("i_character.dat");
+    }
+    /* Once the install finishes, hand off to the Menu state directly.
+     *
+     * This is the same thing the PS Vita port does, for the same reason: the
+     * title screen's "any touch to continue" handler re-decides on every tap
+     * whether to continue or to go to the Com2uS Hub, and the Hub does not
+     * exist here. Their fix (source/patch.c, Corrida 87) is to call the real
+     * STATE_Set(5) -- STATE_EnterMenu -- at the point the Hub would have been
+     * entered, so the title is never on the path at all. Ours does the same at
+     * the equivalent point: the load completing.
+     *
+     * This is not a substitute for making the title's own tap work; it is the
+     * step that shows whether everything downstream of it renders. */
+    if (state == 2 && g_probe_prev.state != 2 && !g_entered_menu) {
+        uint32_t ss = elf_find_symbol(&g_img, "STATE_Set");
+        if (ss) {
+            g_entered_menu = 1;
+            spike_call1(ss, 5);
+            host_log("  [menu] STATE_Set(5) -- entered the Menu state\n");
+        }
     }
     g_probe_prev.state = state;
     g_probe_prev.load_frame = load_frame;
@@ -1121,8 +1187,10 @@ static int spike_tick(void)
 
     uint32_t due[TIMER_MAX];
     int ndue = timers_due(g_clock, due, TIMER_MAX);
-    if (ndue)
+    if (ndue) {
         spike_probe_loader();
+        spike_probe_state();
+    }
 
     uint64_t d0 = g_gl_draw_calls;
     uint64_t x0 = 0;

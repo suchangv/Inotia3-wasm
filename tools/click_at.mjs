@@ -86,7 +86,17 @@ async function main() {
   const deadline = Date.now() + 120000;
   while (Date.now() < deadline && lastFrame < 0) await sleep(500);
   console.log(`frames started (last frame ${lastFrame}), waiting for the screen`);
-  await sleep(Number(process.env.PRE || 8) * 1000);
+  // A fixed delay is the wrong knob: the interpreter's frame rate varies with
+  // what the engine is doing, so "wait 125 s" can land well before the screen
+  // is up. Wait for a frame number instead when one is given.
+  const wantFrame = Number(process.env.FRAME || 0);
+  if (wantFrame > 0) {
+    const fd = Date.now() + 300000;
+    while (Date.now() < fd && lastFrame < wantFrame) await sleep(1000);
+    console.log(`reached frame ${lastFrame} (wanted ${wantFrame})`);
+  } else {
+    await sleep(Number(process.env.PRE || 8) * 1000);
+  }
 
   const box = await send('Runtime.evaluate', {
     expression: `(() => { const c = document.getElementById('canvas');
@@ -104,7 +114,11 @@ async function main() {
     buttons: type === 'mouseReleased' ? 0 : 1,
   });
   await mouse('mousePressed', cx, cy);
-  await sleep(80);
+  // HOLD lets the press land in one engine tick and the release in a later
+  // one. A tap entirely inside a single tick is fine for the input protocol
+  // (click_test.mjs proves it), but screen handlers that latch on the press
+  // and act on the release need the two separated.
+  await sleep(Number(process.env.HOLD || 80));
   await mouse('mouseReleased', cx, cy);
   console.log(`clicked, waiting ${WAIT}s`);
   await sleep(WAIT * 1000);
