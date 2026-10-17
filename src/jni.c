@@ -32,6 +32,7 @@
 #include "timers.h"
 #include "asset_zip.h"
 #include "platform.h"
+#include "text.h"
 
 /* The archive the engine reads its assets out of, and where inside them they
  * live. The archive's *path* comes from host_apk_path() -- see asset_zip.c --
@@ -66,6 +67,7 @@ enum {
 
 typedef struct {
     int      kind;
+    int      refs;       /* JNI references outstanding: local + global */
     char     cls[96];    /* for methods: the class it was resolved against */
     char     name[96];
     char     sig[96];
@@ -83,6 +85,7 @@ static uint32_t handle_new(int kind)
         if (g_handles[i].kind == H_FREE) {
             memset(&g_handles[i], 0, sizeof(g_handles[i]));
             g_handles[i].kind = kind;
+            g_handles[i].refs = 1;
             if (i >= g_nhandles)
                 g_nhandles = i + 1;
             return JNI_HANDLE_BASE | (uint32_t)i;
@@ -151,6 +154,29 @@ static void read_guest_str(uint32_t addr, char *out, size_t cap)
             return;
     }
     out[cap - 1] = 0;
+}
+
+/* The text methods take the string either as a jstring handle (the engine
+ * makes one with NewStringUTF immediately before the call) or as a byte[]
+ * handle (the Draw* variants). Both are payloads in the guest heap, so this
+ * resolves either shape to a C string. A byte[] payload is not NUL-terminated
+ * by contract, hence the explicit terminator. TEXT_MAX truncates rather than
+ * faults; a rectangle this engine draws in never holds more than a few hundred
+ * bytes, and measurement only needs what the wrap will walk. */
+#define TEXT_MAX 1024
+
+static void jni_read_text_arg(uint32_t arg, char *out, size_t cap)
+{
+    jni_handle *h = handle_of(arg);
+    if (h && (h->kind == H_STRING || h->kind == H_ARRAY) && h->guest) {
+        size_t n = h->len;
+        if (n > cap - 1)
+            n = cap - 1;
+        memcpy(out, g_mem + h->guest, n);
+        out[n] = 0;
+        return;
+    }
+    read_guest_str(arg, out, cap);
 }
 
 /* ---- table construction -------------------------------------------------- */
@@ -519,41 +545,57 @@ int jni_host_call(const char *name, uint32_t *args, int nargs, uint32_t *ret_lo,
         /* jint Get<T>ArrayRegion(env, array, start, len, T *buf): copies out
          * of the array into guest memory. The element size comes from the
          * handle rather than the function name, so this covers every element
-         * type with one body. */
+         * type with one body.
+         *
+         * The JNI order is (env, array, start, len, buf) -- args[2] is the
+         * start, args[3] the length and args[4] the destination. Reading it
+         * any other way silently copies nothing (or from the wrong place),
+         * which is how the engine's text string arrived as zeros. */
         jni_handle *o = handle_of(a1);
-        if (o && a2 && o->elem) {
-            uint32_t n = a4 * o->elem;
-            if (a3 + a4 <= o->len)
-                memcpy(g_mem + a2, g_mem + o->guest + a3 * o->elem, n);
+        uint32_t start = a2, len = a3, buf = a4;
+        if (o && buf && o->elem && start + len <= o->len) {
+            uint32_t n = len * o->elem;
+            memcpy(g_mem + buf, g_mem + o->guest + start * o->elem, n);
         }
         st->implemented = 1;
         return 1;
     }
     if (strncmp(fn, "Set", 3) == 0 && strstr(fn, "ArrayRegion")) {
-        /* jint Set<T>ArrayRegion(env, array, start, len, const T *buf) */
+        /* jint Set<T>ArrayRegion(env, array, start, len, const T *buf) --
+         * same order, opposite direction. jDrawTextInRect fills its byte[]
+         * through this, so it is on the text path. */
         jni_handle *o = handle_of(a1);
-        if (o && a2 && o->elem) {
-            uint32_t n = a4 * o->elem;
-            if (a3 + a4 <= o->len)
-                memcpy(g_mem + o->guest + a3 * o->elem, g_mem + a2, n);
+        uint32_t start = a2, len = a3, buf = a4;
+        if (o && buf && o->elem && start + len <= o->len) {
+            uint32_t n = len * o->elem;
+            memcpy(g_mem + o->guest + start * o->elem, g_mem + buf, n);
         }
         st->implemented = 1;
         return 1;
     }
     if (strcmp(fn, "NewGlobalRef") == 0 ||
         strcmp(fn, "NewLocalRef") == 0) {
-        /* Handles have no local/global distinction here: they are indices into
-         * one table that lives as long as the process, so a reference is
-         * promoted by returning it. The guest may keep it indefinitely, which
-         * is exactly what a global ref promises. */
+        /* Handles have no local/global distinction here: the same handle is
+         * returned with one more reference on it. Keeping the count is what
+         * makes the engine's `NewIntArray(); NewGlobalRef(); DeleteLocalRef()`
+         * cache idiom work -- without it the delete freed the payload and the
+         * slot came back as something else (a methodID, in the text-measurement
+         * case), so the engine's cached array handle silently stopped being an
+         * array and every measurement came back as (0,0). */
+        jni_handle *o = handle_of(a1);
+        if (o)
+            o->refs++;
         *ret_lo = a1;
         st->implemented = 1;
         return 1;
     }
     if (strcmp(fn, "DeleteLocalRef") == 0 ||
         strcmp(fn, "DeleteGlobalRef") == 0) {
+        /* Deleting one reference must not invalidate the object while another
+         * reference (typically a cached global ref) still names it. JNI counts
+         * references, not objects; so does this table now. */
         jni_handle *o = handle_of(a1);
-        if (o)
+        if (o && --o->refs <= 0)
             o->kind = H_FREE;
         st->implemented = 1;
         return 1;
@@ -758,6 +800,68 @@ int jni_host_call(const char *name, uint32_t *args, int nargs, uint32_t *ret_lo,
                 }
                 if (strcmp(n, "GetAppProperty") == 0) {
                     *ret_lo = jni_host_new_string("");
+                    st->implemented = 1; return 1;
+                }
+
+                /* ---- the text rasteriser --------------------------------
+                 *
+                 * The engine does not draw text itself: SGL_Font_Android hands
+                 * the string to Java as a byte[]/String and reads the result
+                 * back as an alpha mask out of the pixel[] buffer nativeInit()
+                 * was given (see text.c). All four of these were answering
+                 * zero, which is why every dialogue box, menu label and item
+                 * name in the port came up empty.
+                 *
+                 * Argument indexing is this file's usual one: args[0..2] are
+                 * env/clazz/methodID, so the Java varargs start at args[3] and
+                 * follow the literal signatures from the .so's .rodata --
+                 * DrawText "([BII)I", DrawTextInRect "([BIIIII)I",
+                 * GetStringWidthHeightInRect "(Ljava/lang/String;IIII[I)I",
+                 * GetStringWidth "(Ljava/lang/String;II)I". */
+                if (strcmp(n, "GetStringWidthHeightInRect") == 0) {
+                    char text[TEXT_MAX];
+                    jni_read_text_arg(args[3], text, sizeof(text));
+                    int w = 0, h = 0;
+                    text_measure_width_height(text, (int) args[6], &w, &h);
+                    if (g_jni_verbose) {
+                        static int nn;
+                        if (nn < 12) {
+                            nn++;
+                            host_log("  [text] measure len=%d args=%d,%d,%d,%d "
+                                     "-> w=%d h=%d \"%s\"\n", (int) strlen(text),
+                                     (int) args[4], (int) args[5], (int) args[6],
+                                     (int) args[7], w, h, text);
+                        }
+                    }
+                    /* values[0]=width, values[1]=height: the engine sizes the
+                     * alpha texture it is about to read from these. */
+                    jni_handle *ah = handle_of(args[8]);
+                    if (ah && ah->kind == H_ARRAY && ah->guest) {
+                        ST32(ah->guest, (uint32_t) w);
+                        ST32(ah->guest + 4, (uint32_t) h);
+                    }
+                    *ret_lo = (uint32_t) w;
+                    st->implemented = 1; return 1;
+                }
+                if (strcmp(n, "GetStringWidth") == 0) {
+                    char text[TEXT_MAX];
+                    jni_read_text_arg(args[3], text, sizeof(text));
+                    *ret_lo = (uint32_t) text_measure_width(text);
+                    st->implemented = 1; return 1;
+                }
+                if (strcmp(n, "DrawTextInRect") == 0) {
+                    jni_handle *bh = handle_of(args[3]);
+                    if (bh && bh->kind == H_ARRAY && bh->guest && bh->elem == 1)
+                        text_draw_in_rect(g_mem + bh->guest, (int) bh->len,
+                                          (int) args[6], (int) args[7]);
+                    *ret_lo = 0;
+                    st->implemented = 1; return 1;
+                }
+                if (strcmp(n, "DrawText") == 0) {
+                    jni_handle *bh = handle_of(args[3]);
+                    if (bh && bh->kind == H_ARRAY && bh->guest && bh->elem == 1)
+                        text_draw(g_mem + bh->guest, (int) bh->len, (int) args[5]);
+                    *ret_lo = 0;
                     st->implemented = 1; return 1;
                 }
             }

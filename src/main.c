@@ -30,6 +30,7 @@
 #include "patches.h"
 #include "timers.h"
 #include "input.h"
+#include "text.h"
 
 #ifndef WASM_FREESTANDING
 #include <stdio.h>
@@ -522,6 +523,13 @@ patches_fill_vm_caches(&g_img);
 
 gl_state_init();
 
+/* The engine draws text by asking Java to rasterise it into one shared scratch
+ * buffer and then reading the alpha channel back out (see text.c). The Java
+ * side is this process, and the two things it needs are the engine's own font
+ * data pointer -- a *variable*, filled in later by FONT_Load() -- and the
+ * address of that scratch buffer, which is made below next to nativeInit. */
+text_init(find_symbol("FONT_pFontData"));
+
 #ifdef __EMSCRIPTEN__
 /* The browser build has a real renderer. The context has to exist before
  * gl4es initialises -- with NOEGL nothing else can tell it the surface
@@ -648,6 +656,12 @@ static int spike_boot(void)
         uint32_t gyro   = jni_host_new_array(4, 3);
         uint32_t activity = guest_heap_alloc(16);  /* opaque jobject */
 
+        /* This array is where the engine's text comes back from: nativeInit
+         * calls GetIntArrayElements() on it and caches the payload pointer, and
+         * jGetPixelBufferPointer() hands that same pointer to the renderer. So
+         * the rasteriser writes here. See text.c. */
+        text_set_buffer(jni_host_array_addr(pixel), TEXTVIEW_WIDTH, TEXTVIEW_HEIGHT);
+
         g_cpu.r[13] = GUEST_STACK_TOP - 0x1000;
         ST32(g_cpu.r[13] + 0, pixel);
         ST32(g_cpu.r[13] + 4, gyro);
@@ -670,6 +684,17 @@ static int spike_boot(void)
         ri.insns = g_insn_count - ibefore;
         ri.seconds = host_now() - it0;
         report_run(&ri);
+
+        /* nativeInit() takes the `pixel[]` array for the text scratch buffer
+         * and caches GetIntArrayElements()'s result -- the payload pointer --
+         * at +0x34 of the .bss JNI block the text wrappers share (vaddr
+         * 0x15a36c, i.e. the same block the JavaVM and env pointers are logged
+         * out of above: +0 vm, +4 env, +0x28 the int[] global ref, +0x34 the
+         * pixel pointer). jGetPixelBufferPointer() returns exactly that slot's
+         * value, so printing both says whether the rasteriser draws where the
+         * engine reads. */
+        host_log("[text] pixel buffer %08x, engine cached %08x\n",
+                 jni_host_array_addr(pixel), LD32(0x0115a36cu + 0x34u));
 
         /* --- fire the UserAgree callback ---------------------------
          *

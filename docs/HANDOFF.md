@@ -230,8 +230,57 @@ The engine's rate is now met with ~5x headroom: 2,150,383 instructions and
 time; the profiler being on by default) are in
 [`docs/PERFORMANCE.md`](PERFORMANCE.md).
 
-Text still does not render — the opening event's dialogue box comes up empty —
-and audio is still not wired up. Both are next, and both are separate from this.
+At that point text did not render yet — the opening event's dialogue box came up
+empty — and audio was not wired up. Both were next, and both are separate from
+the frame rate.
+
+---
+
+### Progress since that (2026-10-18, the text)
+
+**Text renders.** The class description (word-wrapped to its rect), the stat
+panel (`STR 30 / DEX 20 / … / LUK ??`), the `Create a new character` title and
+the save slots' `NO DATA` all draw — same code and same result in the browser
+and in the native runner.
+
+The engine does not draw text itself. `SGL_Font_Android::RenderToTextureInRect`
+hands the string to *Java* (`jDrawTextInRect`, as a `byte[]`) and reads the
+result back as an alpha mask out of the `pixel[]` buffer `nativeInit()` was
+given, keeping only the alpha byte (`>> 24`). There is no Java here, so the port
+is that renderer: `src/text.c` lays the string out with the engine's own bitmap
+font — `FONT_pFontData`, the same glyph records the engine's native
+`GRP_PutAsciiChar` reads, so the shapes and metrics match everything else it
+draws — and writes ARGB into that buffer. `src/jni.c` supplies the four methods
+it calls (`GetStringWidthHeightInRect`, `GetStringWidth`, `DrawTextInRect`,
+`DrawText`).
+
+Three things sat between "the bytes are right" and "the picture is right":
+
+* **`Get/Set<T>ArrayRegion` had the JNI argument order wrong.** `(env, array,
+  start, len, buf)` was read as `(env, array, buf, len, start)`, so the
+  `SetByteArrayRegion` that fills `jDrawTextInRect`'s `byte[]` copied nothing
+  and the engine's string arrived as zeros. The `start == 0` case was skipped
+  outright, which is every whole-array copy.
+* **The handle table freed objects, not references** — bug class 16b below.
+  This is the one that made the text *invisible*: the engine's cached `int[]`
+  was freed at init and its slot came back as a methodID, so
+  `SGL_GetTextSizeInRect` read `(0,0)` through a handle that was no longer an
+  array. `RenderToTextureInRect` sizes its texture from those two numbers, so
+  every string became a **1x1** `GL_ALPHA` texture while the `glTexSubImage2D`
+  still uploaded the full 64x16 mask into it — a blit that reports success and
+  draws nothing.
+* **A diagnostic that prints a *derived* value can hide the input.** The
+  rasteriser substitutes the natural width when `rect_width <= 0` (0 means
+  "unlimited" here), and its log printed the substituted value — so the
+  engine's `0` read as `40` in every log line, and the search went to the GL
+  layer for a while when the texture size was the real signal. Log the argument
+  and the interpretation separately.
+
+The GL side needed no change at all. The text is a `GL_ALPHA` texture modulated
+by a white vertex colour, and gl4es/WebGL resolves that to white with the mask's
+alpha, exactly as the engine expects on Android. The bisect that established
+this (a solid fill of the same rect, then a trace of the draw) is removed again,
+per the ground rule that diagnostics do not stay.
 
 ---
 
@@ -366,7 +415,8 @@ conditions you meant it to run under.**
 **Nothing blocks reaching gameplay. These are the loose ends.**
 
 Gameplay is confirmed in both hosts — the native runner and the browser — with
-the map, the character, the HUD and the minimap drawn. What is left is adjacent:
+the map, the character, the HUD, the minimap and the text drawn. What is left is
+adjacent:
 
 - **Audio.** The engine opens its audio files; nothing is mixed yet.
 - **The opening event leaves only on SKIP, and it needs two presses.** The class
@@ -722,6 +772,16 @@ These are the ones the PS Vita port had already solved; the lesson is to read
     twice more with a `jintArray`.* A handle is `0x400000xx`, above
     `GUEST_MEM_SIZE`, so a range check silently rejects it and nothing is
     written. The engine then reads zeros and the whole path reports success.
+16b. **`DeleteLocalRef` deletes a *reference*, not the object.** These handles
+    conflate the two: `NewGlobalRef` handed the same handle back and
+    `DeleteLocalRef` set it `H_FREE` outright, so the engine's cache idiom —
+    `NewIntArray(2)`, `NewGlobalRef`, `DeleteLocalRef` — killed its long-lived
+    array at init. The slot was then recycled by a later `handle_new` for a
+    cached *methodID*, and `SGL_GetTextSizeInRect` went on reading its two
+    measurements out of that method handle: `(0,0)`. Everything downstream was
+    consistent with a font that measures zero — text textures came out 1x1 and
+    every label was drawn into one and thrown away. The table now carries a
+    reference count, and a slot only becomes reusable when it reaches zero.
 17. **`__errno` is a function**, not a variable — and the test is where the
     symbol is reached from: `.rel.plt` (called) vs `.rel.dyn` (addressed).
 18. **A stub that returns success and does nothing is worse than one that
