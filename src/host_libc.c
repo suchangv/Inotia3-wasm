@@ -21,6 +21,10 @@
 #include "gl.h"
 
 #ifndef WASM_FREESTANDING
+#include <math.h>
+#endif
+
+#ifndef WASM_FREESTANDING
 /* The file I/O shims below are real stdio. The freestanding wasm build -- the
  * throughput measurement -- has no filesystem and does not need one; the
  * browser and desktop builds both do. */
@@ -1102,14 +1106,34 @@ void host_import_call(guest_import *im)
         break;
 
     /* ---- math ----
-     * Gated on the same reasoning as file I/O: sin/cos/pow are for the engine's
-     * own effects maths, not the boot path. host_sin/host_cos/host_pow are
-     * declared in platform.h and left for whoever lands the host that needs
-     * them; until then these report rather than silently return 0.0, which
-     * would look like a game bug instead of a missing shim. */
-    case IMPL_sin: case IMPL_cos: case IMPL_pow:
-        host_log("host: %s() not implemented yet (arg=%08x)\n", im->name, a0);
+     *
+     * These matter more than "effects maths" suggested: the engine calls them
+     * while composing the screen and during loading, and a shim that leaves
+     * the result register alone returns whatever was there -- so anything
+     * driven by an angle or a power silently reads garbage. Implemented below
+     * rather than left as a report.
+     *
+     * The guest is soft-float, so a double is two words: the low word first,
+     * in r0:r1 (and r2:r3 for pow's second argument), with the result going
+     * back the same way. */
+    case IMPL_sin: case IMPL_cos: case IMPL_pow: {
+        union { uint32_t u[2]; double d; } x, y, r;
+        x.u[0] = a0; x.u[1] = a1;
+        r.d = 0.0;
+#ifndef WASM_FREESTANDING
+        if (im->impl == IMPL_sin)
+            r.d = sin(x.d);
+        else if (im->impl == IMPL_cos)
+            r.d = cos(x.d);
+        else {
+            y.u[0] = a2; y.u[1] = a3;
+            r.d = pow(x.d, y.d);
+        }
+#endif
+        R[0] = r.u[0];
+        R[1] = r.u[1];
         break;
+    }
     case IMPL_isinf: {
         union { uint32_t u; float f; } x;
         x.u = a0;

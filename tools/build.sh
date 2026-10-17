@@ -43,7 +43,7 @@ build_native() {
     mkdir -p build
     $CC $CFLAGS -g -O2 -I src \
         $COMMON src/platform_native.c src/main.c \
-        -o build/spike
+        -lm -o build/spike
     echo "   -> build/spike"
 }
 
