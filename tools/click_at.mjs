@@ -2,6 +2,8 @@
 //
 //   node tools/click_at.mjs <url> <x> <y> [waitSeconds] [out.png]
 //
+// PRE=<seconds> waits before clicking, for screens that take a while to appear.
+//
 // Separate from click_test.mjs, which exercises the input protocol at the
 // canvas centre. This one is for "there is a button on screen, press it" --
 // the coordinates are engine pixels, so they can be read straight off a
@@ -84,7 +86,7 @@ async function main() {
   const deadline = Date.now() + 120000;
   while (Date.now() < deadline && lastFrame < 0) await sleep(500);
   console.log(`frames started (last frame ${lastFrame}), waiting for the screen`);
-  await sleep(8000);
+  await sleep(Number(process.env.PRE || 8) * 1000);
 
   const box = await send('Runtime.evaluate', {
     expression: `(() => { const c = document.getElementById('canvas');
