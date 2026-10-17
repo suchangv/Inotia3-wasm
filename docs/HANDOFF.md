@@ -3,63 +3,68 @@
 Everything needed to continue this work. Read this first; `docs/SPIKE.md` has the
 running engineering log and `docs/REUSE.md` the dependency research.
 
-**State as of 2026-10-17: the game renders its title screen in the browser.**
-Headless Chrome shows the Inotia 3 splash — the parchment map with the Com2uS
-logo — drawn through gl4es → WebGL2 and out to the canvas.
+**State as of 2026-10-17 (evening): the game reaches its main menu in the
+browser.**
 
-The frame is **washed out**: it measures `out = 0.2 * src + 204` against the
-source asset, i.e. the splash composited at ~20% over white. Everything that
-could produce that has been checked and ruled out (below), so this is where the
-next session should start.
+```
+boot -> Google Play splash -> com2uS splash -> "Now Loading" -> title -> MAIN MENU
+```
 
-### What is known about the wash
+The main menu is fully rendered — NEW GAME / CONTINUE / OST & CREDIT / MORE
+GAMES, the NOTICE and HIVE corners, every button's ornate frame. That means the
+whole chain below it works: asset install, LZMA unpacking, PNG decode, fonts,
+UI rendering, the state machine, and the renderer.
 
-Measured, not guessed:
+**The one blocker left: touches reach the engine but the UI does not act on
+them.** See "The immediate next task".
 
-- The engine uploads a **correct** 480x320 RGBA splash — decoding it out of the
-  guest buffer gives the real artwork, dark border and red logo included.
-- The GL state is ordinary: `glBlendFunc(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA)`,
-  `glTexEnvx(GL_TEXTURE_ENV, GL_TEXTURE_ENV_MODE, GL_MODULATE)`,
-  `glShadeModel(GL_SMOOTH)`, colour `glColor4x(1,1,1,1)`.
-- Forcing every RGBA upload opaque (alpha=255) changes nothing, so the sampled
-  texture's alpha is not it.
-- Forcing `GL_BLEND` off at draw time gives a blank white canvas, which is not
-  the expected result and suggests the test itself perturbs gl4es' batching.
-- The framebuffer's own alpha is opaque, so this is not canvas compositing.
-- **The engine's software framebuffer — the 384x256 RGB565 surface
-  `SGL_FrameBufferToScreen` blits — is entirely `0xffff` (white).** That is the
-  most suspicious fact in the set: if the engine's own compositor were running,
-  that surface would hold the frame, and the GL draws on top would be overlays.
+### What is already proven
 
-So the leading reading is: the engine's *software* rendering is not producing a
-frame, the CSFB stays white, and what the canvas shows is only the GL splash
-overlay sitting on it — washed because it is one layer of a fade-in over white.
-The next thing to check is why the software compositor draws nothing, starting
-from `SGL_grpFillRect` / `SGL_DrawTexture` / `SGL_FrameBufferToScreen` and what
-feeds the CSFB.
+- **Rendering is correct.** The early "washed out" frames were the com2uS
+  splash mid-fade, not a colour bug — the menu renders in full colour. That
+  thread can be closed.
+- **Input plumbing works.** A pointer event arrives as
+  `nativeEvent(0x80000004, slot+1, (x<<16)|y, count)`, and the chain inside the
+  engine is `jGetEventType` (a **constant** in this .so: `movs r0,#2` — always
+  `EventHandler_Wrapper`, not a JNI call) → `EventHandler_Wrapper` (scales the
+  coordinates) → `handleCletEvent(0x18, ...)`, which is the same event id the
+  Vita port documents for the title screen's handler.
+- **The loader completes.** `INITSTATE_nState` goes 0 → 1 → 2 and the twelve
+  data files are installed into the app directory.
+- **The CLI baseline is intact.** `tools/build.sh native &&
+  ./build/spike game/libgame.so --boot --frames=600 --no-profile` still prints
+  `average over 119 frame(s): 8701 instructions` and `final pc=0badf00c`, byte
+  for byte as before the runner was split.
 
 ### The browser host
 
-The page is a real host now: one engine tick per `requestAnimationFrame`, mouse
-and touch input reaching the guest, and no frame cap unless you ask for one.
+The page is a real host: one engine tick per `requestAnimationFrame`, pointer
+input, no frame cap unless asked for.
 
 ```
 tools/build.sh browser
-tools/run_browser.sh 60 /tmp/shot.png          # headless, 600 frames
+tools/run_browser.sh 60 /tmp/shot.png            # headless, 600 frames
 QUERY="frames=200&gltrace=200&dump=1" tools/run_browser.sh 60 /tmp/shot.png
-node tools/click_test.mjs http://127.0.0.1:8080/spike.html 70   # live input test
+node tools/watch_run.mjs http://127.0.0.1:8080/spike.html 150   # real time + screenshots
+node tools/click_at.mjs  http://127.0.0.1:8080/spike.html 467 240 60 /tmp/out.png
+node tools/click_test.mjs http://127.0.0.1:8080/spike.html 70   # input protocol
 ```
 
-Page options: `frames=N` (stop after N; unset means run until closed),
-`fixed=1` (16 ms per tick instead of real elapsed time), `gltrace=N`, `dump=1`.
+Page options: `frames=N` (stop after N; unset runs until closed), `fixed=1`
+(16 ms per tick instead of real elapsed time), `gltrace=N`, `dump=1`.
+`click_at.mjs` also takes `PRE=<seconds>` or `FRAME=<n>` to wait before
+clicking, and `HOLD=<ms>` to separate press from release.
+
+**Headless `--screenshot` cannot reach the menu**: `--virtual-time-budget`
+expires after a couple of dozen engine ticks. Use `watch_run.mjs`, which drives
+a real browser and screenshots at intervals. At the current interpreter speed
+the menu arrives around frame 2800, i.e. ~2.5 minutes in.
 
 `main()` is split into `spike_load` / `spike_boot` / `spike_tick` /
 `spike_finish`. The CLI keeps a synchronous loop over `spike_tick`; the browser
-hands `spike_tick_browser` to `host_browser_main_loop`. **The CLI frame log is
-byte-identical to the pre-split build** -- `tools/build.sh native &&
-./build/spike game/libgame.so --boot --frames=600 --no-profile` should print
-`average over 119 frame(s): 8701 instructions` and `final pc=0badf00c`. That
-comparison is the regression test for any further change to the split.
+hands `spike_tick_browser` to `host_browser_main_loop`. The CLI frame log is
+byte-identical to the pre-split build — that comparison is the regression test
+for any further change to the split.
 
 Two things about the stop condition and the clock that are easy to get wrong:
 
@@ -72,16 +77,10 @@ Two things about the stop condition and the clock that are easy to get wrong:
 
 Input lives in `src/input.c`: the Vita port's five-stable-slot state machine
 with the device layer removed. The one place its model does not transfer is
-*how events arrive* -- it polls hardware at ~60 Hz, so a finger that starts and
+*how events arrive* — it polls hardware at ~60 Hz, so a finger that starts and
 ends between two polls is impossible, while here a tick runs for 200-300 ms and
 a tap is 50-100 ms. A level snapshot would drop the tap entirely, so events go
 into a FIFO and are replayed at the frame boundary.
-
-### How to reproduce
-
-`?dump=1` prints the default framebuffer (glReadPixels, base64, 4x downsampled)
-plus the engine's own screen surface and the two composed uploads, so a run can
-be inspected as images rather than by guessing. See the "Diagnostics" section.
 
 ### Progress since the previous handoff
 
@@ -101,6 +100,36 @@ be inspected as images rather than by guessing. See the "Diagnostics" section.
   built paths and hiding error text.
 - `setjmp`/`longjmp` are now implemented host-side so libpng can unwind out of
   `png_error` instead of spinning.
+
+### Progress since the browser host (2026-10-17, later)
+
+The game now reaches its main menu. Six bugs stood between "renders the title
+screen" and that, and every one of them was found by reading the PS Vita port
+first rather than re-deriving the engine:
+
+- **The JNI handle table ran out at frame 600.** `GetStaticMethodID` minted a
+  new handle on every call with no dedupe, and the engine resolves the same
+  handful of methods every frame. JNI guarantees the id is the same for the same
+  (class, name, signature), so the lookup now reuses it.
+- **A freed block still read as live.** `TM_Run` frees a dead timer node and
+  then re-examines that node's id. On bionic the allocator has clobbered the
+  first word, so the walk ends; ours left the payload intact, so it freed the
+  same node again — 165 million instructions of it. `heap_free` now poisons the
+  block's first word.
+- **A cached JavaVM slot was still null.** `patch_vm_caches` required the vtable
+  load and the call through it to be adjacent, but the JavaVM idiom loads the
+  call's arguments in between. That left `0x0115a34c` null and the guest
+  branched through a null `GetEnv`.
+- **`open()` ignored its flags** and opened every path read-only, so nothing
+  could ever be created. This is the one that stalled the install.
+- **`GetUserDir` had no trailing slash** (the engine concatenates the package
+  name onto it) and its directories did not exist.
+- **`File::GetFullPathName` did not know mode 4**, so a create fell through to
+  the "not on disk, so it must be a shipped asset" fallback and was handed a
+  read-only archive offset.
+
+Plus `sin`/`cos`/`pow`, which were a placeholder that did not even return 0 —
+it left the result register alone.
 
 The previous handoff's "immediate next task" (the `@assets.ap` parse) is **done**;
 its text is kept below only for the history of how it was found.
@@ -234,31 +263,65 @@ conditions you meant it to run under.**
 
 ## The immediate next task
 
-**Find out why the engine's software framebuffer is white.**
+**Make the UI act on a touch.**
 
-`SGL_FrameBufferToScreen` uploads a 384x256 RGB565 surface every frame and
-blits it. That surface is entirely `0xffff`. The engine composes the game into
-it in software (`SGL_grpFillRect`, `SGL_DrawTexture`,
-`SGL_LoadProjectionView_FrameBuffer`, `SGL_LoadProjectionView_Screen`), so a
-white one means the compositor is not writing, or is writing somewhere else.
-Everything visible on the canvas today is the GL splash overlay drawn on top of
-it, at ~20% — see the wash note at the top.
+The event reaches the engine: `nativeEvent` is called with the right type, slot
+and coordinates (verified from `[event]` in the log), `EventHandler_Wrapper`
+runs, and `handleCletEvent(0x18, ...)` is entered. What does not happen is
+anything downstream of that — neither the title screen nor the main menu
+reacts, and the whole `nativeEvent` call retires only ~1000 instructions.
+
+`handleCletEvent` is where to look. It already does real work — it calls
+`SGL_ChangeOrientationPosition`, `IsInAtPopupButton`, and `jGetOriginalWidth` /
+`jGetOriginalHeight` to rescale the coordinates — so the question is what it
+hands the event to afterwards and why that consumer never acts. Two hypotheses
+worth testing in order:
+
+1. **The coordinates are being mangled.** `jGetOriginalWidth/Height` read
+   globals written by `jSetOriginalSize`; if those are still zero the scale is
+   garbage and every hit-test misses. Log the two values and the transformed
+   coordinates that actually reach the hit-test.
+2. **The event is queued and the consumer is starved.** The engine has an
+   event/input queue (`INPUTQUEUE_Put` and friends). If `handleCletEvent` feeds
+   a queue that nothing drains on this path, the event vanishes silently.
+
+A cheaper parallel route, given the title is currently skipped anyway: the menu
+is drawn from `UI_listControl` (the 44-byte `UICONTROL` array the Vita port
+reads for its D-pad navigation — `state` @+0x0, `centerX/Y` @+0xc/+0x10,
+`width/height` @+0x14/+0x18, click callback @+0x28). Dumping it while the menu
+is up gives the real button rectangles *and* a way to invoke a button's click
+callback directly, which would separate "the coordinates miss" from "the click
+never reaches the button" in one run.
 
 Method that has worked on this codebase, and the one to repeat:
 
-1. `?gltrace=N` names every GL call in order with its arguments, and
-   `?dump=1` writes the framebuffer and the engine's own surfaces out as
-   base64 images. Together they say which draw put which pixels where, which
-   is what turned "the canvas is black" into "the CSFB is white and the splash
-   is drawn at 20%".
-2. When a value looks wrong, dump the guest buffer it came from and look at it
-   rather than reasoning about the state that produced it. Reading the splash
-   out of guest memory is what proved the engine's upload is correct and moved
-   the search off the texture path entirely.
-3. `tools/difftest.sh` still works and is still the fastest way to pin a
-   decoder bug; the oracle now covers `memcpy`/`memset`/`memcmp`/`strlen`/
-   `strcmp`/`strncmp`/`strcpy`/`strncpy` on both sides, so it runs past the
-   first import.
+1. **Read the PS Vita port first.** `../source/patch.c` documents ~100 corridas
+   of exactly these problems, and `../source/wr_touch.c` is the input state
+   machine. Its offsets are for a different APK build, but our `.so` exports
+   most of these globals in `.dynsym` (see below), so they resolve by name.
+2. **Probe by symbol, log on change only.** `spike_probe_loader()` is the model:
+   it reads `INITSTATE_nState` / `LoadFrameCnt` / `MEM_nUsedPoolSize` /
+   `GAMELOADER_pText` and logs only when one changes. That turned "stuck on a
+   screen" into the literal string `"File installation error (0)"` in one run.
+3. **Call guest functions from the frame boundary.** `spike_call1()` /
+   `spike_call2()` / `spike_call4()` do this; they are how
+   `RES_LoadToHeap("i_character.dat")` and `LZMA_Decode()` were each cleared in
+   one step, and how the state machine was driven directly. Never from a DOM
+   callback — `g_cpu` and `g_budget` are single globals.
+4. **Screenshot with `watch_run.mjs`, not `--screenshot`.** Headless
+   `--virtual-time-budget` cannot get far enough into a run to see anything
+   past the first splash.
+
+### The `.so` exports its own globals
+
+Worth knowing before disassembling anything: `game/libgame.so` puts its loader
+state in `.dynsym` as OBJECT symbols, so `elf_find_symbol()` reaches it by name
+and survives a different APK build — which the Vita port's hardcoded offsets do
+not. Confirmed present: `INITSTATE_nState`, `INITSTATE_LoadFrameCnt`,
+`GAMELOADER_pText`, `GAMELOADER_bInstalled`, `MEM_nUsedPoolSize`,
+`MEM_nTotalPoolSize`, `INSTALLBASE_pData`/`nRecordCount`/`nRecordSize`,
+`SYMBOLBASE_*`, `FILEPACK_*`, `GAMESTATE_nState`, `STATE_fpEnter`/`fpProcess`,
+and every `GAMELOADER_*` / `EXCELDATA_*` / `RES_*` / `LZMA_*` function.
 
 ### What the previous session found, in case it recurs
 
@@ -317,15 +380,16 @@ was already sitting in that stack slot"). Corridas 34, 35, 37 are all this area.
 
 ### What happens once it works
 
-The chain from there: `File::Open` → `MMappedFile::Open` → `mmap` (implemented
-and reads the archive at the offset) → PNG decode → `glTexImage2D` with real
-pixels. Only the PNG decode is left.
+The chain is already proven end to end: `File::Open` → `MMappedFile::Open` →
+`mmap` → PNG decode → `glTexImage2D` with real pixels → gl4es → WebGL2 → the
+canvas. The main menu is the evidence.
 
-Verify with the framebuffer dump in `gl.c`: it writes the engine's 384×256
-RGB565 surface to `fbNNN.raw`. Today those are 0/98304 or a single flat colour;
-**a dump with many distinct colours is the first frame.** (`fb001.raw` is now
-dumped from the resume path, so there is a file to watch; it is still
-`0/98304`.)
+The `fbNNN.raw` dumps that used to be the only way to see the engine's own
+surface are now behind `SPIKE_DUMP_FB=1` in `src/gl.c` — they wrote up to 80
+files of 192 KB into the working directory on every large texture upload, and
+44 of them had been committed by accident. `?dump=1` on the page is the better
+tool now: it reads the framebuffer back with `glReadPixels` and prints it, along
+with the engine's own surfaces, as base64 images.
 
 ### A cautionary note on probes
 
@@ -383,7 +447,44 @@ Also note: **`build.sh wasm` and `build.sh browser` both write
 
 ## The bug classes, because they recur
 
-Fifteen-plus bugs, all found by running. Grouped by what they teach.
+Twenty-plus bugs, all found by running. Grouped by what they teach.
+
+**Getting past the loading screen** (2026-10-17, later)
+
+These are the ones the PS Vita port had already solved; the lesson is to read
+`../source/patch.c` before reverse-engineering anything game-logic shaped.
+
+0f. **A shim that ignores its arguments is invisible until something needs
+   them.** `open()` opened every path `"rb"`. The port only ever read for
+   months, so nothing showed; the first writer — `GAMELOADER_ProcessInstall`,
+   creating twelve data files with `O_CREAT|O_WRONLY` — failed on all twelve and
+   the engine reported "File installation error (0)".
+0g. **A path with no trailing separator is a different path.** `GetUserDir`
+   returned `"/data"`; the engine concatenates the package name straight onto it
+   and every path became `/datacom.com2us...`. The Vita port returns
+   `"ux0:data/"`. The directories also have to exist — Android creates them, and
+   nothing did here.
+0h. **An unknown mode value falls into whatever the catch-all was written for.**
+   `File::GetFullPathName` handled 0/2/3; mode 4 (a create) fell through to the
+   "file is not on disk, so it must be a shipped asset" fallback, which returned
+   a read-only archive offset *for a write*. Write intent has to skip that
+   fallback.
+0i. **A budget sized for a frame is too small for a loader.** The instruction
+   budget is a runaway guard, but the install runs twelve LZMA decodes inside
+   one guest call. 200M stopped the run mid-install, which is indistinguishable
+   from a hang.
+0j. **A JNI handle table needs dedupe, not more slots.** Method and field ids
+   are stable per (class, name, signature); minting a fresh handle per lookup
+   fills any fixed table, and the failure is a null id rather than an error.
+0k. **`free()` must not leave the payload readable.** Code that re-reads a freed
+   node's first field gets away with it on Android because dlmalloc puts the
+   free-list link there. Leaving the data intact turns a benign use-after-free
+   into an infinite loop.
+0l. **A pattern scan that requires strict adjacency misses the real idiom.**
+   `patch_vm_caches` needed the vtable load and the `blx` through it back to
+   back, but the JavaVM idiom loads the call's own arguments in between. Scan a
+   small window instead — and keep the `blx` requirement, which is what still
+   separates a JavaVM cache from an intrusive list head.
 
 **Host and loader** (the browser build's bring-up, 2026-10-17)
 
