@@ -55,6 +55,8 @@ void host_browser_read_dump(void);
 void host_browser_read_gl_trace(void);
 void host_browser_read_fixed(void);
 void host_browser_read_frame_ms(void);
+void host_browser_read_trace(void);
+void spike_set_trace(int n);
 extern int g_browser_dump_screen;
 extern int g_browser_gl_trace;
 void host_browser_read_pixels(unsigned char *out, int w, int h, int step);
@@ -72,6 +74,10 @@ void host_browser_input_init(void);
 /* Browser build only: ?fixed=1, a fixed 16 ms step instead of real elapsed
  * time. Read at startup. */
 extern int g_browser_fixed;
+
+/* Browser build only: ?trace=1, the interpreter's instruction ring. Read at
+ * startup. */
+extern int g_browser_trace;
 
 /* Per-instruction trace sink, written from inside the interpreter loop.
  * Format is a contract with tools/oracle.py. */

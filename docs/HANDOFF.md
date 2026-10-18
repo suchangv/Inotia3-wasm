@@ -376,6 +376,72 @@ differ here -- deliberately: the browser has the fonts, and the Vita does not.
 
 ---
 
+### Progress since that (2026-10-19, the freeze)
+
+**The freeze was the CPU decoder missing Thumb-2's `movw`/`movt`.** The
+symptom: walking around, the moment the character picked an item up, the world
+stopped for good -- the engine kept ticking frames (33 instructions each,
+`draw=0`, `host_calls=0`) but nothing advanced, so the page was alive and the
+game was dead.
+
+The trail, once the port could see it:
+
+* Every occurrence left the guest at the *same* address: `pc=016d11ec
+  lr=0108c095`, and `016d11ec` is `MEM_pCurrentPool+0x176804` -- inside the
+  engine's own memory pool. The backtrace named the path:
+  `CHAR_PickItemAll -> INVEN_SaveItem -> INVEN_GetMoney`.
+* The instruction ring (`?trace=1`, below) showed the last instruction as
+  `0108c090 f245`. That is not a branch: it is the first half of
+  `movw r0, #0x52ad; movt r0, #0x0181; bx lr` -- i.e. "return 0x018152ad, the
+  address of the money field". The decoder's `11110` space handled only BL/BLX,
+  so it computed a branch offset out of the `movw` bits and jumped into the
+  pool.
+
+This is bigger than one function: **the .so is Thumb-2 code.** The APK files
+it under `lib/armeabi`, but it is built for ARMv7, while the interpreter is
+ARMv5TE/Thumb-1. Any ARMv7-only instruction on a path a player can reach was
+being mis-executed; this was the first one that mattered. `movw`/`movt` are
+implemented now, and the BL/BLX path *validates* its second halfword and traps
+with the full encoding instead of inventing a target out of whatever the bits
+happen to say.
+
+The unit test is a single call, because `INVEN_GetMoney` *is* that sequence:
+
+```
+./build/spike game/libgame.so --entry=108c091
+# before: 2 instrs -> pc 016d11ec (MEM_pCurrentPool+0x176804)
+# after:  5 instrs -> returned to caller, r0 = 018152ad
+```
+
+Getting there needed a diagnostic worth keeping: **when the guest PC leaves the
+image and is not the return sentinel, the run stops and prints a backtrace, the
+register file, and -- with `?trace=1` (browser) or `--trace` (native) -- the
+last 96 instructions.** That ring is what named the instruction; without it the
+freeze looked like a mysterious jump into the engine's heap, and the run kept
+limping, which is why it presented as a hang.
+
+Two unrelated bugs were found while chasing it, both worth having:
+
+* **The GL bridge's texture table could be written past its end.** `g_tex[64]`
+  records id -> size/format for the draw trace. A new id with the table full
+  fell through to `g_tex[i]` with `i == 64` -- a write past the array, into
+  whatever static the linker put after it. Every map brings its own atlases, so
+  the length of the session decided when. It holds 256 entries now and recycles
+  them (a one-line log says when).
+* **Decoded audio was never released.** `decodeAudioData` returns PCM at roughly
+  20x the compressed size, the engine plays a different track per map, and every
+  handle lives for the whole process. It is a 96 MB LRU now. Two supporting
+  fixes came out of testing it: `decodeAudioData` *detaches* the buffer it is
+  given, so it now gets a copy (otherwise an evicted sound could never be
+  decoded twice), and a looping sound that is already playing is no longer
+  restarted (the engine re-issues BGM plays as its state machine re-evaluates).
+
+A freeze now also leaves evidence: `tools/page-options.js` reports uncaught
+exceptions, a lost WebGL context, and main-thread stalls (the heartbeat prints
+how long the thread was blocked once it comes back).
+
+---
+
 ## What this is
 
 A browser port of Inotia 3 that runs the original ARM `libgame.so` — no Android,
@@ -478,6 +544,19 @@ tools/build.sh browser            # -> build/spike.html + .js + .wasm + .data
 tools/run_browser.sh 60 /tmp/x.png
 ```
 
+In a browser **the page needs a WebGL2 context or it stops with a clear line**
+(`gl: no WebGL2 context ...`). A Chrome with hardware acceleration off -- which
+is the norm under WSL -- will not fall back to software WebGL unless it is
+started with `--enable-unsafe-swiftshader`:
+
+```sh
+chrome --enable-unsafe-swiftshader http://localhost:8080/spike.html
+```
+
+Without it the context request returns 0, and before that message existed the
+page died in emscripten's glue with a `TypeError` inside
+`getSupportedExtensions` that named nothing at all.
+
 **Work on the native build.** It iterates in seconds, has a working crash
 handler that translates a host SIGSEGV back into a guest PC and register dump,
 and has the differential oracle. The browser build is for validating, not for
@@ -522,6 +601,12 @@ ships and the sound. What is left is adjacent:
   new-game save round-trips.
 - **`tools/difftest.sh`** — the oracle is still unusable; see "The differential
   oracle" below.
+- **The HUD's character portrait draws but shows nothing** (a transparent
+  hole). See the portrait note above: the texture is uploaded with real
+  pixels, the quad is drawn with an opaque colour, and the atlas region it
+  samples is opaque in the file, so the fault is narrower than "the asset is
+  missing" -- the next step is the one experiment the last session did not
+  finish (bind a known-white texture for that one draw).
 
 To reproduce the native chain (device pixels, one tap per line):
 

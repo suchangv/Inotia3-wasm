@@ -44,7 +44,7 @@
  * them for the life of the process (160 of them at boot), so this is sized for
  * the assets, not for the voices -- the host decides how many can sound at
  * once. Index 0 is not a handle, matching the Java side's "0 means failure". */
-#define SOUND_MAX       256
+#define SOUND_MAX       512
 #define SOUND_NAME_MAX  160
 
 typedef struct {
@@ -132,7 +132,15 @@ int sound_create(const char *name, int loop)
         }
     }
     if (!id) {
-        host_log("[snd] out of handle slots (%d)\n", SOUND_MAX);
+        /* Once, not once per attempt: the engine creates sounds as it meets
+         * new monsters and maps, and a full table would otherwise turn every
+         * such encounter into another log line. */
+        static int said;
+        if (!said) {
+            said = 1;
+            host_log("[snd] out of handle slots (%d) -- further sounds are "
+                     "dropped\n", SOUND_MAX);
+        }
         return 0;
     }
 

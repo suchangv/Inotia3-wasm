@@ -69,6 +69,7 @@ uint64_t *cpu_profile_counts(void);
 /* Ring buffer of the last N executed instructions, for bring-up. Safe to call
  * from a signal handler. */
 void cpu_enable_trace(int on);
+int  cpu_trace_is_on(void);
 void cpu_dump_trace(void);
 void cpu_trace_final(void);
 

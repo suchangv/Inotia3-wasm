@@ -535,7 +535,23 @@ text_init(find_symbol("FONT_pFontData"));
  * gl4es initialises -- with NOEGL nothing else can tell it the surface
  * size -- and gl4es has to be up before any guest GL call arrives. */
 host_browser_set_size(SCREEN_W, SCREEN_H);
-host_browser_gl_setup();
+if (!host_browser_gl_setup()) {
+    /* Stop *before* gl4es initialises. With no context, gl4es' own start-up
+     * asks GL for its version and extension list, and emscripten's glue then
+     * dereferences a null GL object -- a TypeError inside
+     * getSupportedExtensions whose text names nothing about the real problem.
+     * The context-creation failure is the whole story, so say it and stop.
+     *
+     * The usual cause is a browser with hardware acceleration off: it will not
+     * fall back to software WebGL unless it was started with
+     * --enable-unsafe-swiftshader, which is the case for Chrome in WSL. See
+     * "Build and run" in docs/HANDOFF.md. */
+    host_log("gl: no WebGL2 context, so there is nothing to draw into. "
+             "Hardware acceleration is probably off in this browser -- Chrome "
+             "needs --enable-unsafe-swiftshader to use its software renderer. "
+             "Not starting the engine.\n");
+    return 1;
+}
 gl4es_bridge_init(SCREEN_W, SCREEN_H);
 /* Per-call GL tracing is off unless the page asks for it: it is the first
  * thing to reach for when a draw misbehaves, and 600 lines of noise in
@@ -545,7 +561,17 @@ gl4es_bridge_init(SCREEN_W, SCREEN_H);
 
 cpu_init(&g_img);
 cpu_set_profile(g_do_profile);
+#ifdef __EMSCRIPTEN__
+/* main() has already read ?trace=1 by the time this runs, and the ring is
+ * configured here, not there: enabling it in main() was silently undone by
+ * this line. */
+cpu_enable_trace(g_trace_on || g_browser_trace);
+#else
 cpu_enable_trace(g_trace_on);
+#endif
+if (cpu_trace_is_on())
+    host_log("trace: instruction ring on -- the last 96 instructions are "
+             "dumped if the guest jumps out of the image\n");
     return 0;
 }
 
@@ -1379,6 +1405,31 @@ static int spike_tick(void)
         frame_insns += rf.insns;
         frame_secs += rf.seconds;
         reason = rf.reason;
+        /* The guest is allowed to leave the image at exactly one address: the
+         * sentinel the port planted (0badf00c), which is how a frame ends.
+         * Anywhere else it is a jump through a bad pointer, and the run keeps
+         * ticking from a state the engine never intended -- which is what "the
+         * game froze but the log keeps counting frames" looks like. Say where
+         * it came from, once, because no later line will. */
+        if (rf.reason == HALT_BAD_PC &&
+            g_cpu.r[15] != (RETURN_SENTINEL & ~1u)) {
+            host_log("  guest jumped out of the image: pc=%08x lr=%08x -- "
+                     "stopping, the engine's state cannot be trusted from "
+                     "here\n", g_cpu.r[15], g_cpu.r[14]);
+            guest_backtrace("jumped out of the image");
+            /* With the ring on (--trace / ?trace=1) the last 96 instructions
+             * are still in it, and the one that *made* the jump is the last
+             * entry: a `blx r3`, a `pop {pc}`, or whatever this port decoded
+             * wrongly. Without it, all that is known is where it landed. */
+            host_log("  regs r0-r12: %08x %08x %08x %08x %08x %08x %08x "
+                     "%08x %08x %08x %08x %08x %08x\n",
+                     g_cpu.r[0], g_cpu.r[1], g_cpu.r[2], g_cpu.r[3],
+                     g_cpu.r[4], g_cpu.r[5], g_cpu.r[6], g_cpu.r[7],
+                     g_cpu.r[8], g_cpu.r[9], g_cpu.r[10], g_cpu.r[11],
+                     g_cpu.r[12]);
+            cpu_dump_trace();
+            g_frames_max = g_frames_done + 1;
+        }
         if (rf.reason == HALT_BUDGET)
             break;
     }
@@ -1468,6 +1519,12 @@ int main(int argc, char **argv)
     host_browser_read_gl_trace();
     host_browser_read_fixed();
     host_browser_read_frame_ms();
+    host_browser_read_trace();
+    /* The browser's flags arrive *after* spike_load has configured the ring,
+     * so ?trace=1 has to turn it on here, where the flag is actually read --
+     * enabling it next to cpu_enable_trace() above silently does nothing. */
+    if (g_browser_trace)
+        g_trace_on = 1;
 #endif
     (void)0;
 

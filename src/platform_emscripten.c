@@ -175,6 +175,18 @@ EM_JS(void, spike_read_fixed_js, (void), {
 void spike_set_fixed(int n) { g_browser_fixed = n; }
 void host_browser_read_fixed(void) { spike_read_fixed_js(); }
 
+/* ?trace=1 turns on the interpreter's 96-instruction ring. It costs a little
+ * on every instruction, so it is off by default -- but it is what turns "the
+ * guest jumped into data" into "this instruction did it", and the dump only
+ * prints if something goes wrong. */
+int g_browser_trace;
+EM_JS(void, spike_read_trace_js, (void), {
+    if (typeof Module !== 'undefined' && Module.spikeTrace)
+        _spike_set_trace(1);
+});
+void spike_set_trace(int n) { g_browser_trace = n; }
+void host_browser_read_trace(void) { spike_read_trace_js(); }
+
 EM_JS(void, spike_read_dump_js, (void), {
     if (typeof Module !== 'undefined' && Module.spikeDumpScreen)
         _spike_set_dump_screen(1);

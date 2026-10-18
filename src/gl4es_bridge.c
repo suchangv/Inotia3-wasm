@@ -74,8 +74,17 @@ extern void set_getprocaddress(void *(*fn)(const char *));
  * binding is what tells them apart, and it is the only way to attribute a
  * wrong-looking draw to a texture in a build with no debugger. */
 static uint32_t g_cur_tex;
-static struct { uint32_t id, w, h, fmt; } g_tex[64];
-static int g_ntex;
+/* What a texture was created as (id -> w/h/format), for the draw trace only.
+ *
+ * A session outgrows any fixed table -- every map brings its own atlases, and
+ * a long one runs through hundreds of ids -- so a new id with the table full
+ * has to *replace* an entry. It used to fall through to `g_tex[i]` with
+ * i == the limit, which is a write past the end of this array: it corrupted
+ * whatever static followed it in the wasm data segment, and the length of a
+ * session decided when. Diagnostics must never be able to do that. */
+#define GTEX_MAX 256
+static struct { uint32_t id, w, h, fmt; } g_tex[GTEX_MAX];
+static int g_ntex, g_tex_next;
 
 /* The last RGBA upload at each of the sizes the engine composes with, so a
  * run can show what a draw is really sampling. */
@@ -662,7 +671,21 @@ int gl4es_dispatch(const char *name, const uint32_t *args, int nargs,
             int i;
             for (i = 0; i < g_ntex; i++)
                 if (g_tex[i].id == g_cur_tex) break;
-            if (i == g_ntex && g_ntex < 64) g_ntex++;
+            if (i == g_ntex) {
+                if (g_ntex < GTEX_MAX) {
+                    i = g_ntex++;
+                } else {
+                    static int said;
+                    if (!said) {
+                        said = 1;
+                        host_log("gl: more than %d textures this session; "
+                                 "the draw-trace table now recycles entries\n",
+                                 GTEX_MAX);
+                    }
+                    i = g_tex_next;
+                    g_tex_next = (g_tex_next + 1) % GTEX_MAX;
+                }
+            }
             g_tex[i].id = g_cur_tex; g_tex[i].w = a3; g_tex[i].h = a4;
             g_tex[i].fmt = a2;
         }

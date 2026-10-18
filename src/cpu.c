@@ -76,6 +76,7 @@ static uint32_t g_prev_pc;
 static int      g_have_prev;
 
 void cpu_enable_trace(int on) { g_tr_on = on; g_tr_i = 0; }
+int  cpu_trace_is_on(void) { return g_tr_on; }
 
 /* Emit the last executed instruction. The in-loop emit fires at the top of an
  * iteration, so whichever instruction caused the run to end would otherwise
@@ -700,6 +701,56 @@ int cpu_run(uint32_t entry, uint32_t sp, uint64_t budget)
             }
 
             default: {
+                /* ---- Thumb-2 data processing: movw / movt ----
+                 *
+                 * The 16-bit Thumb decoder's `11110` space is not only BL/BLX.
+                 * This binary is built for ARMv7 (the APK ships it under
+                 * lib/armeabi, but the code is Thumb-2), and the compiler
+                 * emits `movw`/`movt` there whenever a 32-bit constant has to
+                 * be materialised -- for example the address of a global:
+                 *
+                 *   INVEN_GetMoney:  movw r0, #0x52ad
+                 *                    movt r0, #0x0181     -> 0x018152ad, &money
+                 *                    bx   lr
+                 *
+                 * Decoding that as a BL meant the first item the player picked
+                 * up (CHAR_PickItemAll -> INVEN_SaveItem -> INVEN_GetMoney)
+                 * branched to a data address inside the engine's own pool
+                 * (MEM_pCurrentPool+0x176804) and the game stopped updating
+                 * while it kept ticking frames -- the "freeze". The unit test
+                 * is one call: --entry=108c091 used to end after 2
+                 * instructions at 016d11ec and now returns 018152ad.
+                 *
+                 * Encoding (ARM ARM A5.3.2/A5.3.3):
+                 *   movw  11110 i 10 0100 imm4   0 imm3 Rd imm8
+                 *   movt  11110 i 10 1100 imm4   0 imm3 Rd imm8
+                 * so hw1 & 0xFB00 == 0xF200 for both, bit 7 of hw1 picks movt,
+                 * and hw2's top bit must be 0. */
+                uint32_t op6 = (ins >> 4) & 0x3fu;
+                if ((ins & 0xfb00u) == 0xf200u &&
+                    (op6 == 0x24u || op6 == 0x2cu)) {   /* movw / movt */
+                    uint32_t hi16 = ins;
+                    uint32_t lo16 = LD16(pc + 2);
+                    if ((lo16 & 0x8000u) == 0) {
+                        uint32_t i     = (hi16 >> 10) & 1u;
+                        uint32_t imm4  = hi16 & 0xfu;
+                        uint32_t imm3  = (lo16 >> 12) & 7u;
+                        uint32_t rd    = (lo16 >> 8) & 0xfu;
+                        uint32_t imm8  = lo16 & 0xffu;
+                        uint32_t imm16 = (imm4 << 12) | (i << 11) |
+                                         (imm3 << 8) | imm8;
+                        int is_movt = (hi16 & 0x80u) != 0;
+                        if (is_movt)
+                            R[rd] = (R[rd] & 0x0000ffffu) | (imm16 << 16);
+                        else
+                            R[rd] = imm16;
+                        g_insn_count++;      /* a 32-bit instruction */
+                        pc += 4;
+                        R[15] = pc;
+                        continue;
+                    }
+                }
+
                 /* format 19: long branch with link.
                  *
                  * BL and BLX share this encoding and are told apart by bit 12
@@ -723,6 +774,12 @@ int cpu_run(uint32_t entry, uint32_t sp, uint64_t budget)
                  * pc=0x0cf426 (f789 eaea, H=0) -> 0x0589fe, the ARM .plt. */
                 uint32_t hi = ins;
                 uint32_t lo = LD16(pc + 2);
+                /* hw2's top five bits are 11111 for BL and 11101 for BLX. Any
+                 * other value is a Thumb-2 encoding this decoder does not
+                 * implement -- trap with it instead of computing a branch
+                 * offset from whatever the bits happen to say. */
+                if ((lo >> 11) != 0x1fu && (lo >> 11) != 0x1du)
+                    return trap(pc, (hi << 16) | lo, 4);
                 g_insn_count++;
                 uint32_t S = (hi >> 10) & 1;
                 uint32_t imm10 = hi & 0x3ff;

@@ -143,7 +143,7 @@ build_browser() {
         -sMIN_WEBGL_VERSION=2 -sMAX_WEBGL_VERSION=2 \
         -sEXIT_RUNTIME=0 \
         -sEXPORTED_RUNTIME_METHODS=ccall,cwrap \
-        -sEXPORTED_FUNCTIONS=_main,_spike_set_frames,_spike_set_dump_screen,_spike_set_gl_trace,_spike_set_fixed,_spike_set_frame_ms,_spike_input_down,_spike_input_move,_spike_input_up,_spike_input_release_all \
+        -sEXPORTED_FUNCTIONS=_main,_spike_set_frames,_spike_set_dump_screen,_spike_set_gl_trace,_spike_set_fixed,_spike_set_frame_ms,_spike_set_trace,_spike_input_down,_spike_input_move,_spike_input_up,_spike_input_release_all \
         $PRELOAD \
         -o build/spike.html
     echo "   -> build/spike.html (serve this directory and open the page)"

@@ -28,6 +28,12 @@
   // The language the game draws in. Absent, the page uses navigator.language
   // (the host's own locale, which is what Android does); ?lang=ko forces one.
   if (q.has('lang'))   M.spikeLang = q.get('lang');
+  // Dump the interpreter's last 96 instructions when the guest jumps into
+  // data. Costs a little on every instruction, so opt in when hunting.
+  if (q.has('trace'))  M.spikeTrace = num('trace');
+  // Decoded-audio budget in MB (see tools/sound.js). A low value stresses the
+  // eviction/re-decode path; the default is 96.
+  if (q.has('pcmmax')) M.spikePcmMax = num('pcmmax');
 
   // Do not let stdout go into the shell's <textarea id="output">.
   //
@@ -46,4 +52,49 @@
   // nowhere else.
   M.print = function (line) { console.log(line); };
   M.printErr = function (line) { console.error(line); };
+
+  // ---- crash and stall reporting -------------------------------------------
+  //
+  // A browser build has no core dump, and this port logs nothing unless the
+  // page asks: when the game freezes or dies, the only evidence is what the
+  // page chose to print. These are the three silent failures worth naming --
+  // an exception the wasm did not catch, a main-thread stall, and a lost
+  // WebGL context -- and each says something specific enough to act on.
+  //
+  // The stall line is the one to look for after a freeze: it prints the gap
+  // when the thread comes back, so a long single stall (one huge frame) and a
+  // run of short ones (the renderer being squeezed) look different.
+  window.addEventListener('error', function (e) {
+    console.error('[fatal] ' + (e.message || e.type) +
+                  (e.filename ? ' at ' + e.filename + ':' + e.lineno : ''));
+  });
+  window.addEventListener('unhandledrejection', function (e) {
+    var r = e.reason;
+    console.error('[fatal] unhandled rejection: ' +
+                  (r && r.message ? r.message : r));
+  });
+
+  var lastBeat = performance.now();
+  (function beat() {
+    var now = performance.now();
+    if (now - lastBeat > 4000)
+      console.error('[stall] main thread blocked for ' +
+                    ((now - lastBeat) / 1000).toFixed(1) + ' s');
+    lastBeat = now;
+    requestAnimationFrame(beat);
+  })();
+
+  // The canvas is created by the generated page, so wait for it.
+  var waitCanvas = setInterval(function () {
+    var c = document.querySelector('canvas');
+    if (!c)
+      return;
+    clearInterval(waitCanvas);
+    c.addEventListener('webglcontextlost', function () {
+      console.error('[fatal] WebGL context lost -- the GPU process dropped it');
+    });
+    c.addEventListener('webglcontextrestored', function () {
+      console.log('[webgl] context restored');
+    });
+  }, 250);
 })();
