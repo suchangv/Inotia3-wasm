@@ -275,6 +275,198 @@ static int trap(uint32_t pc, uint32_t insn, int width)
 
 /* ---- the interpreter ----------------------------------------------------- */
 
+
+/* ---- Thumb-2, the encodings this binary actually uses ---------------------
+ *
+ * The .so is built for ARMv7 (see the movw/movt note below the decoder), so it
+ * contains 32-bit Thumb-2 instructions that a plain Thumb-1 decoder does not
+ * have. What it uses, measured by disassembling every byte covered by a FUNC
+ * symbol in .text and subtracting the encodings implemented here and in the
+ * main loop, is a short list:
+ *
+ *   data processing, shifted register   and/orr/eor/bic/orn/add/sub/rsb/adc/
+ *                                       sbc/cmp/tst/teq with .w -- 0xEA00..
+ *   block transfer (wide)               ldm/stm/ldmdb/stmdb -- 0xE8xx/0xE9xx
+ *   push.w / pop.w                      0xE92D / 0xE8BD
+ *   ldrd / strd                         0xE8xx/0xE9xx with bit 6 set
+ *
+ * Anything else in the 32-bit space still traps, with its encoding, rather
+ * than being guessed at -- that is what turned the item-pickup freeze into a
+ * one-line diagnosis.
+ *
+ * Returns 1 if it handled the instruction (R[15] is the next PC), 0 if this is
+ * not one of the above.
+ */
+static int thumb2_exec(uint32_t pc, uint32_t h1, uint32_t h2, uint32_t *R)
+{
+    /* ---- data processing (shifted register): 11101 01 op S Rn ---- */
+    if ((h1 & 0xfe00u) == 0xea00u && (h2 & 0x8000u) == 0) {
+        uint32_t op  = (h1 >> 5) & 0xfu;
+        uint32_t S   = (h1 >> 4) & 1u;
+        uint32_t rn  = h1 & 0xfu;
+        uint32_t imm3 = (h2 >> 12) & 7u;
+        uint32_t rd  = (h2 >> 8) & 0xfu;
+        uint32_t imm2 = (h2 >> 6) & 3u;
+        uint32_t type = (h2 >> 4) & 3u;
+        uint32_t rm  = h2 & 0xfu;
+        uint32_t shc = 0, op2;
+        uint32_t n_shift = (imm3 << 2) | imm2;
+
+        if (rm == 15)
+            return 0;                    /* PC operand: not emitted here */
+        switch (type) {
+        case 0: op2 = sh_lsl(R[rm], n_shift, &shc); break;
+        case 1: op2 = sh_lsr(R[rm], n_shift ? n_shift : 32, &shc); break;
+        case 2: op2 = sh_asr(R[rm], n_shift ? n_shift : 32, &shc); break;
+        default:
+            if (n_shift == 0) {          /* ROR #0 is RRX, not a rotate */
+                shc = (R[rm] & 1u) ? F_C : 0;
+                op2 = (R[rm] >> 1) |
+                      ((g_cpu.cpsr & F_C) ? 0x80000000u : 0);
+            } else {
+                op2 = sh_ror(R[rm], n_shift, &shc);
+            }
+            break;
+        }
+
+        uint32_t a = R[rn];
+        uint32_t res, flags_in = g_cpu.cpsr & (F_N | F_Z | F_C | F_V);
+        int logical = 0;
+        switch (op) {
+        case 0x0: res = a & op2;  logical = 1; break;              /* AND */
+        case 0x1: res = a & ~op2; logical = 1; break;              /* BIC */
+        case 0x2: res = a | op2;  logical = 1; break;              /* ORR */
+        case 0x3: res = a | ~op2; logical = 1; break;              /* ORN */
+        case 0x4: res = a ^ op2;  logical = 1; break;              /* EOR */
+        case 0x8: res = add_c(a, op2, 0); break;                   /* ADD */
+        case 0xa: res = add_c(a, op2, (g_cpu.cpsr & F_C) ? 1 : 0); break; /* ADC */
+        case 0xb: res = sub_c(a, op2, (g_cpu.cpsr & F_C) ? 1 : 0); break; /* SBC */
+        case 0xd: res = sub_c(a, op2, 1); break;                   /* SUB */
+        case 0xe: res = sub_c(op2, a, 1); break;                   /* RSB */
+        default: return 0;
+        }
+
+        if (S) {
+            set_nz(res);
+            if (logical)
+                g_cpu.cpsr = (g_cpu.cpsr & ~F_C) | shc;
+        } else {
+            g_cpu.cpsr = (g_cpu.cpsr & ~(F_N | F_Z | F_C | F_V)) | flags_in;
+        }
+        if (rd == 15) {
+            /* Rd=15 with S is the compare/test form (CMP/CMN/TST/TEQ); without
+             * S it is a computed jump that does not interwork. */
+            R[15] = S ? pc + 4 : (res & ~1u);
+            if (!S)
+                g_thumb = (res & 1u) != 0;
+            return 1;
+        }
+        R[rd] = res;
+        R[15] = pc + 4;
+        return 1;
+    }
+
+    /* ---- push.w / pop.w ---- */
+    if (h1 == 0xe92du || h1 == 0xe8bdu) {
+        int push = h1 == 0xe92du;
+        uint32_t list = h2 & 0x1fffu;
+        if (!push)                       /* pop.w may name PC */
+            list |= h2 & 0x8000u;
+        else                             /* push.w may name LR */
+            list |= h2 & 0x4000u;
+        uint32_t n = 0;
+        for (int i = 0; i < 16; i++)
+            if (list & (1u << i)) n++;
+        if (!n)
+            return 0;
+        if (push) {
+            R[13] -= 4 * n;
+            uint32_t addr = R[13];
+            for (int i = 0; i < 16; i++)
+                if (list & (1u << i)) { ST32(addr, R[i]); addr += 4; }
+            R[15] = pc + 4;
+        } else {
+            uint32_t pcval = 0;
+            int popped_pc = 0;
+            for (int i = 0; i < 16; i++)
+                if (list & (1u << i)) {
+                    uint32_t v = LD32(R[13]); R[13] += 4;
+                    if (i == 15) { pcval = v; popped_pc = 1; }
+                    else R[i] = v;
+                }
+            if (popped_pc) { R[15] = pcval & ~1u; g_thumb = (pcval & 1u) != 0; }
+            else R[15] = pc + 4;
+        }
+        return 1;
+    }
+
+    /* ---- ldrd / strd: 1110 100 P U 1 W L Rn  (bit 6 set) ---- */
+    if ((h1 & 0xfe40u) == 0xe840u) {
+        int P = (h1 >> 8) & 1, U = (h1 >> 7) & 1;
+        int W = (h1 >> 5) & 1, L = (h1 >> 4) & 1;
+        uint32_t rn = h1 & 0xfu;
+        uint32_t rt = (h2 >> 12) & 0xfu, rt2 = (h2 >> 8) & 0xfu;
+        uint32_t imm = (h2 & 0xffu) * 4u;
+        uint32_t off = U ? imm : (uint32_t) -(int32_t) imm;
+        if (rt == 15 || rt2 == 15)
+            return 0;
+        uint32_t ea = P ? R[rn] + off : R[rn];
+        if (L) { R[rt] = LD32(ea); R[rt2] = LD32(ea + 4); }
+        else   { ST32(ea, R[rt]); ST32(ea + 4, R[rt2]); }
+        if (W || !P)
+            R[rn] = R[rn] + off;
+        R[15] = pc + 4;
+        return 1;
+    }
+
+    /* ---- block transfer (wide): 1110 100 P U 0 W L Rn (bit 6 clear) ---- */
+    if ((h1 & 0xfe40u) == 0xe800u) {
+        int P = (h1 >> 8) & 1, U = (h1 >> 7) & 1;
+        int W = (h1 >> 5) & 1, L = (h1 >> 4) & 1;
+        uint32_t rn = h1 & 0xfu;
+        uint32_t list = h2 & 0xffffu;
+        if (list & 0x2000u)              /* bit 13 is reserved */
+            return 0;
+        uint32_t n = 0;
+        for (int i = 0; i < 16; i++)
+            if (list & (1u << i)) n++;
+        if (!n)
+            return 0;
+
+        uint32_t base;
+        if (U) base = P ? R[rn] + 4 : R[rn];
+        else   base = P ? R[rn] - 4 * n : R[rn] - 4 * n + 4;
+
+        uint32_t pcval = 0;
+        int loaded_pc = 0;
+        uint32_t addr = base;
+        for (int i = 0; i < 16; i++) {
+            if (!(list & (1u << i)))
+                continue;
+            if (L) {
+                uint32_t v = LD32(addr);
+                if (i == 15) { pcval = v; loaded_pc = 1; }
+                else R[i] = v;
+            } else {
+                ST32(addr, R[i]);
+            }
+            addr += 4;
+        }
+        if (W)
+            R[rn] = U ? R[rn] + 4 * n : R[rn] - 4 * n;
+
+        if (loaded_pc) {
+            R[15] = pcval & ~1u;
+            g_thumb = (pcval & 1u) != 0;
+        } else {
+            R[15] = pc + 4;
+        }
+        return 1;
+    }
+
+    return 0;
+}
+
 int cpu_run(uint32_t entry, uint32_t sp, uint64_t budget)
 {
     uint32_t *R = g_cpu.r;
@@ -690,8 +882,13 @@ int cpu_run(uint32_t entry, uint32_t sp, uint64_t budget)
 
             case 0xe: {
                 /* format 18: unconditional branch */
-                if ((ins & 0xF800) != 0xE000)
-                    return trap(pc, ins, 2);
+                if ((ins & 0xF800) != 0xE000) {
+                    uint32_t h2 = LD16(pc + 2);
+                    g_insn_count++;      /* 32-bit instruction */
+                    if (thumb2_exec(pc, ins, h2, R))
+                        break;
+                    return trap(pc, (ins << 16) | h2, 4);
+                }
                 soff = (int32_t)(ins & 0x7ff);
                 soff = (soff << 21) >> 21;
                 pc = (uint32_t)((int32_t)(pc + 4) + (soff << 1));

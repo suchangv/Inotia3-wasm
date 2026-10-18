@@ -1411,6 +1411,17 @@ static int spike_tick(void)
          * ticking from a state the engine never intended -- which is what "the
          * game froze but the log keeps counting frames" looks like. Say where
          * it came from, once, because no later line will. */
+        if (rf.reason == HALT_TRAP) {
+            /* A trap is a valid instruction the interpreter chose not to
+             * emulate. Print the encoding and what led to it: the ring's last
+             * entry is the instruction itself. */
+            host_log("  unimplemented instruction at pc=%08x ins=%08x "
+                     "(width %d), lr=%08x\n",
+                     g_cpu.r[15], g_fault_insn, g_fault_width,
+                     g_cpu.r[14]);
+            cpu_dump_trace();
+            g_frames_max = g_frames_done + 1;
+        }
         if (rf.reason == HALT_BAD_PC &&
             g_cpu.r[15] != (RETURN_SENTINEL & ~1u)) {
             host_log("  guest jumped out of the image: pc=%08x lr=%08x -- "
