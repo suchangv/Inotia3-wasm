@@ -651,6 +651,41 @@ static FILE *g_files[FIOMAX];
 static char  g_file_path[FIOMAX][256];
 static char  g_path_buf[512];
 
+/* Create every missing directory on the way to `path`'s parent.
+ *
+ * The engine composes its save file name as "<MD5(HubSave key)>/saveN.dat" --
+ * always a subdirectory -- and the only code that would ever create that
+ * subdirectory is HubSave_MakeFolder, which runs only after
+ * HubSave_LoadKey() succeeds, i.e. after the Hub/social login. An offline port
+ * has no such login (GetAppProperty and GetUDID are not registered, so the key
+ * stays empty), so the directory is never made, CS_fsOpen's open(O_CREAT) on
+ * "<dir>/saveN.dat" fails with ENOENT, and the game reports "Save failed".
+ * The parent port fixed this the same way (its patch.c, Corrida 62) -- this is
+ * that fix in the one place every write in this .so goes through.
+ *
+ * Idempotent, and only ever called for a creating open; a directory that
+ * already exists, or a parent that is read-only, just leaves mkdir's error
+ * unread. */
+static void ensure_parent_dirs(const char *path)
+{
+    char tmp[512];
+    size_t n = strlen(path);
+    if (n == 0 || n >= sizeof(tmp))
+        return;
+    memcpy(tmp, path, n + 1);
+    for (size_t i = 1; i < n; i++) {
+        if (tmp[i] != '/')
+            continue;
+        tmp[i] = 0;
+        if (mkdir(tmp, 0777) == 0) {
+            static int said;
+            if (said++ < 8)
+                host_log("  [fs] created directory %s\n", tmp);
+        }
+        tmp[i] = '/';
+    }
+}
+
 static void guest_path(uint32_t addr, char *out, size_t cap)
 {
     size_t i = 0;
@@ -1330,6 +1365,11 @@ void host_import_call(guest_import *im)
         int app = (flags & 0x400u) != 0;    /* O_APPEND */
         int cre = (flags & 0x40u) != 0;     /* O_CREAT  */
         int tr  = (flags & 0x200u) != 0;    /* O_TRUNC  */
+        /* A creating open must not fail just because its parent directory was
+         * never made -- that is exactly the "Save failed" bug. See
+         * ensure_parent_dirs(). */
+        if (cre)
+            ensure_parent_dirs(g_path_buf);
         const char *mode;
         if (app)              mode = wr ? "ab" : "ab";
         else if (cre && wr)   mode = (tr || (flags & 0x80u)) ? "wb" : "r+b";

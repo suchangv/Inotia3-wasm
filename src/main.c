@@ -572,7 +572,7 @@ cpu_enable_trace(g_trace_on);
 if (cpu_trace_is_on())
     host_log("trace: instruction ring on -- the last 96 instructions are "
              "dumped if the guest jumps out of the image\n");
-    return 0;
+return 0;
 }
 
 
