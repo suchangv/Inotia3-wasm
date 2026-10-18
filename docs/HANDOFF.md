@@ -442,6 +442,55 @@ how long the thread was blocked once it comes back).
 
 ---
 
+### Progress since that (2026-10-19, the rest of Thumb-2, the save, the portrait)
+
+**The decoder now covers everything the binary actually uses.** Disassembling
+every byte covered by a FUNC symbol in .text, minus the encodings already
+handled, left four groups, and they are implemented: the `.w` data-processing
+forms (`and/orr/eor/bic/orn/add/sub/rsb/adc/sbc/cmp/tst/teq`, shifted operands
+including RRX, and the S-flag rules the ARM path already established); wide
+`ldm/stm/ldmdb/stmdb`; `push.w`/`pop.w`; and `ldrd`/`strd`. Everything else in
+that space still traps, and a trap now prints the encoding and the last 96
+instructions.
+
+**Save works.** The engine composes its save path as
+`<MD5(HubSave key)>/saveN.dat` -- a subdirectory -- and the only code that
+would create that subdirectory runs after the Hub/social login, which an
+offline port does not have. The native run shows it plainly:
+
+```
+[io] open ./data/com.com2us.../e133100100b953020500100100000000/save0.dat FAILED
+```
+
+so the write failed with ENOENT and the game reported "failed". The host
+`open()` shim now creates the parent directories for a creating open (the same
+fix the parent port made in its `CS_fsOpen` hook, applied one layer down where
+every write already goes through).
+
+**The portrait is narrowed, not solved.** What is known:
+
+* the top-left quad is drawn with texture 54 (512x512 RGBA), an opaque
+  `glColor4x`, the colour array disabled, and sane texcoords that map to a
+  region that is opaque in all nine `portraitN.png` files;
+* with texturing *disabled* for that one draw, the character's face appears
+  (screenshot), so geometry, colour, blending and coverage are all fine and
+  what fails is the sampling of that texture;
+* the later builds no longer show that quad in the corner draws sampled so far,
+  which suggests it is drawn more than once and an empty one lands on top.
+
+Next step is the one that was started: inventory the draws for a single HUD
+frame (not the first N of the run) and compare the two that share the corner.
+
+**Linux / Android.** The browser is the only host with the full stack
+(renderer, fonts for every language, audio); the native build is the
+debugging/measurement host and has no window on purpose. `tools/play-linux.sh`
+is the Linux answer: it builds the browser target if needed, serves it on
+localhost and opens it. A native windowed build would need SDL2 (not installed
+here), a font backend (there is no Canvas, so CJK would regress to the bitmap
+fallback) and an audio backend -- a separate project, not a build flag.
+
+---
+
 ## What this is
 
 A browser port of Inotia 3 that runs the original ARM `libgame.so` — no Android,
