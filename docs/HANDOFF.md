@@ -41,6 +41,11 @@ loose ends (audio, the save round-trip, and the unusable `difftest.sh`).
   Vita port documents for the title screen's handler.
 - **The loader completes.** `INITSTATE_nState` goes 0 → 1 → 2 and the twelve
   data files are installed into the app directory.
+- **The opening event's two SKIP presses are the game's own logic.** The class
+  confirm drops into `GAMESTATE_nState` 13 (a black screen with a **SKIP**
+  control at the top right, UI centre `(449,17)`), one press is not enough, and
+  a second press reaches the play state `GAMESTATE_nState` 2. Confirmed against
+  a device by the user: not a port artefact, and not something to chase.
 - **The CLI baseline is intact.** `tools/build.sh native &&
   ./build/spike game/libgame.so --boot --frames=600 --no-profile` still prints
   `average over 119 frame(s): 8701 instructions` and `final pc=0badf00c`, byte
@@ -282,6 +287,9 @@ alpha, exactly as the engine expects on Android. The bisect that established
 this (a solid fill of the same rect, then a trace of the draw) is removed again,
 per the ground rule that diagnostics do not stay.
 
+*(Superseded the next day: the bitmap font described above is what the native
+runner still draws with. The browser renders real fonts as of 2026-10-19.)*
+
 ---
 
 ### Progress since that (2026-10-18, the sound)
@@ -322,6 +330,49 @@ Two details worth knowing:
   images and now resolves sounds through it too.
 * **The volume is 0..100, not a fraction** -- confirmed from the guest:
   `SoundSetVolume(160 "Title.ogg", 100)` on the first music play.
+
+---
+
+### Progress since that (2026-10-19, the fonts)
+
+**The text is a real font now, in every language the game ships.** The first
+text pass drew with the engine's own bitmap font (`FONT_pFontData`, the 5x10
+glyph records `GRP_PutAsciiChar` blits) and that was the wrong font twice over:
+at the sizes the game asks for it reads as a dot matrix once the engine scales
+it onto a 960x544 screen, and it has no glyphs above U+007F at all, so every
+localized string came out as correctly-spaced blanks.
+
+The bytes handed over are UTF-8, not a legacy codepage. Confirmed by asking for
+another language (SPIKE_LANG=ko) and reading the draw: the class description
+starts `ea b1 b0 ec b9 a0 ea b3 a0` = "거칠고" ("rough"). So there was nothing to
+transcode -- the renderer just had to be a real one:
+
+* **Browser**: `tools/text.js`, Canvas2D with `serif` -- the family
+  `WrapperRenderer.java` asks Android for (`Typeface.SERIF`, still a string in
+  the APK's classes.dex) -- and the browser's own per-script fallback behind it.
+  That is Android's arrangement exactly, and it is why Chinese, Japanese and
+  Korean come out right without the port shipping or downloading a font: the
+  platform had the fonts all along, on both sides.
+* **Native**: still the engine's bitmap font, ASCII only. It is the debugging
+  host; what a player sees is the browser.
+
+Layout (wrapping, alignment, line height) stayed in `text.c`, which asks the
+host for two primitives only -- the width of a run of text and the painting of
+one line -- so the size the engine is told and the pixels it reads back cannot
+come from different metrics. The wrap is one greedy pass for every script:
+prefer the last whitespace on the line, and when there is none break at the
+character that overflowed, which is how CJK wraps anyway.
+
+**The language is the host's locale.** `host_language()` (platform_*.c)
+answers with `navigator.language` in the browser -- Android's
+`Locale.getDefault()`, which is what the Java side answered -- so a Chinese or
+Korean browser gets the game in its own language with no setting at all.
+`?lang=zh-CN` (browser) and `SPIKE_LANG=zh-CN` (native) force one for testing;
+`ko-KR`, `zh-CN`, `zh-TW`, `ja-JP` and `fr-FR` all select their file.
+
+For the record, the retired bitmap path is what the parent Vita port does too
+(`source/java.c` sums the engine's own per-byte metric), so the two ports now
+differ here -- deliberately: the browser has the fonts, and the Vita does not.
 
 ---
 
@@ -383,6 +434,7 @@ tools/
   build_gl4es.sh       fetch and build gl4es into vendor/ (gitignored)
   gen_gl4es_protos.sh  regenerate gl4es_protos.h
   sound.js             the browser's WebAudio backend for sound.c
+  text.js              the browser's Canvas2D backend for text.c
   page-options.js      browser CPU/GL options (they have to run before init)
   trap.js              unpack a wasm trap into named frames
   run_browser.sh       serve build/ and screenshot with headless Chrome
@@ -462,16 +514,9 @@ conditions you meant it to run under.**
 **Nothing blocks reaching gameplay. These are the loose ends.**
 
 Gameplay is confirmed in both hosts — the native runner and the browser — with
-the map, the character, the HUD, the minimap, the text and the sound. What is
-left is adjacent:
+the map, the character, the HUD, the minimap, the text in every language it
+ships and the sound. What is left is adjacent:
 
-- **The opening event leaves only on SKIP, and it needs two presses.** The class
-  confirm drops into `GAMESTATE_nState` 13 (a black screen with a **SKIP**
-  control at the top right, UI centre `(449,17)`). One SKIP press is not enough:
-  two SKIP presses (any spacing tried, ~200..1000 frames apart) reach the play
-  state `GAMESTATE_nState` 2, which draws the map; taps elsewhere never leave it.
-  A device probably also ends it on a timer or on a tap anywhere; if the port
-  needs that, the event system (`EVTSYSTEM_*`) is where to look.
 - **A save slot.** After entering play the log still shows `save0.dat` missing.
   That may be correct (nothing is saved until the player saves), but confirm a
   new-game save round-trips.

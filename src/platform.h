@@ -33,6 +33,14 @@ const char *host_app_data_dir(const char *package);
  * the host has no such notion (the browser). */
 void host_install_crash_handler(void);
 
+/* The host's own locale, which is what WrapperJinterface.GetLanguage() answers
+ * on Android (Locale.getDefault()) and what the engine turns into a language:
+ * the first two letters pick the text file (memorytext.dat / _en / _jp / _fr /
+ * _zhhans / _zhhant -- all UTF-8), so "ko-KR", "zh-CN" and "fr-FR" all work.
+ * The browser answers with navigator.language; the native runner has no locale
+ * of its own and takes SPIKE_LANG=... or "en". */
+const char *host_language(void);
+
 /* Browser build only: create the WebGL context on the generated canvas.
  * Returns 0 if the context could not be created. */
 int host_browser_gl_setup(void);

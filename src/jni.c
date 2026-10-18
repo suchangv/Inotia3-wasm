@@ -755,7 +755,13 @@ int jni_host_call(const char *name, uint32_t *args, int nargs, uint32_t *ret_lo,
                     return 1;
                 }
                 if (strcmp(n, "GetLanguage") == 0) {
-                    *ret_lo = jni_host_new_string("en");
+                    /* The device locale, which is what selects the localized
+                     * text file (memorytext.dat / _en / _jp / _fr / _zhhans /
+                     * _zhhant -- all of them UTF-8). "en" is the locale that
+                     * matches the en_US row of the table built below; the
+                     * native runner can be pointed at another one with
+                     * SPIKE_LANG=ko (or ja, zh, fr) to exercise its script. */
+                    *ret_lo = jni_host_new_string(host_language());
                     st->implemented = 1; return 1;
                 }
                 if (strcmp(n, "GetCountry") == 0) {
@@ -818,12 +824,15 @@ int jni_host_call(const char *name, uint32_t *args, int nargs, uint32_t *ret_lo,
                  * follow the literal signatures from the .so's .rodata --
                  * DrawText "([BII)I", DrawTextInRect "([BIIIII)I",
                  * GetStringWidthHeightInRect "(Ljava/lang/String;IIII[I)I",
-                 * GetStringWidth "(Ljava/lang/String;II)I". */
+                 * GetStringWidth "(Ljava/lang/String;II)I". args[4] is the
+                 * font size in every one of them (confirmed at the call site:
+                 * 14 for a label, 12 for the stat values, 0 for the style). */
                 if (strcmp(n, "GetStringWidthHeightInRect") == 0) {
                     char text[TEXT_MAX];
                     jni_read_text_arg(args[3], text, sizeof(text));
                     int w = 0, h = 0;
-                    text_measure_width_height(text, (int) args[6], &w, &h);
+                    text_measure_width_height(text, (int) args[4], (int) args[6],
+                                              &w, &h);
                     if (g_jni_verbose) {
                         static int nn;
                         if (nn < 12) {
@@ -847,21 +856,23 @@ int jni_host_call(const char *name, uint32_t *args, int nargs, uint32_t *ret_lo,
                 if (strcmp(n, "GetStringWidth") == 0) {
                     char text[TEXT_MAX];
                     jni_read_text_arg(args[3], text, sizeof(text));
-                    *ret_lo = (uint32_t) text_measure_width(text);
+                    *ret_lo = (uint32_t) text_measure_width(text, (int) args[4]);
                     st->implemented = 1; return 1;
                 }
                 if (strcmp(n, "DrawTextInRect") == 0) {
                     jni_handle *bh = handle_of(args[3]);
                     if (bh && bh->kind == H_ARRAY && bh->guest && bh->elem == 1)
                         text_draw_in_rect(g_mem + bh->guest, (int) bh->len,
-                                          (int) args[6], (int) args[7]);
+                                          (int) args[4], (int) args[6],
+                                          (int) args[7]);
                     *ret_lo = 0;
                     st->implemented = 1; return 1;
                 }
                 if (strcmp(n, "DrawText") == 0) {
                     jni_handle *bh = handle_of(args[3]);
                     if (bh && bh->kind == H_ARRAY && bh->guest && bh->elem == 1)
-                        text_draw(g_mem + bh->guest, (int) bh->len, (int) args[5]);
+                        text_draw(g_mem + bh->guest, (int) bh->len,
+                                  (int) args[4], (int) args[5]);
                     *ret_lo = 0;
                     st->implemented = 1; return 1;
                 }

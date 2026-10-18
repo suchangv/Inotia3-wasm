@@ -250,6 +250,9 @@ void host_fatal(const char *fmt, ...)
 
 double host_now(void) { return js_now(); }
 
+/* No locale, no text: the throughput build never draws. */
+const char *host_language(void) { return "en"; }
+
 /* ---- allocation ----------------------------------------------------------
  *
  * A bump allocator over wasm linear memory, growing as needed. Enough for what

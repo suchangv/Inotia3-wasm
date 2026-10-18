@@ -24,38 +24,37 @@
  * rasterising into it *is* the render; there is no second JNI round trip to
  * invent.
  *
- * Glyphs come from the engine's own bitmap font rather than a TrueType
- * rasteriser. The lookup is exactly GRP_PutAsciiChar's (guest 0x6b580):
+ * The bytes are UTF-8 -- confirmed, not assumed: with GetLanguage answering
+ * "ko" the first draw of the class description is
+ * `ea b1 b0 ec b9 a0 ea b3 a0` = "거카고", and the English locale draws plain
+ * ASCII. So the text needs a real font stack, per script:
  *
- *   record = FONT_pFontData + 0xb10 + (ch - 0x21) * 0xc      ch in 0x21..0x7e
+ *   - In the browser the host does it (tools/text.js): Canvas2D, with `serif`
+ *     as the family and the browser's own per-script fallback behind it. That
+ *     is the same arrangement Android has -- WrapperRenderer.java asks for
+ *     Typeface.SERIF and lets the platform find the glyph -- and it is what
+ *     gives antialiased Latin *and* Chinese/Korean/Japanese without the port
+ *     shipping or downloading a font of its own.
+ *   - In the native runner there is no such stack, so the fallback rasteriser
+ *     below blits the engine's own bitmap font (FONT_pFontData, the same glyph
+ *     records GRP_PutAsciiChar reads). It covers ASCII only, with a
+ *     font-size-proportional advance for everything else, and exists to debug
+ *     *layout* -- what a player sees is the browser.
  *
- * 12 bytes per glyph, 5 columns from bits 7..3 of each byte, 10 rows, bit
- * CLEAR means ink (GRP_PutAsciiChar skips a pixel whose bit is set, and the
- * empty glyph is memset to 0xff). FONT_pFontData itself is a 4-byte pointer
- * variable, filled in by FONT_Load() -> RES_LoadToPool(), so it is read at
- * draw time and not at init.
- *
- * The per-byte advance is FONT_GetSubStringWidth's (guest 0x6a0ec), which is
- * also the metric the engine's own native text drawing uses: a space is 4px,
- * any byte with bit 7 set starts a 2-byte glyph (EUC-KR and friends) 9px wide,
- * anything else is 6px. Two-byte glyphs have no entry in this ASCII table, so
- * they are advanced over and drawn blank -- visible as correctly-spaced gaps,
- * not as garbage. Making them real means porting GRP_PutHanChar's Johab
- * composition; see the note at the end of this file.
- *
- * The wrap and the line height (16px) are replicated from the parent port,
- * which tuned them against the same engine; the engine measures with one call
- * and draws with the next assuming they agree, so both here go through the
- * same wrap function.
+ * Layout (wrapping, alignment, line height) stays here in both cases, and asks
+ * the host only for two primitives -- the pixel width of a run of text, and
+ * the painting of one line -- so the measurement the engine is handed and the
+ * pixels it reads back always come from the same source.
  */
 #include <stdint.h>
 
 #include "compat.h"    /* the string helpers, declared for freestanding */
 #include "guest.h"
 #include "jni.h"
+#include "platform.h"
 #include "text.h"
 
-/* ---- the engine's bitmap font ------------------------------------------- */
+/* ---- the engine's bitmap font (the native stand-in) --------------------- */
 
 #define FONT_GLYPH_OFFSET  0x0b10u   /* first printable glyph, '!'           */
 #define FONT_GLYPH_STRIDE  0x0c      /* bytes per glyph record               */
@@ -64,11 +63,10 @@
 #define FONT_GLYPH_COLS    5
 #define FONT_GLYPH_ROWS    10
 
-/* ---- metrics (FONT_GetSubStringWidth) ----------------------------------- */
-
-#define METRIC_SPACE   4
-#define METRIC_NARROW  6
-#define METRIC_WIDE    9             /* one 2-byte (high-bit) glyph          */
+/* ---- metrics (FONT_GetSubStringWidth) -- the stand-in's only source of a
+ * per-character advance. Kept proportional to the font size so a 14px and a
+ * 12px call still lay out differently; at 14px these are the engine's own
+ * numbers: space 4, narrow 6, wide 9. -------------------------------------- */
 #define LINE_HEIGHT    16
 #define LINE_TOP       3             /* glyph row 0 sits this far into a line */
 
@@ -90,20 +88,82 @@ void text_set_buffer(uint32_t guest_addr, int width, int height)
     g_buf_ready = guest_addr != 0;
 }
 
-/* One character's advance and width. Same table FONT_GetSubStringWidth uses:
- * space 4, high-bit lead byte 9 and two bytes, everything else 6 and one. */
-static int char_advance(const uint8_t *s, int i, int len, int *width)
+/* ---- the host's text stack (the browser) ---------------------------------
+ *
+ * Implemented in tools/text.js. `s`/`len` are a UTF-8 run of text that is not
+ * NUL-terminated (it is a slice of the engine's own buffer), the guest buffers
+ * are passed as host pointers because the tooling writes straight into them. */
+#ifdef __EMSCRIPTEN__
+extern int  text_host_width(const char *s, int len, int font_size);
+extern int  text_host_line_height(int font_size);
+extern int  text_host_paint(const char *s, int len, int font_size, int x, int y,
+                            uint32_t *out, int stride, int max_w, int max_h);
+
+static int host_text = 1;
+#endif
+
+/* ---- metrics ------------------------------------------------------------- */
+
+/* One UTF-8 character's byte length, resynchronising on a stray continuation
+ * byte rather than walking off the end. */
+static int utf8_len(const uint8_t *s, int i, int len)
 {
-    if (s[i] == ' ') {
-        *width = METRIC_SPACE;
-        return 1;
-    }
-    if (s[i] & 0x80) {
-        *width = METRIC_WIDE;
-        return (i + 1 < len) ? 2 : 1;
-    }
-    *width = METRIC_NARROW;
-    return 1;
+    uint8_t c = s[i];
+    int n = 1;
+    if (c >= 0xf0)
+        n = 4;
+    else if (c >= 0xe0)
+        n = 3;
+    else if (c >= 0xc0)
+        n = 2;
+    if (c >= 0x80 && c < 0xc0)
+        n = 1;                                  /* continuation: resync */
+    if (i + n > len)
+        n = 1;
+    return n;
+}
+
+/* The stand-in's advance for one character: the engine's own metrics scaled
+ * with the requested size (a 14px request reproduces them exactly). Anything
+ * multi-byte gets the wide advance and, in the stand-in, no ink. */
+static int fallback_advance(const uint8_t *s, int i, int len, int font_size)
+{
+    int n = utf8_len(s, i, len);
+    if (s[i] == ' ')
+        return font_size / 3;
+    if (n > 1)
+        return font_size * 2 / 3;
+    return font_size * 3 / 7;
+}
+
+/* The pixel width of s[start..end) as one line. The host measures it when
+ * there is one (real font metrics, every script); otherwise the stand-in's
+ * per-character advances are summed. */
+static int run_width(const uint8_t *s, int start, int end, int font_size)
+{
+    if (end <= start)
+        return 0;
+#ifdef __EMSCRIPTEN__
+    if (host_text)
+        return text_host_width((const char *) (s + start), end - start,
+                               font_size);
+#endif
+    int w = 0;
+    for (int i = start; i < end;)
+        w += fallback_advance(s, i, end, font_size), i = i + utf8_len(s, i, end);
+    return w;
+}
+
+/* One line's height. The engine sizes the alpha texture from the height the
+ * measurement reports, so this has to be the same number the painting uses. */
+static int line_height(int font_size)
+{
+#ifdef __EMSCRIPTEN__
+    if (host_text)
+        return text_host_line_height(font_size);
+#endif
+    (void) font_size;
+    return LINE_HEIGHT;
 }
 
 /* ---- wrapping ------------------------------------------------------------ */
@@ -117,17 +177,17 @@ typedef void (*line_fn)(void *ctx, int start, int end, int width);
  * RenderToTextureInRect passes one value to both). Treating 0 as 1px wraps
  * every string one character per line and the texture comes out one pixel
  * wide -- coloured, positioned, and completely blank. So: 0 means unlimited,
- * and the natural single-line width is what comes back. */
+ * and the natural single-line width is what comes back.
+ *
+ * The same greedy wrap serves every script: it prefers the last whitespace on
+ * the line, and when there is none it breaks at the character that would have
+ * overflowed -- which is exactly how CJK wraps, one character at a time. */
 static int unlimited(int rect_width)
 {
     return rect_width <= 0;
 }
 
-/* Greedy wrap, preferring the last whitespace seen on the line, which is what
- * the real Java-side word wrap does. A single pass, and the exact same walk
- * measures and draws, so the height the engine is told and the rows it reads
- * back cannot disagree. */
-static void wrap_lines(const uint8_t *s, int len, int rect_width,
+static void wrap_lines(const uint8_t *s, int len, int rect_width, int font_size,
                        line_fn fn, void *ctx)
 {
     if (unlimited(rect_width))
@@ -146,7 +206,8 @@ static void wrap_lines(const uint8_t *s, int len, int rect_width,
             continue;
         }
 
-        int w, adv = char_advance(s, i, len, &w);
+        int adv = utf8_len(s, i, len);
+        int w   = run_width(s, i, i + adv, font_size);
 
         if (line_width + w > rect_width && i > line_start) {
             int have_space = last_space > line_start;
@@ -188,14 +249,14 @@ static void measure_line(void *ctx_, int start, int end, int width)
     ctx->lines++;
 }
 
-int text_measure_width_height(const char *s, int rect_width, int *out_w,
-                              int *out_h)
+int text_measure_width_height(const char *s, int font_size, int rect_width,
+                              int *out_w, int *out_h)
 {
     measure_ctx ctx;
     ctx.max_width = 0;
     ctx.lines = 0;
-    wrap_lines((const uint8_t *) s, (int) strlen(s), rect_width, measure_line,
-               &ctx);
+    wrap_lines((const uint8_t *) s, (int) strlen(s), rect_width, font_size,
+               measure_line, &ctx);
 
     int w = ctx.max_width;
     if (!unlimited(rect_width) && w > rect_width)
@@ -203,35 +264,21 @@ int text_measure_width_height(const char *s, int rect_width, int *out_w,
     if (out_w)
         *out_w = w;
     if (out_h)
-        *out_h = ctx.lines * LINE_HEIGHT;
+        *out_h = ctx.lines * line_height(font_size);
     return w;
 }
 
-int text_measure_width(const char *s)
+int text_measure_width(const char *s, int font_size)
 {
-    const uint8_t *p = (const uint8_t *) s;
-    int len = (int) strlen(s);
-    int w = 0;
-    for (int i = 0; i < len;) {
-        int cw, adv = char_advance(p, i, len, &cw);
-        w += cw;
-        i += adv;
-    }
-    return w;
+    return run_width((const uint8_t *) s, 0, (int) strlen(s), font_size);
 }
 
-/* The width the same string measures at with no limit -- what a
- * rectWidth<=0 call above handed back, and therefore the width of the texture
- * this draw is being read into. */
-static int natural_width(const uint8_t *s, int len)
+/* The width the same string measures at with no limit -- what a rectWidth<=0
+ * call above handed back, and therefore the width of the texture this draw is
+ * being read into. */
+static int natural_width(const uint8_t *s, int len, int font_size)
 {
-    int w = 0;
-    for (int i = 0; i < len;) {
-        int cw, adv = char_advance(s, i, len, &cw);
-        w += cw;
-        i += adv;
-    }
-    return w;
+    return run_width(s, 0, len, font_size);
 }
 
 /* ---- drawing ------------------------------------------------------------- */
@@ -266,13 +313,14 @@ static const uint8_t *glyph_for(unsigned ch)
                                       (ch - FONT_FIRST_CHAR) * FONT_GLYPH_STRIDE);
 }
 
-/* The blit, GRP_PutAsciiChar's loop in the host's own terms: rows 0..9 read
- * glyph bytes 1..10, columns 0..4 read bits 7..3, bit clear = ink. */
-static void put_glyph(unsigned ch, int x, int y, int stride)
+/* The stand-in's blit, GRP_PutAsciiChar's loop in the host's own terms: rows
+ * 0..9 read glyph bytes 1..10, columns 0..4 read bits 7..3, bit clear = ink. */
+static int put_glyph(unsigned ch, int x, int y, int stride)
 {
     const uint8_t *g = glyph_for(ch);
     if (!g)
-        return;
+        return 0;
+    int n = 0;
 
     for (int row = 0; row < FONT_GLYPH_ROWS; row++) {
         uint8_t bits = g[1 + row];
@@ -282,9 +330,43 @@ static void put_glyph(unsigned ch, int x, int y, int stride)
             uint32_t *px = pixel_at(x + col, y + row, stride);
             if (px) {
                 *px = INK;
-                g_ink++;
+                n++;
             }
         }
+    }
+    return n;
+}
+
+/* Paint s[start..end) as one line whose left edge and top edge are (x, y).
+ * `stride` is the row length the engine reads the buffer back with, which is
+ * the rect width, not the buffer's own width. */
+static void paint_run(const uint8_t *s, int start, int end, int font_size, int x,
+                      int y, int stride)
+{
+    if (end <= start)
+        return;
+#ifdef __EMSCRIPTEN__
+    if (host_text) {
+        int max_w = stride < g_buf_w ? stride : g_buf_w;
+        g_ink += text_host_paint((const char *) (s + start), end - start,
+                                 font_size, x, y,
+                                 (uint32_t *) (void *) (g_mem + g_buffer),
+                                 stride, max_w, g_buf_h);
+        return;
+    }
+#endif
+    int at = x;
+    for (int i = start; i < end;) {
+        int adv = utf8_len(s, i, end);
+        if (adv == 1) {
+            g_ink += put_glyph(s[i], at, y + LINE_TOP, stride);
+            at += fallback_advance(s, i, end, font_size);
+        } else {
+            /* No stand-in glyph for a multi-byte character: advance over it so
+             * the ASCII around it still lands where the engine measured it. */
+            at += fallback_advance(s, i, end, font_size);
+        }
+        i += adv;
     }
 }
 
@@ -292,6 +374,7 @@ typedef struct {
     const uint8_t *s;
     int rect_width;
     int align;                                  /* 0 left, 1 centre, 2 right */
+    int font_size;
     int y;
 } draw_ctx;
 
@@ -307,14 +390,8 @@ static void draw_line(void *ctx_, int start, int end, int width)
     if (x0 < 0)
         x0 = 0;
 
-    int x = x0;
-    for (int i = start; i < end;) {
-        int cw, adv = char_advance(ctx->s, i, end, &cw);
-        put_glyph(ctx->s[i], x, ctx->y + LINE_TOP, ctx->rect_width);
-        x += cw;
-        i += adv;
-    }
-    ctx->y += LINE_HEIGHT;
+    paint_run(ctx->s, start, end, ctx->font_size, x0, ctx->y, ctx->rect_width);
+    ctx->y += line_height(ctx->font_size);
 }
 
 static void clear_rows(int rect_width, int rows)
@@ -352,20 +429,19 @@ static void log_text(const char *what, const uint8_t *s, int len, int a, int b,
 
     host_log("  [text] %s len=%d args=%d,%d,%d high=%d \"%s\"\n", what, len, a,
              b, c, hi, shown);
-    if (!g_font_data_var || !LD32(g_font_data_var))
-        host_log("  [text]   font data pointer is null\n");
 }
 
-int text_draw_in_rect(const uint8_t *s, int len, int align, int rect_width)
+int text_draw_in_rect(const uint8_t *s, int len, int font_size, int align,
+                      int rect_width)
 {
     if (!g_buf_ready || !s || len <= 0)
         return 0;
     if (unlimited(rect_width))
-        rect_width = natural_width(s, len);
+        rect_width = natural_width(s, len, font_size);
     if (rect_width <= 0)
         rect_width = 1;
 
-    log_text("DrawTextInRect", s, len, align, rect_width, 0);
+    log_text("DrawTextInRect", s, len, font_size, align, rect_width);
 
     /* The buffer is one shared scratch area reused by every call, and both a
      * shorter string and a previous longer one start at index 0, so the region
@@ -375,29 +451,31 @@ int text_draw_in_rect(const uint8_t *s, int len, int align, int rect_width)
     measure_ctx m;
     m.max_width = 0;
     m.lines = 0;
-    wrap_lines(s, len, rect_width, measure_line, &m);
-    clear_rows(rect_width, m.lines * LINE_HEIGHT);
+    wrap_lines(s, len, rect_width, font_size, measure_line, &m);
+    clear_rows(rect_width, m.lines * line_height(font_size));
 
     draw_ctx ctx;
     ctx.s = s;
     ctx.rect_width = rect_width;
     ctx.align = align;
+    ctx.font_size = font_size;
     ctx.y = 0;
     g_ink = 0;
-    wrap_lines(s, len, rect_width, draw_line, &ctx);
+    wrap_lines(s, len, rect_width, font_size, draw_line, &ctx);
 
     if (g_jni_verbose) {
         static int nd;
         if (nd < 6) {
             nd++;
-            host_log("  [text]   %d ink pixels, stride %d, %d line(s)\n", g_ink,
-                     rect_width, m.lines);
+            host_log("  [text]   %d ink pixels, stride %d, %d line(s), %dpx "
+                     "#%d\n", g_ink, rect_width, m.lines,
+                     line_height(font_size), font_size);
         }
     }
     return 0;
 }
 
-int text_draw(const uint8_t *s, int len, int stride)
+int text_draw(const uint8_t *s, int len, int font_size, int stride)
 {
     if (!g_buf_ready || !s || len <= 0)
         return 0;
@@ -406,31 +484,20 @@ int text_draw(const uint8_t *s, int len, int stride)
      * the text, so the stride it reads back with is the text's own width. The
      * caller passes that width; fall back to measuring if it did not. */
     if (stride <= 0)
-        stride = natural_width(s, len);
+        stride = natural_width(s, len, font_size);
     if (stride <= 0)
         return 0;
 
-    log_text("DrawText", s, len, stride, 0, 0);
+    log_text("DrawText", s, len, font_size, stride, 0);
 
-    clear_rows(stride, LINE_HEIGHT);
+    clear_rows(stride, line_height(font_size));
 
     draw_ctx ctx;
     ctx.s = s;
     ctx.rect_width = stride;
     ctx.align = 0;
+    ctx.font_size = font_size;
     ctx.y = 0;
-    wrap_lines(s, len, stride, draw_line, &ctx);
+    wrap_lines(s, len, stride, font_size, draw_line, &ctx);
     return 0;
 }
-
-/*
- * Not done: two-byte (high-bit) glyphs. The metric already accounts for them
- * (9px, 2 bytes) so layout is right, but the ASCII table at FONT_pFontData+0xb10
- * has no entry for them and they draw blank. The engine's own Korean path is
- * GRP_PutHanChar (guest 0x6b601, 496 bytes): split the 2-byte code into
- * initial/medial/final jamo with FONT_ConvertKSToJohab (0x6a07d) and the
- * FONT_nCho/Jung/Jong tables, then blit three jamo glyphs from the same font
- * data. Worth doing only if the text this build draws turns out to be
- * multi-byte -- the port answers "en" for GetLanguage, and DrawTextInRect's
- * own arguments are logged under --jni-verbose, so the run says which.
- */

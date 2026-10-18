@@ -220,3 +220,12 @@ uint32_t host_guest_mmap(uint32_t size)
     g_mmap_next = a + size;
     return a;
 }
+
+/* The native runner has no locale of its own: the browser is the host that
+ * owns one, and this build exists to debug the guest. SPIKE_LANG=ko (or ja, zh,
+ * fr) selects a language to exercise, and "en" is the default. */
+const char *host_language(void)
+{
+    const char *l = getenv("SPIKE_LANG");
+    return (l && *l) ? l : "en";
+}

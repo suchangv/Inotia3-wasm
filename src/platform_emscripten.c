@@ -182,6 +182,28 @@ EM_JS(void, spike_read_dump_js, (void), {
 void spike_set_dump_screen(int n) { g_browser_dump_screen = n; }
 void host_browser_read_dump(void) { spike_read_dump_js(); }
 
+/* The language the engine should draw in. Android's Java side answered this
+ * from Locale.getDefault(); navigator.language is the same notion here, so a
+ * Chinese or Korean browser gets the game in Chinese or Korean without a
+ * setting. ?lang=ko overrides it, which is how a script the machine's own
+ * locale would never reach gets tested. */
+static char g_lang_code[32];
+
+EM_JS(void, spike_read_language_js, (char *buf, int cap), {
+    var s = (typeof Module !== 'undefined' && Module.spikeLang)
+        ? String(Module.spikeLang)
+        : (typeof navigator !== 'undefined' && navigator.language)
+            ? String(navigator.language) : 'en';
+    stringToUTF8(s, buf, cap);
+});
+
+const char *host_language(void)
+{
+    if (!g_lang_code[0])
+        spike_read_language_js(g_lang_code, sizeof(g_lang_code));
+    return g_lang_code;
+}
+
 /* The engine's frame period, overridable from the page (Module.spikeFrameMs).
  * Off by default: moving it changes how fast the world moves -- see patches.c. */
 extern int g_frame_period_ms;

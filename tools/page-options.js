@@ -25,6 +25,9 @@
   // own 66 ms is the game's speed, and lowering it accelerates the game. This
   // exists to measure that, not to ship it -- see src/patches.c.
   if (q.has('framems')) M.spikeFrameMs = num('framems');
+  // The language the game draws in. Absent, the page uses navigator.language
+  // (the host's own locale, which is what Android does); ?lang=ko forces one.
+  if (q.has('lang'))   M.spikeLang = q.get('lang');
 
   // Do not let stdout go into the shell's <textarea id="output">.
   //
