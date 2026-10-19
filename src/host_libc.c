@@ -363,8 +363,22 @@ void host_parse_offset_len_path(uint32_t out_ptr, uint32_t buf_ptr, uint32_t len
  * Failing the call and naming it turns that into a location. */
 static int guest_ok(uint32_t addr, uint32_t len, const char *what)
 {
-    if (!addr)
-        return 0;
+    if (!addr) {
+        /* Address 0 is a real page in this address space -- the null guard, all
+         * zeros -- so a null pointer is not a reason to refuse the call: the
+         * operation is harmless and the shim then does exactly what the guest
+         * asked for. Refusing made every shim disagree with the oracle on the
+         * first null argument (memset(NULL) claimed success and wrote nothing,
+         * strcmp(NULL) compared the text "(null)"), and the differential has no
+         * way to tell that class from a decoder bug. Still worth naming once:
+         * reaching here means the engine passed a pointer it never got. */
+        static int warned;
+        if (warned < 20) {
+            warned++;
+            host_log("  [shim] %s: null pointer (caller %08x)\n",
+                     what, g_cpu.r[14]);
+        }
+    }
     if (len > GUEST_MEM_SIZE || addr > GUEST_MEM_SIZE - len) {
         static int warned;
         if (warned < 20) {
@@ -447,6 +461,81 @@ static const char *guest_str(uint32_t addr, size_t max)
     }
     out[i] = 0;
     return out;
+}
+
+/* Byte-exact comparison of two guest strings.
+ *
+ * Not guest_str(): that one substitutes the *text* "(null)" for a null pointer,
+ * because it exists to make host_log() readable. Using that for the result made
+ * strcmp(NULL, "PHONENUMBER") return '(' - 'P' = -40, a number no libc
+ * produces, while the oracle compared against the zeroed page at address 0 and
+ * saw the empty string. A differential run reports it on the first null
+ * argument -- and the trace cannot say which side is right, because "null is
+ * UB" does not make '(null)' a string. Read what the guest actually has.
+ *
+ * n == UINT32_MAX is strcmp: compare up to and including the NUL. The shorter
+ * string is not special -- its NUL is compared like any other byte, which is
+ * the classic contract and the same rule memcmp and strncmp use. (Comparing
+ * only the common prefix and then returning a length difference, which one
+ * common implementation does, is a *different* number for the same answer.)
+ *
+ * The bound is the end of the guest space, not a scratch buffer. The engine
+ * calls strncmp with lengths like 0x0a0f6a, and copying both arguments into an
+ * 8 KB scratch buffer truncated them and then read past the copy.
+ */
+static int guest_strcmp(uint32_t a, uint32_t b, uint32_t n)
+{
+    for (uint32_t i = 0; i < n; i++, a++, b++) {
+        if (a >= GUEST_MEM_SIZE || b >= GUEST_MEM_SIZE)
+            return 0;
+        uint32_t xa = LD8(a), ya = LD8(b);
+        if (xa != ya)
+            return (int)xa - (int)ya;
+        if (!xa)
+            return 0;
+    }
+    return 0;
+}
+
+/* Byte-exact memcmp over guest memory.
+ *
+ * Not the host's memcmp(): glibc is free to return any value with the right
+ * sign, and its AVX2 path does exactly that -- memcmp(four zero bytes,
+ * 89 50 4e 47, 4) returns -1 here, not the -137 the loop below computes. The
+ * differential compares register values instruction by instruction, so a shim
+ * whose result depends on which glibc path ran reports a divergence that is the
+ * shim's fault. Same rule as guest_strcmp(): unsigned byte difference, 0 when
+ * equal, and 0 for a range outside the guest space. */
+static int guest_memcmp(uint32_t a, uint32_t b, uint32_t n)
+{
+    for (uint32_t i = 0; i < n; i++) {
+        if (a + i >= GUEST_MEM_SIZE || b + i >= GUEST_MEM_SIZE)
+            return 0;
+        uint32_t xa = LD8(a + i), ya = LD8(b + i);
+        if (xa != ya)
+            return (int)xa - (int)ya;
+    }
+    return 0;
+}
+
+/* Length of the guest string at `addr`, or -1 if there is no NUL before the end
+ * of the address space.
+ *
+ * Scanning the guest's own bytes rather than a scratch copy: the engine pushes
+ * paths and JSON blobs through strcpy/strlen, and those can be longer than the
+ * 8 KB scratch buffer, which truncated the source and then copied the truncated
+ * string. -1 for a wild or unterminated pointer is the same contract as the rest
+ * of the shims (do nothing, return 0) and it is what tools/oracle.py does, so a
+ * function called with a garbage pointer agrees on both sides instead of
+ * reporting a decoder divergence. */
+static int guest_strlen_ok(uint32_t addr)
+{
+    if (addr >= GUEST_MEM_SIZE)
+        return -1;
+    for (uint32_t i = 0; addr + i < GUEST_MEM_SIZE; i++)
+        if (!LD8(addr + i))
+            return (int)i;
+    return -1;
 }
 
 /* ========================================================================== */
@@ -875,13 +964,6 @@ void host_import_call(guest_import *im)
 
     /* ---- strings ---- */
     case IMPL_memcpy:  watch_check("memcpy", a0, a2);
-        /* TEMP probe: the per-frame composite is ~294 memcpy crossings per
-         * active frame, and the uploaded 384x256 surface comes out all-white.
-         * Trace the big ones to learn what the composite reads. */
-        static int cpy_traced;
-        if (cpy_traced < 60 && a2 >= 512)
-            cpy_traced++,
-            host_log("  [cpy] %08x <- %08x n=%u caller=%08x\n", a0, a1, a2, g_cpu.r[14]);
         if (guest_ok(a0, a2, "memcpy dst") && guest_ok(a1, a2, "memcpy src"))
             memcpy(g_mem + a0, g_mem + a1, a2);
         R[0] = a0; break;
@@ -893,40 +975,32 @@ void host_import_call(guest_import *im)
             memmove(g_mem + a0, g_mem + a1, a2);
         R[0] = a0; break;
     case IMPL_memcmp:  R[0] = (guest_ok(a0, a2, "memcmp a") && guest_ok(a1, a2, "memcmp b"))
-            ? (uint32_t)(int32_t)memcmp(g_mem + a0, g_mem + a1, a2) : 0; break;
-    case IMPL_strlen:  R[0] = guest_str_ok(a0, GUEST_MEM_SIZE - a0, "strlen")
-            ? (uint32_t)strlen((const char *)(g_mem + a0)) : 0; break;
-    case IMPL_strcmp:  R[0] = (uint32_t)(int32_t)strcmp(guest_str(a0, 4096), guest_str(a1, 4096)); break;
-    case IMPL_strncmp: {
-        /* Stopping at the first difference or NUL is strncmp's whole contract,
-         * and it is also what keeps this in bounds: memcmp'ing a caller-supplied
-         * n over two 8 KB scratch buffers reads straight past them for any n
-         * above 8192. The engine passes sizes like 0x0a0f6a here. */
-        const char *x = guest_str(a0, a2 + 1);
-        const char *y = guest_str(a1, a2 + 1);
-        size_t n = a2, i = 0;
-        R[0] = 0;
-        for (; i < n; i++) {
-            if (x[i] != y[i]) { R[0] = (uint32_t)(int32_t)((uint8_t)x[i] - (uint8_t)y[i]); break; }
-            if (!x[i]) break;
-        }
+            ? (uint32_t)(int32_t)guest_memcmp(a0, a1, a2) : 0; break;
+    case IMPL_strlen: {
+        int n = guest_strlen_ok(a0);
+        R[0] = n < 0 ? 0u : (uint32_t)n;
         break;
     }
+    case IMPL_strcmp:  R[0] = (uint32_t)(int32_t)guest_strcmp(a0, a1, 0xFFFFFFFFu); break;
+    case IMPL_strncmp:
+        R[0] = (uint32_t)(int32_t)guest_strcmp(a0, a1, a2);
+        break;
     case IMPL_strcpy: {
-        const char *s = guest_str(a1, 4096);
-        size_t n = strlen(s) + 1;
-        watch_check("strcpy", a0, (uint32_t)n);
-        if (a0) memcpy(g_mem + a0, s, n);
+        int n = guest_strlen_ok(a1);
+        watch_check("strcpy", a0, n < 0 ? 0u : (uint32_t)n + 1);
+        if (n >= 0 && guest_ok(a0, (uint32_t)n + 1, "strcpy"))
+            memcpy(g_mem + a0, g_mem + a1, (size_t)n + 1);
         R[0] = a0;
         break;
     }
     case IMPL_strncpy: {
-        const char *s = guest_str(a1, a2 + 1);
-        size_t n = strlen(s);
-        if (n > a2) n = a2;
+        int n = guest_strlen_ok(a1);
         watch_check("strncpy", a0, a2);
-        if (a0 && guest_ok(a0, a2, "strncpy"))
-            { memcpy(g_mem + a0, s, n); memset(g_mem + a0 + n, 0, a2 - n); }
+        if (n >= 0 && guest_ok(a0, a2, "strncpy")) {
+            size_t k = (size_t)n < a2 ? (size_t)n : a2;
+            memcpy(g_mem + a0, g_mem + a1, k);
+            memset(g_mem + a0 + k, 0, a2 - k);
+        }
         R[0] = a0;
         break;
     }

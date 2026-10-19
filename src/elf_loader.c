@@ -304,9 +304,35 @@ int elf_load(const uint8_t *file, size_t len, guest_image *out)
                 *slot = addend + GUEST_IMAGE_BASE;
                 break;
 
-            case R_ARM_ABS32:
-                *slot = addend + GUEST_IMAGE_BASE;
+            case R_ARM_ABS32: {
+                /* A base-relative add *only* when there is no symbol. With one
+                 * the value is S + A, and S is the symbol's address: a stub
+                 * address when the symbol is imported, base + st_value when it
+                 * is defined here.
+                 *
+                 * Treating it as RELATIVE regardless wrote base + 0 for the two
+                 * imported-function pointers this binary keeps in .data --
+                 * jsonp_malloc and jsonp_free store &malloc and &free -- so
+                 * `blx r3` jumped to the image base and executed the ELF
+                 * header. Both sides of the differential agreed on the wrong
+                 * value (it is in the dumped image), which is exactly why the
+                 * trace shows it as "the interpreter walked into .rodata and
+                 * the oracle reported an invalid instruction". */
+                uint32_t S = GUEST_IMAGE_BASE;
+                if (symidx && symidx < (uint32_t)nsyms) {
+                    const elf_sym *sym = &out->syms[symidx];
+                    if (sym->shndx == 0) {
+                        const char *nm = elf_sym_name(out, sym);
+                        int idx = import_register(nm, ELF32_ST_TYPE(sym->info) == STT_OBJECT);
+                        S = g_imports[idx].is_object ? g_imports[idx].stub
+                                                     : g_imports[idx].interwork;
+                    } else {
+                        S = GUEST_IMAGE_BASE + sym->value;
+                    }
+                }
+                *slot = S + addend;
                 break;
+            }
 
             case R_ARM_GLOB_DAT:
             case R_ARM_JUMP_SLOT: {

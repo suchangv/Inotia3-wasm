@@ -1043,6 +1043,39 @@ int cpu_run(uint32_t entry, uint32_t sp, uint64_t budget)
             R[15] = next + 4;
 
             uint32_t cond = ins >> 28;
+            if (cond == 0xf) {
+                /* The unconditional space. It is not "AL with a different
+                 * name": bit 28 set changes what the rest of the word means,
+                 * and cond_true(0xf) is false for every flag state, so this
+                 * used to fall into the block above and skip every instruction
+                 * here as if it had failed its condition. The WMMX helpers
+                 * (__gnu_Unwind_Restore_WMMXC: four `ldc2 p1` then `bx lr`)
+                 * "ran" as five no-ops. A `blx` immediate in this space would
+                 * have been a silently dropped call. */
+                if (((ins >> 25) & 7) == 5) {
+                    /* BLX <imm>: target = PC + 8 + (imm24 << 2) + (H << 1),
+                     * and it always switches to ARM. */
+                    int32_t off = (int32_t)(ins & 0xffffff);
+                    off = (off << 8) >> 6;
+                    uint32_t target = (uint32_t)((int32_t)pc + 8 + off +
+                                                 (((ins >> 24) & 1) << 1));
+                    R[14] = next | (g_thumb ? 1u : 0u);
+                    g_thumb = 0;
+                    pc = target & ~3u;
+                    R[15] = pc;
+                    prof_transfer(pc);
+                    continue;
+                }
+                if (((ins >> 24) & 0xf) >= 0x4 && ((ins >> 24) & 0xf) <= 0x7 &&
+                    ((ins >> 12) & 0xf) == 0xf) {
+                    /* PLD/PLI: prefetch hints with no architectural effect. */
+                    pc = next;
+                    continue;
+                }
+                /* LDC2/STC2/MCR2/MRC2 (coprocessor 2 space) and SVC land here.
+                 * Nothing in this image needs them; trap with the encoding. */
+                return trap(pc, ins, 4);
+            }
             if (cond != 0xe && !cond_true(cond)) {
                 pc = next;
                 continue;
@@ -1108,46 +1141,107 @@ int cpu_run(uint32_t entry, uint32_t sp, uint64_t budget)
                     continue;
                 }
 
-                if (kind == 1 && !((ins >> 22) & 1)) {
-                    /* LDRH / STRH / LDRSB / LDRSH */
-                    uint32_t P = (ins >> 24) & 1, U = (ins >> 23) & 1;
-                    uint32_t I = (ins >> 22) & 1, W = (ins >> 21) & 1;
-                    uint32_t L = (ins >> 20) & 1;
-                    uint32_t sh = (ins >> 5) & 3;
-                    uint32_t off = I ? ((((ins >> 8) & 0xf) << 4) | rm) : R[rm];
-                    uint32_t base = R[rn];
-                    uint32_t a = U ? base + off : base - off;
-                    if (!P) {
-                        a = base;
-                        R[rn] = U ? base + off : base - off;
-                    } else if (W) {
-                        R[rn] = U ? base + off : base - off;
-                    }
-                    if (L) {
-                        switch (sh) {
-                        case 1: R[rd] = LD16(a); break;
-                        case 2: R[rd] = (uint32_t)(int32_t)(int8_t)LD8(a); break;
-                        default: R[rd] = (uint32_t)(int32_t)(int16_t)LD16(a); break;
-                        }
-                    } else {
-                        if (sh != 1)
-                            return trap(pc, ins, 4);
-                        ST16(a, (uint16_t)R[rd]);
-                    }
-                    pc = next;
-                    continue;
-                }
+                /* The only encodings left in this space once bits[7:4] is 1001
+                 * are SWP/SWPB, and nothing in this image uses them (it is
+                 * single-threaded). Trapping is honest: the branch that used to
+                 * sit here claimed to decode LDRH/STRH, which can never reach
+                 * it -- those have bits[7:4] = 1011, not 1001 -- so it would
+                 * have read a SWP as a sign-extended halfword load. The real
+                 * halfword forms are handled in the extra-load/store block
+                 * below. */
                 return trap(pc, ins, 4);
             }
 
-            /* ---- BX / BLX register (bits[27:20] = 0001 0010) ---- */
-            if (op1 == 0 && ((ins >> 20) & 0xff) == 0x12 && ((ins >> 4) & 0xf) == 1) {
-                uint32_t t = R[ins & 0xf];
-                g_thumb = (t & 1) != 0;
-                pc = t & ~1u;
-                R[15] = pc;
-                prof_transfer(pc);
+            /* ---- extra load/store: LDRH/STRH/LDRSB/LDRSH/LDRD/STRD ----
+             *
+             * bits[27:24] = 0001, bits[7:4] = 1 SH 1. SH picks the width and
+             * the sign -- 01 halfword, 10 signed byte, 11 signed halfword --
+             * and for the two 64-bit forms the *store* form has L=0 with the
+             * same bits[7:4] the load form uses:
+             *
+             *   SH=10, L=1 -> LDRSB        SH=10, L=0 -> LDRD
+             *   SH=11, L=1 -> LDRSH        SH=11, L=0 -> STRD
+             *
+             * This block did not exist. Everything here fell through to the
+             * data-processing decoder, which read `strd r2, r3, [r12]` as
+             * `bic r2, r12, r0`: a store that silently did nothing, a register
+             * changed for no reason, and eight bytes of memory left stale. The
+             * differential found it in __gnu_ldivmod_helper, which ends every
+             * 64-bit division with exactly that instruction -- first as a
+             * register mismatch, then again as a memcmp disagreement whose two
+             * sides had written different bytes to the stack. */
+            if (op1 == 0 && (ins & 0x90u) == 0x90u && ((ins >> 5) & 3) != 0) {
+                uint32_t P = (ins >> 24) & 1, U = (ins >> 23) & 1;
+                uint32_t I = (ins >> 22) & 1, W = (ins >> 21) & 1;
+                uint32_t L = (ins >> 20) & 1;
+                uint32_t sh = (ins >> 5) & 3;
+                uint32_t rm = ins & 0xf;
+                uint32_t off = I ? ((((ins >> 8) & 0xf) << 4) | rm) : R[rm];
+                uint32_t base = R[rn];
+                uint32_t eff = U ? base + off : base - off;
+                uint32_t a = P ? eff : base;
+
+                if (sh == 1) {
+                    if (L) R[rd] = LD16(a);
+                    else   ST16(a, (uint16_t)R[rd]);
+                } else if (sh == 3 && !L) {
+                    /* STRD: Rt and Rt+1 as one doubleword. */
+                    ST32(a, R[rd]);
+                    ST32(a + 4, R[(rd + 1) & 0xf]);
+                } else if (sh == 2 && !L) {
+                    /* LDRD. Writing Rt+1 = PC is UNPREDICTABLE in the ARM ARM;
+                     * take the interworking bit from it anyway, because a
+                     * doubleword pop into {rX, pc} is what the instruction
+                     * would mean. */
+                    uint32_t lo = LD32(a), hi = LD32(a + 4);
+                    R[rd] = lo;
+                    if (rd + 1 == 15) {
+                        g_thumb = (hi & 1) != 0;
+                        pc = hi & ~1u;
+                        R[15] = pc;
+                        if (!P || W)
+                            R[rn] = eff;
+                        prof_transfer(pc);
+                        continue;
+                    }
+                    R[rd + 1] = hi;
+                } else if (sh == 2) {
+                    R[rd] = (uint32_t)(int32_t)(int8_t)LD8(a);
+                } else {
+                    R[rd] = (uint32_t)(int32_t)(int16_t)LD16(a);
+                }
+                if (!P || W)
+                    R[rn] = eff;
+                pc = next;
                 continue;
+            }
+
+            /* ---- BX / BLX register (bits[27:20] = 0001 0010) ----
+             *
+             * bits[7:4] picks them apart: 0001 is BX, 0011 is BLX. Only BX was
+             * decoded, so `blx r12` -- the compiler's way of calling a function
+             * held in a register, and how this image reaches every function
+             * pointer -- fell through to the data-processing decoder and ran as
+             * `teq r15, r12`: the call never happened, the flags were clobbered
+             * and the PC walked on into the next instruction. The differential
+             * reported it on five entries before a human noticed.
+             *
+             * BLX also leaves a return address; bit 0 is the *current*
+             * instruction set, so a call from ARM code returns to ARM (bit 0
+             * clear) and a Thumb caller's BLX (a different encoding, handled in
+             * the Thumb decoder) returns with it set. */
+            if (op1 == 0 && ((ins >> 20) & 0xff) == 0x12) {
+                uint32_t low = (ins >> 4) & 0xf;
+                if (low == 1 || low == 3) {
+                    if (low == 3)                      /* BLX */
+                        R[14] = next | (g_thumb ? 1u : 0u);
+                    uint32_t t = R[ins & 0xf];
+                    g_thumb = (t & 1) != 0;
+                    pc = t & ~1u;
+                    R[15] = pc;
+                    prof_transfer(pc);
+                    continue;
+                }
             }
 
             /* ---- CLZ (bits[27:20] = 0001 0110, rn = 1111, bits[11:4] = 0001) ----
@@ -1408,6 +1502,25 @@ const char *cpu_halt_str(int reason)
     case HALT_IMPORT:    return "stopped at host crossing (oracle mode)";
     case HALT_STOPPED:   return "reached the requested stop address";
     case HALT_BAD_MEM:   return "guest accessed outside its address space";
+    default:             return "?";
+    }
+}
+
+/* The same thing as one word, for tools that have to branch on it. */
+const char *cpu_halt_slug(int reason)
+{
+    switch (reason) {
+    case HALT_BUDGET:    return "budget";
+    case HALT_HALTED:    return "halted";
+    case HALT_UNDEFINED: return "undefined";
+    case HALT_TRAP:      return "trap";
+    case HALT_BAD_PC:
+        /* Running off the end is the normal end of a function call: the
+         * return sentinel is not in the image on purpose. */
+        return g_cpu.r[15] == (RETURN_SENTINEL & ~1u) ? "returned" : "bad-pc";
+    case HALT_IMPORT:    return "import";
+    case HALT_STOPPED:   return "stopped";
+    case HALT_BAD_MEM:   return "bad-mem";
     default:             return "?";
     }
 }

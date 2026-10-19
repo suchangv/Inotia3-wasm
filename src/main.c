@@ -43,8 +43,8 @@
  * PC 0, and with LR=1 the two are indistinguishable -- a real failure gets
  * reported as a clean return. This value is outside the image (so HALT_BAD_PC
  * fires) and recognisable on sight. The Thumb bit is set, as a `bx lr` return
- * requires. */
-#define RETURN_SENTINEL 0x0BADF00Du
+ * requires. In guest.h because cpu.c recognises it too, to name the end of a
+ * run as "returned" rather than "bad pc". */
 
 /* The surface the guest is told it has. WrapperJinterface.GetRealScreenWidth/
  * Height feed these into nativePreInit(), and the engine lays its HUD and menus
@@ -225,6 +225,16 @@ static const char *g_snapshot_dump_path;
 static const char *g_snapshot_trace_path;
 static int g_stop_at_resume;
 
+/* A dump the differential takes *before* an entry runs, rather than after.
+ *
+ * The oracle compares from the entry, so the memory it starts from has to be
+ * the memory the interpreter started from. A dump taken after the run hands it
+ * the run's own results: every global the entry initialises is already
+ * initialised, an allocator's free list is already built, and the two traces
+ * disagree on the first load that reads one of them -- a divergence the harness
+ * caused, which is worse than not comparing at all. */
+static const char *g_dump_at_entry_path;
+
 /* Take the snapshot if cpu_run stopped at the requested address, then carry on
  * from the same instruction with the trace running. Shared by every cpu_run
  * call site -- nativeInit is driven directly rather than through
@@ -262,6 +272,16 @@ static run_result run_entry_arg(const char *what, uint32_t entry, uint32_t arg0,
 
     uint64_t before = g_insn_count;
     double t0 = host_now();
+
+    /* The pre-run image, for the differential. r15 is set to what cpu_run is
+     * about to start from so the dump's REGS block is self-describing: the
+     * oracle resumes at the PC it finds there instead of assuming one. */
+    if (g_dump_at_entry_path) {
+        g_cpu.r[15] = entry & ~1u;
+        dump_guest(g_dump_at_entry_path);
+        g_dump_at_entry_path = NULL;
+    }
+
     r.reason = cpu_run(entry, g_cpu.r[13], g_insn_count + budget);
     cpu_trace_final();
 
@@ -324,6 +344,13 @@ static void report_run(const run_result *r)
              r->what, r->entry, (unsigned long long)r->insns,
              r->seconds > 0 ? (double)r->insns / r->seconds / 1e6 : 0.0, status);
 
+    /* The end reason in one machine-readable word. tools/difftest.py has to
+     * tell "both sides ran out of budget, so the traces simply stop" from "the
+     * interpreter stopped where the oracle did not", and those are the same
+     * shape in the trace files. Matching on the prose above would break the
+     * next time someone reworded it. */
+    host_log("    halt=%s\n", cpu_halt_slug(r->reason));
+
     if (r->reason != HALT_BUDGET &&
         !(r->reason == HALT_BAD_PC && g_cpu.r[15] == (RETURN_SENTINEL & ~1u))) {
         const char *nm = elf_func_name(&g_img, g_fault_pc);
@@ -361,8 +388,20 @@ static void report_run(const run_result *r)
  * There is none in the wasm build, and the wasm build exists to measure
  * throughput rather than to be diffed. */
 static const struct { uint32_t addr, size; } k_dump_regions[] = {
+    /* The null page. A guest store through a null pointer lands here, and the
+     * import shims read and write it too (address 0 is inside the flat address
+     * space, so refusing it would be a different memory model from the
+     * interpreter's). Usually all zeros, and then the oracle skips the write. */
+    { 0x00000000u,      0x00001000u },
     { GUEST_IMAGE_BASE, 0x00E00000u },  /* relocated .so, .data, .bss */
-    { GUEST_STUB_BASE,  0x00500000u },  /* import stubs + host data   */
+    /* The stub page and everything above it, to the top of the address space.
+     * That is 8 MB, not the 4 MB the stubs need: GUEST_JNI_BASE (0x08D00000)
+     * sits above them, and the engine reads its JavaVM/JNIEnv structs out of
+     * there -- `(*vm)->functions` is a real pointer the guest dereferences. A
+     * dump that stopped at the stubs left those bytes zero on the oracle's
+     * side, so every entry that touched the vm cache reported r3 = 0 vs a
+     * pointer, on the same instruction, with nothing wrong with the decoder. */
+    { GUEST_STUB_BASE,  0x00800000u },  /* stubs + host data + JNI structs */
     { GUEST_HEAP_BASE,  0x04000000u },  /* the heap: RB-tree nodes live here */
     /* The stack. Without it the oracle starts with a zeroed frame and the
      * divergence it reports is a load of the caller's saved registers --
@@ -403,6 +442,14 @@ static void dump_guest(const char *path)
     fwrite("REGS", 1, 4, f);
     fwrite(&g_cpu.r[0], 4, 16, f);
     fwrite(&g_cpu.cpsr, 4, 1, f);
+
+    /* The executable bounds, so the oracle knows which PCs are guest code
+     * without a copy of this image's layout compiled into it. Hardcoded
+     * constants in the Python side go stale the moment the .so is rebuilt, and
+     * a stale high bound silently classifies real code as "left the image". */
+    fwrite("TEXT", 1, 4, f);
+    fwrite(&g_img.text_lo, 4, 1, f);
+    fwrite(&g_img.text_hi, 4, 1, f);
 
     fwrite("INAM", 1, 4, f);
     uint32_t ni = (uint32_t)g_nimports;
@@ -1545,8 +1592,14 @@ int main(int argc, char **argv)
      * preloaded into it -- so only the option parsing is skipped. */
 #else
     for (int i = 1; i < argc; i++) {
-        if (strncmp(argv[i], "--g_budget=", 9) == 0)
-            g_budget = (uint64_t)strtoull(argv[i] + 9, NULL, 10);
+        if (strncmp(argv[i], "--g_budget=", 11) == 0 ||
+            strncmp(argv[i], "--budget=", 9) == 0) {
+            /* Into the local, not the global: `g_budget = budget` below
+             * overwrites the global with the default, so writing it here made
+             * every budget flag a no-op -- and the default is three billion
+             * instructions, which is a very long time when an entry loops. */
+            budget = (uint64_t)strtoull(strchr(argv[i], '=') + 1, NULL, 10);
+        }
         else if (strcmp(argv[i], "--init-array") == 0)
             do_init_array = 1;
         else if (strcmp(argv[i], "--jni") == 0)
@@ -1602,6 +1655,15 @@ int main(int argc, char **argv)
             only_entry = (uint32_t)strtoul(argv[i] + 8, NULL, 16);
         else if (argv[i][0] != '-')
             path = argv[i];
+        else {
+            /* Refuse an option this build does not know instead of ignoring
+             * it. A silently dropped "--budget=..." left the default of three
+             * billion instructions in place, and the first entry that looped
+             * wrote a 5 GB trace while the sweep was supposed to take seconds:
+             * the typo is cheap to report and expensive to debug later. */
+            host_log("unknown option %s\n", argv[i]);
+            path = NULL;
+        }
     }
 #endif
 #if defined(WASM_FREESTANDING) || defined(__EMSCRIPTEN__)
@@ -1628,7 +1690,9 @@ int main(int argc, char **argv)
 #if !defined(WASM_FREESTANDING)
     if (!path) {
         host_log("usage: spike <libgame.so> [--boot] [--frames=N] [--tap=frame,x,y]\n"
-                 "             [--all] [--g_budget=N] [--no-profile]\n");
+                 "             [--all] [--budget=N] [--no-profile]\n"
+                 "             [--entry=ADDR] [--oracle] [--dump-guest=FILE]\n"
+                 "             [--trace-insns=FILE] [--stop-at=ADDR]\n");
         return 2;
     }
 #endif
@@ -1673,6 +1737,14 @@ int main(int argc, char **argv)
     } else if (trace_path) {
         host_trace_open(trace_path);
         g_trace_insn_on = 1;
+    }
+
+    if (only_entry && dump_path) {
+        /* An entry-point differential starts both sides *at* the entry, so the
+         * image has to be the one from before it ran. Handled in run_entry_arg,
+         * which is where the entry's own registers are set. */
+        g_dump_at_entry_path = dump_path;
+        dump_path = NULL;
     }
 
 

@@ -47,6 +47,22 @@ build_native() {
     echo "   -> build/spike"
 }
 
+# The same interpreter with bounds-checked guest access. A sweep of every
+# function entry in the image calls each one with zeroed arguments, so plenty of
+# them dereference a null pointer; in the release build that is a host SIGSEGV
+# with the guest's PC recovered from the crash handler, and in the oracle it is
+# a clean stop. This build stops at the same instruction as the oracle, which is
+# what makes the two traces comparable there. It is also slower (about half the
+# speed), so it is a test build, not the runtime.
+build_check() {
+    echo "== native (GUEST_CHECK) =="
+    mkdir -p build
+    $CC $CFLAGS -g -O2 -DGUEST_CHECK -I src \
+        $COMMON src/platform_native.c src/main.c \
+        -lm -o build/spike-check
+    echo "   -> build/spike-check"
+}
+
 build_wasm() {
     echo "== wasm32 =="
     LLDIR=$(find_wasm_ld) || {
@@ -151,9 +167,10 @@ build_browser() {
 
 case "${1:-both}" in
     native)  build_native ;;
+    check)   build_check ;;
     wasm)    build_wasm ;;
     browser) build_browser ;;
     both)    build_native; build_wasm ;;
     all)     build_native; build_wasm; build_browser ;;
-    *) echo "usage: $0 [native|wasm|browser|both|all]"; exit 2 ;;
+    *) echo "usage: $0 [native|check|wasm|browser|both|all]"; exit 2 ;;
 esac

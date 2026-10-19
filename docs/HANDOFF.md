@@ -26,7 +26,8 @@ where every "return to gameplay" path lands), which draws the map. One SKIP
 press is not enough, and taps elsewhere never leave the event.
 
 **Nothing blocks reaching gameplay.** See "The immediate next task" for the
-loose ends (audio, the save round-trip, and the unusable `difftest.sh`).
+loose ends (audio, the save round-trip, and the budgeted coverage of code that
+only runs with real arguments).
 
 ### What is already proven
 
@@ -519,6 +520,107 @@ localhost and opens it. A native windowed build would need SDL2 (not installed
 here), a font backend (there is no Canvas, so CJK would regress to the bitmap
 fallback) and an audio backend -- a separate project, not a build flag.
 
+### Progress since that (2026-10-20, the differential covers the whole image)
+
+**The oracle now runs every function in the image, not four constructors.**
+`tools/difftest.py` starts both sides from one pre-run dump of the loader's own
+image and compares one line per retired instruction. `--all` derives an entry
+address from every FUNC symbol in the `.so` -- 5904 of them -- and the result is
+**all entries match**:
+
+```
+5904 entries, 3951988 instructions compared
+  identical  5861
+  capped     25
+  bad-mem    18
+```
+
+75 s wall on eight workers. `capped` is the per-entry instruction budget: the
+interpreter counts a 32-bit Thumb-2 instruction as two (it counts instruction
+*words*), so a capped run retires about 5% fewer instructions than the oracle's
+budget and the two traces end at different lengths without anything being wrong.
+`bad-mem` is the harness calling a function with zeroed arguments so it
+dereferences a null pointer: both sides stop at the same instruction, and what
+differs is the destination register of the aborted access. Named, counted, not
+counted as a decoder mismatch.
+
+`--log=FILE` writes one line per failure with the first divergent PC and the
+registers that differ, and the summary groups failures by that signature. After
+a fix the *group counts* are what say whether the sweep got better or just moved.
+
+Five real defects came out of it, four in the CPU and one in the loader:
+
+- **ARM `BLX <register>` was not decoded.** `blx r12` -- how the compiler calls a
+  function held in a register, and how this image reaches every function pointer
+  -- fell through to the data-processing decoder and ran as `teq r15, r12`: the
+  call never happened, the flags were clobbered and the PC walked on. Five
+  entries reported it.
+- **ARM `LDRH/STRH/LDRSB/LDRSH/LDRD/STRD` were not decoded either.** The block
+  claiming to handle them was gated on `bits[7:4] == 1001`, which is the
+  *multiply* encoding; the halfword forms are `1011/1101/1111`, so that branch
+  could never run. Every one of these instructions executed as whatever the
+  data-processing decoder made of it: `strd r2, r3, [r12]` -- how
+  `__gnu_ldivmod_helper` ends every 64-bit division -- became
+  `bic r2, r12, r0`, a store that silently did nothing and a register that
+  changed for no reason. It surfaced twice, the second time as a `memcmp`
+  disagreement, because the two sides had written different bytes to the stack.
+- **The ARM unconditional space (`cond == 0xF`) was skipped as if it had failed
+  its condition.** `cond_true(0xF)` is false, so four `ldc2` in
+  `__gnu_Unwind_Restore_WMMXC` "executed" as no-ops. A `blx` immediate there
+  would have been a silently dropped call. It now decodes BLX immediate (a real
+  branch), treats PLD/PLI as the hints they are, and traps on the coprocessor-2
+  forms and SVC with the encoding printed.
+- **`R_ARM_ABS32` against an imported symbol was applied as a base-relative
+  add.** The only two in the binary are `jsonp_malloc`/`jsonp_free`'s stored
+  `&malloc`/`&free` in `.data`; both were written as the image base, so `blx r3`
+  jumped to `0x01000000` and executed the ELF header. Fixed to S + A, with S
+  resolved through the import stubs (or the symbol's own address when it is
+  defined in this image).
+
+The fifth is one layer up, in the shims, and it is the same class of lie:
+**`memcmp` was the host's, and glibc's AVX2 path returns `-1` where the byte
+difference is `-137`.** The oracle compared bytes, the interpreter asked glibc,
+and the two disagreed about a value no code is allowed to depend on. `strcmp`
+had the same problem plus a worse one: `guest_str()` substitutes the *text*
+`"(null)"` for a null pointer, so `strcmp(NULL, "PHONE...")` returned
+`'(' - 'P' = -40`. Both now compare guest bytes directly, under one documented
+contract (see `do_reproducible()`'s docstring and `guest_strcmp()`): unsigned
+byte difference, 0 when equal, and **an argument range outside the 144 MB space
+means do nothing and return 0** -- which a flat address space makes possible and
+which both sides must do, or every entry that hands `strlen` a null pointer looks
+like a decoder bug. `strncmp` also stopped copying both operands into an 8 KB
+scratch buffer first; the engine passes lengths like `0x0a0f6a` through it, and
+the loop then read past the copy.
+
+**The harness had to become trustworthy before any of this meant anything.**
+Each of these had already wasted a session:
+
+- `--budget` did not exist. The option was `--g_budget`, and even that was
+  parsed into a global that the next line overwrote with the 3-billion default,
+  so *every* budget was a no-op. One entry that loops wrote a 5 GB trace and
+  filled the disk -- the sweep is what found it, and unknown options are now an
+  error rather than a shrug.
+- The oracle needs `UC_CPU_ARM_CORTEX_A7`. Unicorn's default ARM CPU rejects
+  Thumb-2, and reports "0 instructions compared" for every entry.
+- Returning from an import stub switches instruction set through **`R15`, with
+  bit 0**; writing the CPSR's T bit from a code hook does not stick.
+- Both traces must end at the same place: the oracle has to emit the last
+  instruction the interpreter flushes (`cpu_trace_final`), and must *not* flush
+  again when a hook already wrote that line.
+- The dump has to contain everything the guest can read: the JNI/JavaVM structs
+  at `GUEST_JNI_BASE` (the engine caches `(*vm)->functions`, and a dump that
+  stopped at the stub page left the oracle reading zeros -- 15 entries reported
+  "r3 = 0 vs a pointer" on otherwise matching traces), the text bounds (so the
+  oracle knows what "left the image" means without a constant that goes stale
+  when the `.so` is rebuilt), and the null page.
+
+`tools/build.sh check` builds the same interpreter with `GUEST_CHECK`: a sweep
+calls each function with no arguments, so plenty of them dereference a null
+pointer, and the bounds-checked build stops at the same instruction the oracle
+does instead of taking a host SIGSEGV. `difftest.py` prefers that binary when it
+exists. The release build is unchanged -- the check is a test build, about half
+speed.
+
 ---
 
 ## What this is
@@ -575,7 +677,7 @@ src/
   platform_*.c     host services: native / wasm-freestanding / emscripten
   main.c           the runner
 tools/
-  build.sh             native | wasm | browser
+  build.sh             native | check | wasm | browser (check = GUEST_CHECK)
   build_gl4es.sh       fetch and build gl4es into vendor/ (gitignored)
   gen_gl4es_protos.sh  regenerate gl4es_protos.h
   sound.js             the browser's WebAudio backend for sound.c
@@ -586,7 +688,8 @@ tools/
   run_wasm.mjs         node driver for the freestanding build
   oracle.py            Unicorn differential oracle
   difftrace.py         first divergent instruction, with a register diff
-  difftest.sh          run the oracle over every entry point
+  difftest.py          the sweep: both sides, every entry, one verdict each
+  difftest.sh          the sweep over the ctors, or every FUNC symbol
   callers.py           who calls this function (finds direct BL/BLX only)
 docs/
   HANDOFF.md       this file
@@ -616,7 +719,13 @@ Flags: `--boot` (constructors → JNI_OnLoad → nativePreInit → nativeInit �
 UserAgreeCallback → resumes → nativeRender frames) · `--frames=N` ·
 `--tap=frame,x,y` (inject a tap at a frame; device pixels) · `--trace`
 (last 96 instructions, dumped on a fault) · `--jni-verbose` · `--oracle` ·
+`--entry=ADDR` (run one function and stop) · `--budget=N` · `--stop-at=ADDR` ·
 `--dump-guest=FILE` · `--trace-insns=FILE` · `--watch=ADDR`
+
+`--budget` is a runaway guard, not a target: the default is three billion
+instructions, and the differential passes its own. An option this build does not
+know is an error, because a silently ignored one is how a 3-billion-instruction
+run fills a disk.
 
 ```sh
 tools/build.sh browser            # -> build/spike.html + .js + .wasm + .data
@@ -678,8 +787,15 @@ ships and the sound. What is left is adjacent:
 - **A save slot.** After entering play the log still shows `save0.dat` missing.
   That may be correct (nothing is saved until the player saves), but confirm a
   new-game save round-trips.
-- **`tools/difftest.sh`** — the oracle is still unusable; see "The differential
-  oracle" below.
+- **Coverage of functions that need real arguments.** The differential sweep
+  starts every function with zeroed registers, so a function that immediately
+  dereferences an argument stops at its first access (`bad-mem`): the prologue
+  is checked, the body is not. The way to reach the body is a snapshot at the
+  call site -- `--stop-at=ADDR --dump-guest=FILE` -- and `oracle.py` from that
+  image, which is the same mechanism `--entry` already uses.
+- **`--watch=ADDR` names host-side writes**, which is the one thing the
+  instruction trace cannot see. Worth wiring into the sweep if a future
+  divergence is a memory difference with matching registers.
 
 To reproduce the native chain (device pixels, one tap per line):
 
@@ -859,8 +975,9 @@ Working:
 | ELF load + relocation | 3139 relocations, 0 unhandled, 7713 symbols |
 | Import table | 183 ELF + 234 JNI entries, interworking stubs |
 | Thumb-1 decoder | full coverage, oracle-verified |
-| ARM decoder | verified against Unicorn (plus the new MUL/MLA and carry fixes) |
-| Oracle | `tools/difftest.sh`, all four constructors instruction-identical |
+| Thumb-2 decoder | everything the image contains (`movw/movt`, wide data-processing, wide `ldm/stm`, `push.w/pop.w`, `ldrd/strd`); unknown encodings trap with the word |
+| ARM decoder | full coverage of the image: data processing, loads/stores incl. halfword/doubleword, block transfer, branches, multiply, BX **and BLX**, unconditional space (BLX imm, PLD/PLI, coprocessor-2 traps) |
+| Oracle | `tools/difftest.sh --all`: 5904 entries, ~4M instructions, all match |
 | Boot sequence | ctors → JNI_OnLoad → nativePreInit → nativeInit → UserAgreeCallback → resumes → frames |
 | Timer table | engine clock unified with `GetSystemCurrentTime` |
 | Assets | found in the .apk, offsets delivered, the archive **opens** and its bytes are mmapped |
@@ -1024,6 +1141,33 @@ These are the ones the PS Vita port had already solved; the lesson is to read
     conversion, so `"libpng error: %s"` printed a literal `%s` and hid the real
     message for a whole debugging session.
 
+**Instruction-set semantics, second pass** (2026-10-20, found by the sweep)
+
+16. **A decode block whose gate can never match is dead code that reads as
+    coverage.** The ARM halfword/doubleword load-store branch was inside a
+    `bits[7:4] == 1001` gate -- the *multiply* encoding -- while the forms it
+    was written for are `1011/1101/1111`. It never ran, and the comment above it
+    ("LDRH/STRH/LDRSB/LDRSH") was enough to make it look handled. The check that
+    catches this is the differential, not reading the code.
+17. **`BLX <register>` is not `BX <register>` with an extra bit.** Bits[7:4] are
+    `0001` for BX and `0011` for BLX; matching only `0001` sent the BLX into the
+    data-processing decoder, where it became `teq r15, r12` -- a call that never
+    happens, plus clobbered flags. Every indirect call in the image goes through
+    it.
+18. **Condition field `1111` is not "always".** `cond_true(0xF)` is false by
+    construction (the flag tests only define 0x0-0xE), so a decoder that tests
+    the condition before testing for `0xF` skips the entire unconditional space
+    as if the condition had failed: `ldc2`, `mcr2`, SVC and -- the one that
+    matters -- `BLX <immediate>`. Handle `cond == 0xF` first, implement BLX
+    there, treat PLD/PLI as hints and trap on the rest.
+19. **The host C library is not a specification.** `memcmp` and `strcmp` may
+    return *any* value with the right sign, and glibc's AVX2 paths do: the same
+    four bytes came back as `-1` from the shim and `-137` from the byte loop.
+    Anything whose exact result reaches a register the differential compares has
+    to be implemented explicitly. The same mistake in the other direction is
+    `guest_str()`'s `"(null)"` placeholder: a string used for logging must never
+    be the string an import compares.
+
 **The boundary between guest and host** (this is the fertile ground)
 
 16. **A `jstring` is a handle, not a pointer.** *And the same mistake was made
@@ -1085,21 +1229,43 @@ These are the ones the PS Vita port had already solved; the lesson is to read
     the cautionary note above.
 31. A comment was left unterminated by an edit, so the build failed and runs used
     a stale binary — which made two real fixes look ineffective.
+32. **A flag that is parsed and then overwritten is worse than a flag that is
+    rejected.** `--g_budget=` wrote a global that `main()` overwrote two lines
+    later, and `--budget=` was never a flag at all, so both were silently
+    ignored and a 3-billion-instruction default applied. The symptom was a 5 GB
+    trace file and a full disk. Unknown options are an error now.
+33. **A dump that leaves out what the *host* wrote into the guest space makes
+    the oracle disagree with itself.** The JNI/JavaVM structs live at
+    `GUEST_JNI_BASE`, the engine caches `(*vm)->functions` from there, and the
+    dump stopped at the stub page: 15 entries reported `r3 = 0` against a
+    pointer on traces that matched line for line. Dump everything the guest can
+    read, including the null page and the text bounds.
+34. **Two traces that end at different places are a harness bug until proven
+    otherwise.** The interpreter flushes the instruction that ended the run
+    (`cpu_trace_final`) and the oracle has to do the same -- but only when no
+    hook already wrote that line, or every "PC left the image" stop gains a
+    duplicate. A sweep with a 50%-false-positive rate is a sweep nobody reads.
 
-**Test coverage** — `tools/difftest.sh` runs four constructors totalling ~130
-instructions. `MUL` was wrong from the start and none of them touch it. Widen it
-(a synthetic entry per instruction family, or a captured `inflate` prologue)
-before trusting any decoder change.
+**Test coverage** — `tools/difftest.sh --all` runs every FUNC symbol in the
+image from its own entry: 5904 entries, ~4M instructions, 75 s on eight workers.
+That is the check to run before trusting a decoder change, and it is what found
+the ARM `BLX`, the ARM halfword/doubleword load-stores, the unconditional-space
+skip and the `R_ARM_ABS32` loader bug. The four constructors remain the fast
+check (a second or two, `tools/difftest.sh` with no arguments).
 
-As of 2026-10-17 it does not even get that far: every entry reports DIVERGENCE
-with the oracle running 0 instructions and stopping at the first import it cannot
-reproduce (`__aeabi_atexit`). It resumes from the C side's dump point, which for
-these entries is an import stub rather than the entry, so it compares nothing.
-This reproduces with the multiply fix reverted (pre-existing, not the decoder),
-and fixing it is the next harness task. Until then, verify a decoder change by
-calling the guest function directly with known operands — which is how the
-`umull`/`umlal` routing fix above was verified (`__muldf3` against six operand
-pairs).
+What the sweep cannot see:
+
+- Code that never runs because the function needs real arguments. A function
+  that is only reached with a live object stops at its first dereference
+  (`bad-mem`), so the sweep covers its prologue and not its body. Diffing a deep
+  function needs a snapshot at the point the engine calls it --
+  `--stop-at=ADDR --dump-guest=FILE` on the C side, then `oracle.py` from that
+  image, exactly as `--entry` works.
+- Memory the two sides write differently while their registers agree. The trace
+  has no memory operands; the `strd` bug showed up twice for that reason, the
+  second time only because a later `memcmp` disagreed about bytes.
+- Anything above the per-entry budget (`capped`). Raise `--budget` for a
+  specific entry; it is also the trace-file size limit.
 
 ---
 
@@ -1142,4 +1308,8 @@ Do not re-litigate without new evidence; `docs/REUSE.md` has the detail.
 - **`libgame.so` and the assets are Com2uS's copyrighted work.** `game/`, `*.so`,
   `*.apk`, `*.obb` are gitignored. Never commit or publish them — a browser build
   is far more visible than a Vita homebrew.
-- Run `tools/difftest.sh` before committing anything that touches `src/cpu.c`.
+- Run `tools/difftest.sh --all` before committing anything that touches
+  `src/cpu.c`, `src/elf_loader.c` or the `mem*`/`str*` shims. It takes about
+ 75 s and it is the only check that covers the whole image; the constructor
+  run (`tools/difftest.sh`, no arguments) is the quick one, and it does not
+  exercise the ARM paths at all.

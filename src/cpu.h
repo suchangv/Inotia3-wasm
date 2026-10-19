@@ -43,6 +43,9 @@ enum {
 };
 
 const char *cpu_halt_str(int reason);
+/* One word, for tools: budget, import, returned, bad-pc, trap, undefined,
+ * halted, stopped, bad-mem. */
+const char *cpu_halt_slug(int reason);
 
 /* PC of the last fault, plus the raw instruction and its width in bytes, for
  * the "tell me exactly what is missing" report. */

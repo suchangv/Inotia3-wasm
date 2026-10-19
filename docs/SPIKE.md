@@ -100,20 +100,28 @@ Verified against observed execution rather than only the ARM ARM:
 ## The differential oracle
 
 `tools/difftest.sh` runs every guest entry point twice — once under the
-hand-written interpreter, once under Unicorn 2.1.4 — and diffs
-`tools/difftrace.py`. Both sides start from the *same* relocated memory image
-(the interpreter dumps it, the oracle loads it), stub every import to a no-op
-returning 0, and stop when PC leaves the image. That leaves pure CPU semantics,
-so a mismatch is a decoder bug by construction and the first differing line
-names the instruction.
+hand-written interpreter, once under Unicorn 2.1.4 — and diffs the two traces
+with `tools/difftrace.py`. Both sides start from the *same* relocated memory
+image (the interpreter dumps it *before* the entry runs), both perform the same
+`mem*/str*` imports, and both stop when PC leaves the image or at the first
+import neither side can perform identically. That leaves pure CPU semantics, so
+a mismatch is a decoder bug by construction and the first differing line names
+the instruction.
+
+`tools/difftest.py` is the driver: `--all` takes an entry address from every
+FUNC symbol in the `.so`, runs them on a fork-pool (one copy of the image,
+copy-on-write), and prints one verdict per entry plus a summary grouped by
+divergence signature. `--log=FILE` keeps a machine-readable line per failure.
+The current result over the whole image is 5904 entries, ~4M instructions
+compared, all matching; ~75 s wall on eight workers. The four constructors are
+still the fast check (`tools/difftest.sh` with no arguments).
 
 Why Unicorn is an oracle and not the product is in the parent repo's
 WASM_PORT_ASSESSMENT.md and the README: its speed comes from QEMU's TCG JIT and
 a browser cannot execute generated code, so in wasm it runs TCI — a two-level
 interpreter that does strictly more work per guest instruction than a direct
 decoder. It is also GPLv2. As a *reference* it is exactly right, and it is the
-reason the two bugs below were found in minutes rather than by bisecting
-crashes.
+reason the bugs below were found in minutes rather than by bisecting crashes.
 
 Setting it up needs no system packages and no pip: create a venv with
 `--without-pip` and unpack the PyPI wheel into its `site-packages`. The
@@ -141,6 +149,31 @@ are recorded because anyone re-running this will hit them in the same order:
 5. **The final instruction must be emitted exactly once.** The trace is written
    at the top of the loop for the *previous* instruction, so a run that ends
    before the next top would either miss the last instruction or emit it twice.
+   Both cases are real: a fetch fault never reaches a hook (flush), while a
+   "PC left the image" stop reaches the hook and has already written the line
+   (do not flush). `state["prev"]` is the switch.
+6. **The CPU model matters.** Unicorn's default ARM CPU rejects Thumb-2: the
+   oracle reports 0 instructions compared for every entry. Set
+   `UC_CPU_ARM_CORTEX_A7`.
+7. **A return from a stub switches instruction set through `R15`, bit 0.**
+   Writing the CPSR's T bit from a code hook does not stick — the next fetch is
+   still ARM and the trace diverges one instruction later, in the middle of the
+   PLT.
+8. **The dump must contain everything the guest can read.** The JNI/JavaVM
+   structs at `GUEST_JNI_BASE`, the text bounds and the null page are all read
+   by real code. A dump that stopped at the stub page left the oracle reading
+   zeros where the interpreter had a pointer, on 15 entries, on traces that
+   matched line for line.
+9. **"Instructions per entry" is not one number.** The interpreter counts
+   instruction *words* (a 32-bit Thumb-2 instruction counts as two), so a run
+   cut off by `--budget` retires ~5% fewer instructions than the oracle's. That
+   is a `capped` result, not a length mismatch: the driver reads the
+   interpreter's `halt=` slug and compares the common prefix.
+10. **The shims are part of the machine under test.** Anything whose exact
+    result reaches a register has to be implemented identically on both sides,
+    which means not calling the host's `strcmp`/`memcmp` (sign only, and glibc's
+    AVX2 path returns `-1` where the byte difference is `-137`) and not using
+    the `"(null)"` text a logging helper substitutes for a null pointer.
 
 ## Interpreter bugs found
 
@@ -551,3 +584,72 @@ restore it before committing anything else.
 **Still open, and not performance:** text does not render (the opening event's
 dialogue box comes up empty) and audio is not wired up. `SOUNDSYSTEM_Process` is
 called every frame from `MainProcess` with no host backend behind it.
+
+## Session log — 2026-10-20, the sweep over the whole image
+
+The differential had been "fixed" twice and still only covered four static
+constructors — about 130 instructions, none of which touch a multiply — so it
+had never had a chance to find anything. `tools/difftest.py` turns it into a
+sweep: one entry per FUNC symbol (5904), both sides from one pre-run dump, one
+verdict per entry, failures grouped by signature. First honest run: 119 entries
+did not match. Four were real CPU/loader bugs, five were the harness lying, and
+the rest were the same null-argument class repeated across entries.
+
+**The four real ones.**
+
+1. `strd r2, r3, [r12]` — the last instruction of every 64-bit division in
+   `__gnu_ldivmod_helper` — ran as `bic r2, r12, r0`. The ARM extra-load/store
+   block existed but was gated on `bits[7:4] == 1001`, the multiply encoding,
+   so it never ran for `1011/1101/1111`; every halfword and doubleword load and
+   store fell through to the data-processing decoder. The migration to Unicorn
+   was instant: `strd` is one instruction to decode (`sh == 3 && !L`), and its
+   absence looked exactly like a random register corruption until the trace
+   named the PC.
+2. `blx r12` — how the image reaches every function pointer — was not decoded
+   either; it ran as `teq r15, r12`, so the call never happened and the flags
+   were clobbered. Five entries, all ending in the same place.
+3. Condition field `0xF` was treated as "condition failed" and the instruction
+   was skipped. That silently turned four `ldc2` (XScale WMMX helpers, dead code
+   on ARMv7) into no-ops — and would have turned a `blx` immediate into a
+   dropped call. The unconditional space now has its own block.
+4. `R_ARM_ABS32` pointing at an *imported* symbol was applied as `addend + base`.
+   The two in the binary are `jsonp_malloc`/`jsonp_free`'s stored `&malloc` and
+   `&free`; both became `0x01000000`, so `blx r3` jumped to the image base and
+   executed the ELF header. This one was invisible to the differential at first
+   because *both* sides read the same wrong value out of the dumped image: it
+   surfaced as "the interpreter walks into .rodata and the oracle reports an
+   invalid instruction".
+
+**The harness lies, in the order they cost time.**
+
+- `--budget` was not a flag (`--g_budget` was, and its value was overwritten by
+  the default), so the first entry that looped ran to three billion instructions
+  and wrote a 5 GB trace. 926 GB of `build/` later, unknown options are an
+  error.
+- The dump was taken *after* the entry ran, so the oracle resumed at an import
+  stub. It is taken before the entry now, with `r15` set to what the entry is
+  about to run.
+- The dump did not include `GUEST_JNI_BASE`, where the host writes the JavaVM
+  and JNIEnv function tables; the engine caches `(*vm)->functions` from there,
+  so 15 entries reported `r3 = 0` against a real pointer.
+- The oracle ran with Unicorn's default CPU, which rejects Thumb-2: "0
+  instructions compared", every entry.
+- Returning from a stub has to write `R15` (bit 0 selects Thumb), not the CPSR
+  T bit — a CPSR write from a code hook does not stick.
+- The oracle had to learn to emit the last instruction the interpreter flushes,
+  and to *not* emit it twice when a hook already wrote that line.
+- `memcmp`/`strcmp` were the host's. glibc's AVX2 `memcmp` returns `-1` where
+  the byte difference is `-137`, so the shim and the oracle disagreed about a
+  value the guest is not allowed to depend on but the trace compares. Both are
+  byte loops now, and both sides share one documented out-of-space contract.
+- `strncmp` copied its arguments into an 8 KB scratch buffer and then looped to
+  `n` — the engine passes `0x0a0f6a` through it. `strcpy`/`strlen` copied into
+  the same buffer, so a long string was silently truncated.
+
+**What the sweep still cannot see** is in HANDOFF's "Test coverage": functions
+that need real arguments (they stop at the first null dereference, so only the
+prologue is checked), and memory that differs while the registers agree. The
+`strd` bug appeared *twice* for the second reason — once as a register
+mismatch, once as a `memcmp` disagreement over bytes the two sides had stored
+differently. If a future divergence has matching registers, `--watch=ADDR` is
+the tool.

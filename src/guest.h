@@ -58,6 +58,11 @@
  * pointer never lands in a live allocation. */
 #define GUEST_HEAP_START   (GUEST_HEAP_BASE + 0x1000u)
 
+/* Where a returning entry function lands. Outside the image on purpose, so
+ * HALT_BAD_PC fires: see the note in src/main.c. Must match
+ * RETURN_SENTINEL in tools/oracle.py. */
+#define RETURN_SENTINEL    0x0BADF00Du
+
 extern uint8_t *g_mem;          /* whole guest address space               */
 extern uint32_t g_mem_size;
 

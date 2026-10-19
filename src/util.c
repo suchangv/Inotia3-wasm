@@ -209,9 +209,14 @@ uint8_t guest_ld8(uint32_t a)
     if (!GUEST_INRANGE(a, 1)) { guest_bad(a, "load8"); return 0; }
     return *(uint8_t *)(g_mem + a);
 }
-/* TEMP probe (see guest_st32): names the stores that paint the composite
- * buffer. 32-bit stores log individually; 16/8-bit ones aggregate into a
- * tiny per-PC table and flush it when the budget runs out. */
+/* The guest-store half of --watch (see the host-side half in host_libc.c).
+ *
+ * A guest store to the watched range is not always the culprit behind a
+ * corrupted buffer, but "who wrote this" is the first question every such bug
+ * starts with, and the instruction trace cannot answer it: it has no memory
+ * operands. 32-bit stores log individually; the 8/16-bit ones aggregate per PC
+ * and flush at the end of the run, because a 16-bit repaint writes thousands
+ * of them. */
 uint32_t g_probe_lo, g_probe_len, g_probe_n, g_probe_on = 1;
 static struct { uint32_t pc; int n; } g_probe_pcs[8];
 

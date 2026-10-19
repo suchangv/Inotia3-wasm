@@ -269,11 +269,15 @@ int import_dispatch(int idx)
     im->calls++;
     if (g_oracle_mode) {
         if (import_is_reproducible(im->name)) {
-            /* Both sides perform this one. The oracle has the same fifteen
-             * lines of Python, and the comparison continues past the crossing
-             * -- which is the only way it can ever see inside inflate. */
-            g_cpu.r[0] = 0;
-            g_cpu.r[1] = 0;
+            /* Both sides perform this one, and they have to perform it on the
+             * same arguments. Zeroing r0/r1 first -- which is right for the
+             * stop case below, where the guest must see a deterministic NULL --
+             * clears the first two arguments of the very call being compared:
+             * memcpy(dst, src, n) became memcpy(0, 0, n) here while the oracle
+             * ran the real one, so the two diverged on the return value at the
+             * first crossing and the oracle then faulted on the pointer the
+             * guest derived from it. host_import_call() clears the return
+             * registers itself, before it runs the implementation. */
             host_import_call(im);
             return 0;
         }
