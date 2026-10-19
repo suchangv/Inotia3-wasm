@@ -467,35 +467,49 @@ so the write failed with ENOENT and the game reported "failed". The host
 fix the parent port made in its `CS_fsOpen` hook, applied one layer down where
 every write already goes through).
 
-**The portrait is narrowed further, still not solved.** What is now established
-by measurement rather than inference:
+**The portrait is fixed.** Its draw and its texture were never the problem: the
+texture reaches GL as **64** and its pixels are exactly `portrait4.png`
+(checksummed every 512x512 upload in a run against the same checksum over each
+portrait PNG in the archive, and only one matches). The problem was the
+**multi-textured draw** it goes through, which the OpenGL ES 1.1 client-array
+conversion in `src/gl4es_bridge.c` did not model.
 
-* the hero's portrait reaches GL as **texture 64**, and its pixels are
-  **exactly `portrait4.png`** -- verified by checksumming every 512x512 upload
-  in a run (FNV-1a over the RGBA bytes) and matching it against the same
-  checksum computed over each portrait PNG in the archive. There is one match,
-  and it is the portrait;
-* texture 64 **renders correctly**: binding it to the draw that paints the oval
-  frame (a known-visible quad in the same place) puts the character's face in
-  the oval, so the texture, its sampling, the blend and the oval's coverage are
-  all fine;
-* the only draw that uses texture 64 every frame is `PortraitInfo_Process`'s
-  overlay -- a 212x281 quad at (0,38) in engine space, which the matrices place
-  over the left half of the screen. It is drawn *before* the map and is covered
-  by it, and it is not the HUD portrait (`Portrait_Draw(record, x, y, 1, 0, 1,
-  ...)`, the "new portrait" popup);
-* the three `Portrait_DrawUI` call sites are the inventory, skill and party-bar
-  portraits (x ~ 40, y ~ 255-260), not the top-left corner;
-* the oval frame itself is drawn by `SGL_DrawVPObject` (a UI object whose
-  texture is the UI atlas), and that function walks a **piece list** on the
-  object (`[o+0x48]` array, `[o+0x58]` count, `[o+0x50]` an alpha). So the HUD
-  portrait is most likely a *second piece of that same UI object*, and the next
-  step is to print that object's piece count and image index rather than hunt
-  more draws.
+The chain is `UI_CharacterState_Draw -> UI_CharacterDraw_Icon ->
+GRPX_DrawPartExWithMask -> SGL_DrawTexturePartWithMask`, and it samples two
+texture units: unit 0 the portrait atlas, unit 1 a circular alpha mask that was
+generated once at start-up. `SGL_InitState` sets the two client arrays with
+`glClientActiveTexture`:
 
-The earlier note that the portrait "used texture 54" was a misreading: 54 is a
-different 512x512 atlas, and the draw it belonged to was at the same corner but
-with a different rect.
+```
+glClientActiveTexture(GL_TEXTURE0); glTexCoordPointer(2, GL_FIXED, 0, portraitUVs);
+...
+glClientActiveTexture(GL_TEXTURE1); glEnable(GL_TEXTURE_2D);
+glTexCoordPointer(2, GL_FIXED, 0, maskUVs);
+```
+
+The port had **one** shared `fixed_array` for texture coordinates, so the second
+call overwrote the first, and at draw time it converted only that one and
+installed it on whichever unit happened to be client-active. Unit 1 kept its raw
+`GL_FIXED` words -- WebGL reads those as garbage -- so the mask evaluated to
+alpha 0 across the quad and the portrait was masked out completely: an empty
+ring, with the frame drawn around it by a separate, unaffected sprite. That is
+exactly the reported symptom.
+
+The texture-coordinate array is the one client array that is per *unit*, and
+gl4es already stores it that way (`ATT_MULTITEXCOORD0 + glstate->texture.client`),
+so the port now records one `fixed_array` per unit, notes which unit
+`glClientActiveTexture` selected, and reinstalls each array on its own unit
+before the draw (restoring the engine's client-active unit afterwards). Vertex
+and colour arrays are not per unit and are unchanged.
+
+Two things worth keeping from the search: the earlier "texture 54" reading was a
+misreading (54 is a different 512x512 atlas drawn at the same corner with a
+different rect), and `PortraitInfo_Process` draws a 212x281 portrait overlay
+every frame at (0,38) that the map covers -- it is a "new portrait" popup, not
+the HUD icon, and chasing it wasted a lot of time.
+
+The regression run is unchanged at `average over 1271 frame(s): 390385
+instructions`, and the face now renders in the oval in the browser.
 
 **Linux / Android.** The browser is the only host with the full stack
 (renderer, fonts for every language, audio); the native build is the
@@ -666,12 +680,6 @@ ships and the sound. What is left is adjacent:
   new-game save round-trips.
 - **`tools/difftest.sh`** — the oracle is still unusable; see "The differential
   oracle" below.
-- **The HUD's character portrait draws but shows nothing** (a transparent
-  hole). See the portrait note above: the texture is uploaded with real
-  pixels, the quad is drawn with an opaque colour, and the atlas region it
-  samples is opaque in the file, so the fault is narrower than "the asset is
-  missing" -- the next step is the one experiment the last session did not
-  finish (bind a known-white texture for that one draw).
 
 To reproduce the native chain (device pixels, one tap per line):
 
@@ -950,6 +958,15 @@ These are the ones the PS Vita port had already solved; the lesson is to read
    of a run sees the engine's data. And each array needs its own conversion
    buffer: one shared scratch buffer is aliased by all three pointers, so by draw
    time the vertex array holds the colour data.
+   The same family, one layer up: **the texture-coordinate array is per texture
+   unit** (`glClientActiveTexture`). One shared record for it means the engine's
+   second `glTexCoordPointer` overwrites the first and only one array is ever
+   converted, on whichever unit happened to be selected — the other unit keeps
+   its raw `GL_FIXED` pointer and WebGL reads garbage from it. It hid for a long
+   time because almost every draw in this engine uses a single unit, so the
+   symptom was local: the top-left HUD portrait is `SGL_DrawTexturePartWithMask`,
+   the only multi-textured draw, and with the mask sampling garbage it evaluated
+   to alpha 0 and erased the face behind an otherwise perfect circular frame.
 0e. **A one-character shortcut on a name is not a name test.** `name[2] == 'n'`
    to tell `glEnable` from `glDisable` is never true — `name[2]` is `'E'` — so
    `glEnable` became a no-op and the screen went white with no error at all.

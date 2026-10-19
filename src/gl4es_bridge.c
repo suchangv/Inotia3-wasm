@@ -215,7 +215,38 @@ typedef struct {
     size_t   conv_cap;
 } fixed_array;
 
-static fixed_array g_fx_vertex, g_fx_texcoord, g_fx_color;
+/* The texture-coordinate array is the one array that is per texture *unit*:
+ * GLES1 has glClientActiveTexture, and the engine uses it -- the HUD character
+ * portrait is drawn with multi-texturing (unit 0 samples the portrait atlas,
+ * unit 1 samples a circular alpha mask). One shared record made the second
+ * glTexCoordPointer overwrite the first, so at draw time only one array was
+ * converted and installed, on the one unit that happened to be selected. Unit
+ * 1 kept its raw GL_FIXED words, WebGL read them as garbage, the mask evaluated
+ * to alpha 0 everywhere, and the portrait was masked out completely -- an empty
+ * ring where the face should be. gl4es keeps the arrays per unit itself
+ * (ATT_MULTITEXCOORD0 + glstate->texture.client), so the port only has to
+ * remember them per unit and reinstall each on its own unit before the draw. */
+#define FIXED_TEX_UNITS 4
+static fixed_array g_fx_vertex, g_fx_color;
+static fixed_array g_fx_texcoord[FIXED_TEX_UNITS];
+
+/* Which unit glActiveTexture/glClientActiveTexture last selected. The engine
+ * uses only units 0 and 1, but the state is tracked for all four so an
+ * unexpected unit cannot silently index past the array. */
+static int g_client_tex_unit;
+static int g_active_tex_unit;
+
+static fixed_array *fx_texcoord(void)
+{
+    return &g_fx_texcoord[g_client_tex_unit];
+}
+
+static int tex_unit_index(uint32_t e)
+{
+    if (e < 0x84c0u || e >= 0x84c0u + FIXED_TEX_UNITS)
+        return -1;
+    return (int)(e - 0x84c0u);
+}
 
 /* Convert `count` vertices starting at `first` into this array's own float
  * buffer and hand that to gl4es. Called before every draw, because that is
@@ -638,8 +669,16 @@ int gl4es_dispatch(const char *name, const uint32_t *args, int nargs,
         gl4es_glBindTexture(a0, a1); return 1;
     }
     if (strcmp(name, "__glBindTexture") == 0) { gl4es_glBindTexture(a0, a1); return 1; }
-    if (strcmp(name, "glActiveTexture") == 0)       { gl4es_glActiveTexture(a0); return 1; }
-    if (strcmp(name, "glClientActiveTexture") == 0) { gl4es_glClientActiveTexture(a0); return 1; }
+    if (strcmp(name, "glActiveTexture") == 0) {
+        int u = tex_unit_index(a0);
+        if (u >= 0) g_active_tex_unit = u;
+        gl4es_glActiveTexture(a0); return 1;
+    }
+    if (strcmp(name, "glClientActiveTexture") == 0) {
+        int u = tex_unit_index(a0);
+        if (u >= 0) g_client_tex_unit = u;
+        gl4es_glClientActiveTexture(a0); return 1;
+    }
     if (strcmp(name, "glTexParameteri") == 0) {
         gl4es_glTexParameteri(a0, a1, (int32_t)a2); return 1;
     }
@@ -829,13 +868,18 @@ int gl4es_dispatch(const char *name, const uint32_t *args, int nargs,
         gl4es_glColorPointer((int32_t)a0, a1, (int32_t)a2, G(a3)); return 1;
     }
     if (strcmp(name, "glTexCoordPointer") == 0) {
+        /* The texture-coordinate array is per unit: whichever unit
+         * glClientActiveTexture last selected owns this call, and each unit
+         * keeps its own record (the HUD portrait samples unit 0 for the face
+         * and unit 1 for the circular mask). See g_fx_texcoord's declaration. */
+        fixed_array *fx = fx_texcoord();
         if (a1 == GL_FIXED_) {
             /* Do not forward: WebGL rejects the type and the array is left
              * unbound. Recorded for conversion at draw time instead. */
-            g_fx_texcoord.active = 1; g_fx_texcoord.size = (int)a0; g_fx_texcoord.stride = a2; g_fx_texcoord.ptr = a3;
+            fx->active = 1; fx->size = (int)a0; fx->stride = a2; fx->ptr = a3;
             return 1;
         }
-        g_fx_texcoord.active = 0;
+        fx->active = 0;
         gl4es_glTexCoordPointer((int32_t)a0, a1, (int32_t)a2, G(a3)); return 1;
     }
     if (strcmp(name, "glNormalPointer") == 0) {
@@ -902,20 +946,37 @@ int gl4es_dispatch(const char *name, const uint32_t *args, int nargs,
                     }
                 }
                 {
-                    char tb[120] = {0};
-                    if (g_fx_texcoord.active) {
-                        const int32_t *t = (const int32_t *)(g_mem + g_fx_texcoord.ptr);
-                        int tn = g_fx_texcoord.size ? g_fx_texcoord.size : 2;
-                        int o3 = 0;
-                        for (int i = 0; i < 4 && o3 < 100; i++) {
-                            o3 += snprintf(tb + o3, sizeof(tb) - (size_t)o3, "(");
-                            for (int k = 0; k < tn; k++)
-                                o3 += snprintf(tb + o3, sizeof(tb) - (size_t)o3,
-                                               "%s%.3f", k ? "," : "",
-                                               (double)t[i * tn + k] / 65536.0);
-                            o3 += snprintf(tb + o3, sizeof(tb) - (size_t)o3, ")");
+                    char tb[160] = {0};
+                    int o3 = 0;
+                    if (!g_fx_texcoord[g_client_tex_unit].active &&
+                        !g_fx_texcoord[1].active) {
+                        snprintf(tb, sizeof(tb), "(texcoord array off)");
+                    } else {
+                        for (int u = 0; u < 2; u++) {
+                            const fixed_array *fx = &g_fx_texcoord[u];
+                            if (!fx->active)
+                                continue;
+                            const int32_t *t =
+                                (const int32_t *)(g_mem + fx->ptr);
+                            int tn = fx->size ? fx->size : 2;
+                            o3 += snprintf(tb + o3, sizeof(tb) - (size_t)o3,
+                                           "u%d", u);
+                            for (int i = 0; i < 4 && o3 < 140; i++) {
+                                o3 += snprintf(tb + o3,
+                                               sizeof(tb) - (size_t)o3, "(");
+                                for (int k = 0; k < tn; k++)
+                                    o3 += snprintf(tb + o3,
+                                                   sizeof(tb) - (size_t)o3,
+                                                   "%s%.3f", k ? "," : "",
+                                                   (double)t[i * tn + k] /
+                                                       65536.0);
+                                o3 += snprintf(tb + o3,
+                                               sizeof(tb) - (size_t)o3, ")");
+                            }
+                            o3 += snprintf(tb + o3, sizeof(tb) - (size_t)o3,
+                                           " ");
                         }
-                    } else snprintf(tb, sizeof(tb), "(texcoord array off)");
+                    }
                     host_log("  [draw]   texcoords %s\n", tb);
                 }
                 {
@@ -943,16 +1004,38 @@ int gl4es_dispatch(const char *name, const uint32_t *args, int nargs,
                         if (g_tex[i].id == g_cur_tex) {
                             tw = g_tex[i].w; th = g_tex[i].h; tf = g_tex[i].fmt;
                         }
-                    host_log("  [draw] mode=%d n=%d fixed=%d tex=%u(%ux%u "
+                    host_log("  [draw] mode=%d n=%d fixed=%d unit=%d tex=%u(%ux%u "
                              "internal=%04x) verts %s\n",
                              (int)a0, (int)a2, g_fx_vertex.active,
-                             g_cur_tex, tw, th, tf, vb);
+                             g_active_tex_unit, g_cur_tex, tw, th, tf, vb);
                 }
             }
         }
+        /* The texture-coordinate arrays are per unit and gl4es stores them per
+         * unit, so each recorded array has to be reinstalled on its own unit,
+         * with glClientActiveTexture selecting it: glTexCoordPointer always
+         * writes the array of the unit that is client-active at the moment of
+         * the call, and the engine leaves that on unit 0. Installing them all
+         * on unit 0 -- what a single shared record did -- leaves unit 1 with
+         * the raw GL_FIXED pointer it was given, which WebGL reads as garbage,
+         * so the mask samples alpha 0 and masks the portrait out entirely. */
         fixed_install("glVertexPointer", &g_fx_vertex, (int)a1, (int)a2);
-        fixed_install("glTexCoordPointer", &g_fx_texcoord, (int)a1, (int)a2);
         fixed_install("glColorPointer", &g_fx_color, (int)a1, (int)a2);
+        {
+            int moved = 0;
+            for (int u = 0; u < FIXED_TEX_UNITS; u++) {
+                if (!g_fx_texcoord[u].active)
+                    continue;
+                if (u != g_client_tex_unit) {
+                    gl4es_glClientActiveTexture(0x84c0 + u);
+                    moved = 1;
+                }
+                fixed_install("glTexCoordPointer", &g_fx_texcoord[u],
+                              (int)a1, (int)a2);
+            }
+            if (moved)
+                gl4es_glClientActiveTexture(0x84c0 + g_client_tex_unit);
+        }
         gl4es_glDrawArrays(a0, (int32_t)a1, (int32_t)a2);
         g_gl_draw_calls++;
         return 1;
