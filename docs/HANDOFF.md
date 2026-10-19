@@ -467,19 +467,35 @@ so the write failed with ENOENT and the game reported "failed". The host
 fix the parent port made in its `CS_fsOpen` hook, applied one layer down where
 every write already goes through).
 
-**The portrait is narrowed, not solved.** What is known:
+**The portrait is narrowed further, still not solved.** What is now established
+by measurement rather than inference:
 
-* the top-left quad is drawn with texture 54 (512x512 RGBA), an opaque
-  `glColor4x`, the colour array disabled, and sane texcoords that map to a
-  region that is opaque in all nine `portraitN.png` files;
-* with texturing *disabled* for that one draw, the character's face appears
-  (screenshot), so geometry, colour, blending and coverage are all fine and
-  what fails is the sampling of that texture;
-* the later builds no longer show that quad in the corner draws sampled so far,
-  which suggests it is drawn more than once and an empty one lands on top.
+* the hero's portrait reaches GL as **texture 64**, and its pixels are
+  **exactly `portrait4.png`** -- verified by checksumming every 512x512 upload
+  in a run (FNV-1a over the RGBA bytes) and matching it against the same
+  checksum computed over each portrait PNG in the archive. There is one match,
+  and it is the portrait;
+* texture 64 **renders correctly**: binding it to the draw that paints the oval
+  frame (a known-visible quad in the same place) puts the character's face in
+  the oval, so the texture, its sampling, the blend and the oval's coverage are
+  all fine;
+* the only draw that uses texture 64 every frame is `PortraitInfo_Process`'s
+  overlay -- a 212x281 quad at (0,38) in engine space, which the matrices place
+  over the left half of the screen. It is drawn *before* the map and is covered
+  by it, and it is not the HUD portrait (`Portrait_Draw(record, x, y, 1, 0, 1,
+  ...)`, the "new portrait" popup);
+* the three `Portrait_DrawUI` call sites are the inventory, skill and party-bar
+  portraits (x ~ 40, y ~ 255-260), not the top-left corner;
+* the oval frame itself is drawn by `SGL_DrawVPObject` (a UI object whose
+  texture is the UI atlas), and that function walks a **piece list** on the
+  object (`[o+0x48]` array, `[o+0x58]` count, `[o+0x50]` an alpha). So the HUD
+  portrait is most likely a *second piece of that same UI object*, and the next
+  step is to print that object's piece count and image index rather than hunt
+  more draws.
 
-Next step is the one that was started: inventory the draws for a single HUD
-frame (not the first N of the run) and compare the two that share the corner.
+The earlier note that the portrait "used texture 54" was a misreading: 54 is a
+different 512x512 atlas, and the draw it belonged to was at the same corner but
+with a different rect.
 
 **Linux / Android.** The browser is the only host with the full stack
 (renderer, fonts for every language, audio); the native build is the
