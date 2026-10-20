@@ -111,6 +111,64 @@ void host_android_window_size(int *w, int *h);
 int host_adjust_viewport(int32_t *x, int32_t *y, int32_t *w, int32_t *h);
 #endif
 
+/* Resolve one GL entry point from the *driver* (not from gl4es). Every host
+ * that links gl4es statically needs it: the static archive also exports the
+ * unprefixed gl* names, so a plain call in port code binds to gl4es' own
+ * implementation, which is not what a driver-level lookup is for. */
+#if defined(__ANDROID__) || defined(SPIKE_SDL)
+void *host_gl_proc(const char *name);
+#endif
+
+/* ---- SDL2 (the handheld, and a desktop window) --------------------------
+ *
+ * SDL2 owns the window, the GL context, the gamepad and the clock; the port
+ * keeps the same host_* contract as everywhere else. main.c drives it exactly
+ * like the Android loop: pump, tick, present only when the engine drew.
+ */
+#ifdef SPIKE_SDL
+int  host_sdl_init(void);
+void host_sdl_finish(void);
+/* Process events, waiting up to `timeout_ms` for one. Returns 0 to quit. */
+int  host_sdl_pump(int timeout_ms);
+/* Clear the whole window black and put the viewport inside the letterbox. */
+void host_sdl_begin_frame(void);
+void host_sdl_present(void);
+
+extern int  g_sdl_windowed;        /* --windowed: 960x544 window */
+extern int  g_sdl_frames;          /* --frames=N: stop after N engine frames */
+extern const char *g_sdl_shot;     /* --shot=FILE: write a PPM */
+extern int  g_sdl_shot_frame;      /* presented frames to wait before the shot */
+extern int  g_sdl_cursor_x, g_sdl_cursor_y;  /* --cursor=x,y: show the pointer */
+
+int host_adjust_viewport(int32_t *x, int32_t *y, int32_t *w, int32_t *h);
+#endif
+
+/* ---- MiniLoong (RK3566, aarch64 Linux) ----------------------------------
+ *
+ * A PortMaster game: no Android, no browser, no X server. The window is an EGL
+ * surface on whatever display the handheld's compositor hands us, the input is
+ * evdev gamepad events, and the audio is ALSA. loong_main() in main.c drives
+ * the engine; these are the pieces that loop cannot do itself.
+ *
+ * Deliberately not SDL. SDL2 would be a second windowing dependency that the
+ * device is not guaranteed to ship headers for, while EGL is what every other
+ * PortMaster game on this hardware already uses. evdev is a handful of ioctls.
+ */
+#if defined(__aarch64__) && defined(GUEST_PORT_LOONG)
+int  host_loong_init(void);
+/* Open the display and create the GLES context. Separate from init() because
+ * the engine must not touch GL until there is a surface. Returns 0 on success. */
+int  host_loong_create_window(void);
+/* Drain input events (non-blocking) and return 1 if the app should keep going,
+ * 0 if the user asked to quit. */
+int  host_loong_pump(void);
+void host_loong_begin_frame(void);
+void host_loong_present(void);
+/* The engine's 960x544 viewport mapped into a centred letterbox of the panel. */
+int  host_loong_adjust_viewport(int32_t *x, int32_t *y, int32_t *w, int32_t *h);
+void host_loong_window_size(int *w, int *h);
+#endif
+
 /* Per-instruction trace sink, written from inside the interpreter loop.
  * Format is a contract with tools/oracle.py. */
 void host_trace_open(const char *path);

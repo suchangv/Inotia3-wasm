@@ -165,12 +165,61 @@ build_browser() {
     echo "   -> build/spike.html (serve this directory and open the page)"
 }
 
+# The SDL build: the same engine with a window, a gamepad and (later) sound, for
+# a handheld running PortMaster and for the development machine.
+build_sdl() {
+    echo "== sdl (desktop window) =="
+    SDL2=vendor/SDL2/dist-native
+    GL4ES=vendor/gl4es/lib/native
+    [ -f "$SDL2/lib/libSDL2-2.0.so" ] || {
+        echo "   no SDL2 build. Run tools/build_sdl2.sh native"; exit 1; }
+    [ -f "$GL4ES/libGL.a" ] || {
+        echo "   no gl4es build. Run tools/build_gl4es.sh native"; exit 1; }
+    mkdir -p build
+    $CC $CFLAGS -g -O2 -DSPIKE_SDL -Isrc -I"$SDL2/include/SDL2" \
+        $COMMON src/gl4es_bridge.c src/text_ttf.c src/platform_sdl.c src/main.c \
+        "$GL4ES/libGL.a" \
+        -L"$SDL2/lib" -lSDL2 -ldl -lm -lpthread ${AARCH64_LINK_LIBS:-} \
+        -Wl,-rpath,'$ORIGIN/../vendor/SDL2/dist-native/lib' \
+        -o build/inotia3
+    echo "   -> build/inotia3"
+}
+
+# The same for the handheld: aarch64, statically linked against gl4es, SDL2 from
+# libs/ next to the binary (see tools/build-portmaster.sh).
+build_handheld() {
+    echo "== handheld (aarch64) =="
+    CC=${CROSS_CC:-aarch64-linux-gnu-gcc}
+    # See tools/build_sdl2.sh: AARCH64_SYSROOT pins the glibc the binary is
+    # linked against (PortMaster firmware is older than this build machine).
+    # See tools/cross-aarch64.sh: AARCH64_SYSROOT pins the glibc floor.
+    SYSROOT_FLAG=$(tools/cross-aarch64.sh)
+    [ -n "$AARCH64_GL_INC" ] && SYSROOT_FLAG="$SYSROOT_FLAG -I$AARCH64_GL_INC"
+    [ -n "$AARCH64_GL_INC" ] && SYSROOT_FLAG="$SYSROOT_FLAG -I$AARCH64_GL_INC"
+    SDL2=vendor/SDL2/dist-aarch64
+    GL4ES=vendor/gl4es/lib/aarch64
+    [ -f "$SDL2/lib/libSDL2-2.0.so" ] || {
+        echo "   no aarch64 SDL2. Run tools/build_sdl2.sh aarch64"; exit 1; }
+    [ -f "$GL4ES/libGL.a" ] || {
+        echo "   no aarch64 gl4es. Run tools/build_gl4es.sh aarch64"; exit 1; }
+    mkdir -p build
+    $CC $SYSROOT_FLAG $CFLAGS -O2 -DSPIKE_SDL -Isrc -I"$SDL2/include/SDL2" \
+        $COMMON src/gl4es_bridge.c src/text_ttf.c src/platform_sdl.c src/main.c \
+        "$GL4ES/libGL.a" \
+        -L"$SDL2/lib" -lSDL2 -ldl -lm -lpthread ${AARCH64_LINK_LIBS:-} \
+        -Wl,-rpath,'$ORIGIN/libs' \
+        -o build/inotia3-aarch64
+    echo "   -> build/inotia3-aarch64"
+}
+
 case "${1:-both}" in
     native)  build_native ;;
+    sdl)     build_sdl ;;
+    handheld) build_handheld ;;
     check)   build_check ;;
     wasm)    build_wasm ;;
     browser) build_browser ;;
     both)    build_native; build_wasm ;;
     all)     build_native; build_wasm; build_browser ;;
-    *) echo "usage: $0 [native|check|wasm|browser|both|all]"; exit 2 ;;
+    *) echo "usage: $0 [native|check|wasm|browser|sdl|handheld|both|all]"; exit 2 ;;
 esac

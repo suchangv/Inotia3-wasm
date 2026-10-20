@@ -759,7 +759,8 @@ src/
   text.c           the Java-side text rasteriser (the engine draws no glyphs)
   sound.c          the Java-side sound player (the .so's own one is stubbed)
   input.c          touch, as device coordinates
-  platform_*.c     host services: native / wasm-freestanding / emscripten / android
+  platform_*.c     host services: native / wasm-freestanding / emscripten /
+                   android / sdl (the handheld)
   text_android.c   the text renderer on the phone's own fonts (stb_truetype)
   sound_android.c  the sound player on OpenSL ES (stb_vorbis)
   falsojni.h       the guest's JNI surface (renamed: it shadowed the NDK's jni.h)
@@ -767,7 +768,9 @@ src/
 android/
   AndroidManifest.xml  NativeActivity: no Java, no dex, no WebView
 tools/
-  build.sh             native | check | wasm | browser (check = GUEST_CHECK)
+  build.sh             native | check | wasm | browser | sdl | handheld
+  build_sdl2.sh        SDL2 for the SDL build (native x86_64 / aarch64)
+  build-portmaster.sh  the PortMaster package (aarch64)
   build-android.sh     the APK: compile, package, sign (no Gradle)
   gen_gl4es_protos.sh  regenerate gl4es_protos.h
   build_gl4es.sh       fetch and build gl4es (emscripten or NDK); see below
@@ -787,6 +790,7 @@ third_party/
 docs/
   HANDOFF.md       this file
   ANDROID.md       the Android build: setup, layers, what is verified
+  PORTMASTER.md    the handheld build: layout, build, input mapping
   SPIKE.md         the engineering log: every bug, every finding
   REUSE.md         what off-the-shelf code exists and why each was chosen
 ```

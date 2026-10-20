@@ -122,8 +122,40 @@ android)
     done
     ;;
 
+native|aarch64)
+    # The SDL build: a desktop window on the development machine, or the
+    # handheld. Same contract as Android -- gl4es does not create the context
+    # (NOEGL), the host does, and gl4es emits GLSL ES 3.00 so the host asks for
+    # an ES3 context. NO_INIT_CONSTRUCTOR for the same reason as Android: gl4es'
+    # constructor runs when the binary loads, before the host has set the
+    # backend lookup, and calls through a null gles_glGetString.
+    CROSS=""
+    if [ "$TARGET" = aarch64 ]; then
+        CROSS="-DCMAKE_C_COMPILER=aarch64-linux-gnu-gcc"
+        # Same sysroot as the SDL2 build: glibc 2.31 rather than the build
+        # machine's, or the binary dies with "GLIBC_2.3x not found" on firmware
+        # that froze years ago. AARCH64_GL_INC is the dir holding GL/EGL headers.
+        SYSFLAGS=$("$ROOT/tools/cross-aarch64.sh")
+        [ -n "$AARCH64_GL_INC" ] && SYSFLAGS="$SYSFLAGS -I$AARCH64_GL_INC"
+        [ -n "$SYSFLAGS" ] && CROSS="$CROSS -DCMAKE_C_FLAGS=$SYSFLAGS"
+    fi
+    echo "== gl4es: $TARGET =="
+    mkdir -p "$GL4ES/build-$TARGET"
+    cd "$GL4ES/build-$TARGET"
+    cmake .. \
+        $CROSS \
+        -DCMAKE_BUILD_TYPE=Release \
+        -DNOX11=ON -DNOEGL=ON -DSTATICLIB=ON -DDEFAULT_ES=2 \
+        -DNO_INIT_CONSTRUCTOR=ON \
+        > /dev/null
+    make -j"$(nproc)" > /dev/null
+    mkdir -p "$GL4ES/lib/$TARGET"
+    cp "$GL4ES/lib/libGL.a" "$GL4ES/lib/$TARGET/libGL.a"
+    echo "   -> vendor/gl4es/lib/$TARGET/libGL.a ($(du -h "$GL4ES/lib/$TARGET/libGL.a" | cut -f1))"
+    ;;
+
 *)
-    echo "usage: $0 [emscripten|android|--clean]"
+    echo "usage: $0 [emscripten|android|native|aarch64|--clean]"
     exit 2
     ;;
 esac

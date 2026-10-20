@@ -1,5 +1,9 @@
 /*
- * text_android.c -- the Java-side text renderer, from the platform's own fonts.
+ * text_ttf.c -- the Java-side text renderer, over the platform's own fonts.
+ *
+ * (Was text_android.c: nothing in it is Android-specific -- stb_truetype, mmap
+ * and dirent -- so the SDL build on the handheld uses the same file with an
+ * extra list of font directories.)
  *
  * The engine draws no glyphs. SGL_Font_Android::RenderToTexture calls
  * jDrawText, the *Java* side paints the string into one shared ARGB buffer, and
@@ -94,6 +98,13 @@ static const char *k_known[] = {
     "/system/fonts/NotoSansCJK-Regular.otf",
     "/system/fonts/Roboto-Regular.ttf",
     "/system/fonts/DroidSans.ttf",
+    /* Linux / PortMaster handhelds: whatever font package the firmware ships. */
+    "/usr/share/fonts/truetype/noto/NotoSansCJK-Regular.ttc",
+    "/usr/share/fonts/opentype/noto/NotoSansCJK-Regular.ttc",
+    "/usr/share/fonts/truetype/wqy/wqy-zenhei.ttc",
+    "/usr/share/fonts/truetype/wqy/wqy-microhei.ttc",
+    "/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf",
+    "/usr/share/fonts/truetype/liberation/LiberationSans-Regular.ttf",
     NULL
 };
 
@@ -284,30 +295,36 @@ static int font_name_cjk(const char *n)
  * preferred over whatever else might have a glyph for the probe. */
 static int scan_system_fonts(uint32_t probe, int size)
 {
-    for (int pass = 0; pass < 2; pass++) {
-        DIR *d = opendir("/system/fonts");
-        if (!d)
-            return 0;
-        struct dirent *e;
-        while ((e = readdir(d)) != NULL) {
-            if (!font_name_ok(e->d_name))
-                continue;
-            if (pass == 0 && !font_name_cjk(e->d_name))
-                continue;
-            if (pass == 1 && font_name_cjk(e->d_name))
-                continue;
-            char path[320];
-            snprintf(path, sizeof(path), "/system/fonts/%s", e->d_name);
-            tfont *f = load_font(path);
-            if (!f)
-                continue;
-            if (font_draws(f, probe, size)) {
-                host_log("text: %s draws U+%04X\n", path, probe);
-                closedir(d);
-                return 1;
+    static const char *dirs[] = {
+        "/system/fonts", "/usr/share/fonts/truetype", "/usr/share/fonts",
+        "/usr/share/fonts/opentype", NULL
+    };
+    for (int di = 0; dirs[di]; di++) {
+        for (int pass = 0; pass < 2; pass++) {
+            DIR *d = opendir(dirs[di]);
+            if (!d)
+                break;                  /* no such directory: next one */
+            struct dirent *e;
+            while ((e = readdir(d)) != NULL) {
+                if (!font_name_ok(e->d_name))
+                    continue;
+                if (pass == 0 && !font_name_cjk(e->d_name))
+                    continue;
+                if (pass == 1 && font_name_cjk(e->d_name))
+                    continue;
+                char path[320];
+                snprintf(path, sizeof(path), "%s/%s", dirs[di], e->d_name);
+                tfont *f = load_font(path);
+                if (!f)
+                    continue;
+                if (font_draws(f, probe, size)) {
+                    host_log("text: %s draws U+%04X\n", path, probe);
+                    closedir(d);
+                    return 1;
+                }
             }
+            closedir(d);
         }
-        closedir(d);
     }
     return 0;
 }

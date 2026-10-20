@@ -51,7 +51,7 @@ extern void set_getprocaddress(void *(*fn)(const char *));
 #ifdef __EMSCRIPTEN__
 #include <emscripten/html5.h>
 #endif
-#if defined(__EMSCRIPTEN__) || defined(__ANDROID__)
+#if defined(__EMSCRIPTEN__) || defined(__ANDROID__) || defined(SPIKE_SDL)
 /* For the backend prototypes the wrapper below calls. gl4es never sees this
  * header -- it resolves its own pointers -- so there is no aliasing. */
 #include <GLES2/gl2.h>
@@ -340,7 +340,7 @@ void gl4es_bridge_attach(void)
     g_gl_backend = gl4es_dispatch;
 }
 
-#if defined(__EMSCRIPTEN__) || defined(__ANDROID__)
+#if defined(__EMSCRIPTEN__) || defined(__ANDROID__) || defined(SPIKE_SDL)
 /* gl4es resolves its backend GLES2 entry points through this. With NOEGL there
  * is no EGL to ask, so without it every gles_gl* pointer stays NULL and the
  * first call prints "gles_glXxx is NULL" and does nothing -- the engine runs
@@ -371,13 +371,8 @@ static shader_source_fn real_shader_source(void)
     static int tried;
     if (!tried) {
         tried = 1;
-#ifdef __ANDROID__
-        fn = (shader_source_fn)(uintptr_t)eglGetProcAddress("glShaderSource");
-        if (!fn) {
-            void *h = dlopen("libGLESv2.so", RTLD_NOW | RTLD_LOCAL);
-            if (h)
-                fn = (shader_source_fn)(uintptr_t)dlsym(h, "glShaderSource");
-        }
+#if defined(__ANDROID__) || defined(SPIKE_SDL)
+        fn = (shader_source_fn)(uintptr_t)host_gl_proc("glShaderSource");
 #else
         fn = (shader_source_fn)(uintptr_t)glShaderSource;
 #endif
@@ -478,10 +473,8 @@ static void *gl4es_get_proc(const char *name)
             return (void *)(uintptr_t)k_backend_shims[i].fn;
     if (strcmp(name, "glShaderSource") == 0)
         return (void *)(uintptr_t)gl_shader_source_wrap;
-#ifdef __ANDROID__
-    void *p = (void *)(uintptr_t)eglGetProcAddress(name);
-    if (!p)
-        p = dlsym(RTLD_DEFAULT, name);
+#if defined(__ANDROID__) || defined(SPIKE_SDL)
+    void *p = host_gl_proc(name);
 #else
     void *p = (void *)(uintptr_t)emscripten_webgl_get_proc_address(name);
 #endif
@@ -504,12 +497,12 @@ void gl4es_bridge_init(int fb_w, int fb_h)
      * framebuffer size before it initialises -- otherwise it guesses, and every
      * glOrthox and viewport the engine sets is relative to the wrong size. */
     set_getmainfbsize(fb_size);
-#if defined(__EMSCRIPTEN__) || defined(__ANDROID__)
+#if defined(__EMSCRIPTEN__) || defined(__ANDROID__) || defined(SPIKE_SDL)
     set_getprocaddress(gl4es_get_proc);
 #endif
     initialize_gl4es();
 
-#if defined(__EMSCRIPTEN__) || defined(__ANDROID__)
+#if defined(__EMSCRIPTEN__) || defined(__ANDROID__) || defined(SPIKE_SDL)
     /* gl4es allocates its per-context state in NewGLState(), which the EGL
      * layer calls when a context is created. With NOEGL there is no context
      * creation, so nothing calls it and `glstate` stays pointing at a
@@ -621,7 +614,7 @@ int gl4es_dispatch(const char *name, const uint32_t *args, int nargs,
     if (strcmp(name, "glViewport") == 0) {
         int32_t vx = (int32_t)a0, vy = (int32_t)a1;
         int32_t vw = (int32_t)a2, vh = (int32_t)a3;
-#ifdef __ANDROID__
+#if defined(__ANDROID__) || defined(SPIKE_SDL)
         /* The engine's screen is 960x544 and the window is the device's: the
          * host scales the rect into a centred letterbox and installs the GL
          * viewport itself, so gl4es never sees a viewport it would have to

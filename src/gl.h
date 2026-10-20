@@ -58,10 +58,10 @@ void gl_report(int top_n);
 extern int (*g_gl_backend)(const char *name, const uint32_t *args,
                            int nargs, uint32_t *ret);
 
-#if defined(__EMSCRIPTEN__) || defined(__ANDROID__)
-/* Browser build only: bring gl4es up. See gl4es_bridge.c and docs/REUSE.md.
- * The Android build needs it for the same reason -- gl4es with NOEGL is told
- * the framebuffer size and initialised by the host. */
+#if defined(__EMSCRIPTEN__) || defined(__ANDROID__) || defined(SPIKE_SDL)
+/* Every host that renders: bring gl4es up. See gl4es_bridge.c and
+ * docs/REUSE.md -- gl4es with NOEGL is told the framebuffer size and
+ * initialised by the host. */
 void gl4es_bridge_init(int fb_w, int fb_h);
 #endif
 

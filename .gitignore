@@ -38,3 +38,6 @@ vendor/
 # game/ above) made by tools/build-android.sh; the APK and the debug keystore
 # live under build/.
 android/assets/
+
+# --- PortMaster package output ---
+dist/

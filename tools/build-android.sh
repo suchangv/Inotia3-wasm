@@ -68,7 +68,7 @@ CC_FLAGS="-std=c11 -O2 -fPIC -Wall -Wextra -Wno-unused-parameter \
 -Wno-unused-function -Isrc -Ithird_party/stb -Iandroid -I$GLUE"
 SOURCES="src/util.c src/elf_loader.c src/cpu.c src/imports.c src/host_libc.c \
 src/jni.c src/gl.c src/gl4es_bridge.c src/patches.c src/timers.c \
-src/asset_zip.c src/input.c src/text.c src/text_android.c src/sound.c \
+src/asset_zip.c src/input.c src/text.c src/text_ttf.c src/sound.c \
 src/sound_android.c src/platform_android.c src/main.c \
 $GLUE/android_native_app_glue.c"
 

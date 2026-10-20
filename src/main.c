@@ -1572,8 +1572,120 @@ static int spike_tick_browser(void)
     return 1;
 }
 
+#ifdef SPIKE_SDL
+/*
+ * The SDL build *is* the game: no oracle flags, no traces, no measurement
+ * runner. It is the same engine and the same host contract as every other
+ * platform, driven the way the Android loop drives it -- pump, tick, present
+ * only when the engine actually drew (presenting an untouched back buffer is
+ * what flickers on a 60 Hz display against a 15 fps engine).
+ */
+static int spike_sdl_run(int argc, char **argv)
+{
+    const char *so = "libgame.so";
+    for (int i = 1; i < argc; i++) {
+        if (strncmp(argv[i], "--so=", 5) == 0)
+            so = argv[i] + 5;
+        else if (strcmp(argv[i], "--windowed") == 0)
+            g_sdl_windowed = 1;
+        else if (strncmp(argv[i], "--frames=", 9) == 0)
+            g_sdl_frames = atoi(argv[i] + 9);
+        else if (strncmp(argv[i], "--cursor=", 9) == 0) {
+            if (sscanf(argv[i] + 9, "%d,%d", &g_sdl_cursor_x,
+                       &g_sdl_cursor_y) != 2) {
+                host_log("--cursor needs x,y\n");
+                return 2;
+            }
+        } else if (strncmp(argv[i], "--tap=", 6) == 0) {
+            /* --tap=frame,x,y, in *tick* frames (device pixels), same as the
+             * CLI. Kept in the SDL build for scripted smoke tests: it is the
+             * only way to drive the menu without a hand on the device. */
+            int fr = 0, tx = 0, ty = 0;
+            if (sscanf(argv[i] + 6, "%d,%d,%d", &fr, &tx, &ty) == 3 &&
+                g_ntaps < (int)(sizeof(g_taps) / sizeof(g_taps[0]))) {
+                g_taps[g_ntaps].frame = fr;
+                g_taps[g_ntaps].x = tx;
+                g_taps[g_ntaps].y = ty;
+                g_ntaps++;
+            }
+        }
+        else if (strncmp(argv[i], "--shot=", 7) == 0) {
+            /* --shot=FILE[@FRAME]: write a PPM after that many presented
+             * frames (default: the first). Static storage because argv lives
+             * for the whole run and strdup is not declared without a POSIX
+             * feature macro. */
+            static char shot_path[512];
+            snprintf(shot_path, sizeof(shot_path), "%s", argv[i] + 7);
+            char *at = strchr(shot_path, '@');
+            if (at) {
+                *at = 0;
+                g_sdl_shot_frame = atoi(at + 1);
+            }
+            g_sdl_shot = shot_path;
+        } else if (argv[i][0] != '-') {
+            so = argv[i];
+        } else {
+            host_log("unknown option %s\n", argv[i]);
+            return 2;
+        }
+    }
+
+    if (host_sdl_init() != 0)
+        return 1;
+    host_log("loading %s\n", so);
+    if (spike_load(so) != 0) {
+        host_sdl_finish();
+        return 1;
+    }
+    g_budget = 3000u * 1000u * 1000u;
+    g_do_profile = 0;
+    /* Real elapsed time: the engine's own 66 ms frame period is the game's
+     * speed, and a fixed step would fight it. */
+    g_use_fixed_step = 0;
+
+    host_log("\n=== booting ===\n");
+    if (spike_boot() != 0) {
+        host_sdl_finish();
+        return 1;
+    }
+    input_init(spike_dispatch_event);
+    host_log("=== frame loop ===\n");
+
+    /* --frames counts *engine* frames, not loop iterations: the loop ticks at
+     * the display's rate and the engine only draws when a timer is due, so
+     * counting iterations would make "frames" mean nothing. */
+    int engine_frames = 0;
+    for (;;) {
+        /* Sleep until the engine's next timer (input still arrives: the pump
+         * waits on SDL events). Without this the loop spins at 100% of a core,
+         * because presenting is the only other thing that blocks. */
+        int64_t wait = g_tick_drew ? 0 : timers_next_in(g_clock);
+        if (wait < 0 || wait > 40)
+            wait = 8;
+        if (!host_sdl_pump((int)wait))
+            break;
+        host_sdl_begin_frame();
+        if (!spike_tick())
+            break;
+        if (g_tick_drew) {
+            host_sdl_present();
+            engine_frames++;
+        }
+        if (g_sdl_frames > 0 && engine_frames >= g_sdl_frames)
+            break;
+    }
+    host_log("\n=== %d engine frame(s) ===\n", engine_frames);
+    spike_finish();
+    host_sdl_finish();
+    return 0;
+}
+#endif
+
 int main(int argc, char **argv)
 {
+#ifdef SPIKE_SDL
+    return spike_sdl_run(argc, argv);
+#endif
     const char *path = NULL;
     const char *dump_path = NULL;
     const char *trace_path = NULL;
