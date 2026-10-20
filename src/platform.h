@@ -93,10 +93,15 @@ void host_android_init(struct android_app *app);
 /* Copy libgame.so and assets.apk out of the APK, then chdir to the app's
  * private files directory. Returns 0 on success. */
 int  host_android_prepare(void);
-/* Run the looper until it has nothing left. Blocks while there is no window;
- * returns 0 when the activity is going away. */
-int  host_android_pump(void);
+/* Process the looper: 0 drains pending events and returns, >0 waits up to that
+ * many milliseconds (the loop's sleep, and how input still arrives while the
+ * engine has nothing to draw), and it blocks outright while there is no window.
+ * Returns 0 when the activity is going away. */
+int  host_android_pump(int timeout_ms);
 int  host_android_have_window(void);
+/* Clear the whole window surface (black), scissor off. Called before each tick
+ * so the letterbox bars are black rather than stale buffer contents. */
+void host_android_begin_frame(void);
 void host_android_present(void);
 void host_android_window_size(int *w, int *h);
 

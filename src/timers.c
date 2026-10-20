@@ -96,6 +96,29 @@ int timers_due(int64_t now, uint32_t *out, int max)
     return n;
 }
 
+/* Milliseconds until the soonest timer is due, or -1 when nothing is armed.
+ *
+ * A host whose display only updates when the engine draws has no vsync to pace
+ * its loop (see the Android loop in main.c): present-every-tick is what causes
+ * the flicker, so the loop has to sleep, and sleeping for a fixed number of
+ * milliseconds either adds latency or wakes for nothing. This is the number the
+ * looper should wait for. */
+int64_t timers_next_in(int64_t now)
+{
+    int64_t best = -1;
+    for (int i = 0; i < TIMER_MAX; i++) {
+        wr_timer *t = &g_timers[i];
+        if (!t->used)
+            continue;
+        int64_t d = t->firetime - now;
+        if (d < 0)
+            d = 0;
+        if (best < 0 || d < best)
+            best = d;
+    }
+    return best;
+}
+
 int timers_active(void)
 {
     int n = 0;

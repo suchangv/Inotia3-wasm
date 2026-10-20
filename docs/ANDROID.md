@@ -88,6 +88,48 @@ surface) shadowed the NDK's `<jni.h>` for every NDK header that includes it, so
 `android/native_activity.h` could not even declare `JavaVM`. The header is now
 `src/falsojni.h`.
 
+## Fixed after the first device test
+
+Three things a real 16:10 phone showed that the emulator did not:
+
+**The letterbox bars were garbage, not black.** The engine only covers its
+960x544 region, and an Android window surface's buffers are not guaranteed to
+come back preserved: whatever the last user of that buffer left in the top and
+bottom bars is what the compositor shows. `host_android_begin_frame()` now
+clears the whole surface black (scissor off, full-size viewport) before each
+tick, then restores the letterbox viewport so a frame that draws without setting
+one still lands inside the bars.
+
+**The screen flickered badly.** The loop presented on every tick -- 60 a second
+on a phone -- while the engine only draws when one of its timers is due, 15
+times a second. Presenting an untouched back buffer puts the *previous* frame on
+screen for one vsync, then the next tick puts this one back: flicker at the
+display's rate, three times per engine frame. The loop now presents only when
+`spike_tick()` actually ran the engine (`g_tick_drew`), and sleeps on
+`timers_next_in()` otherwise, through the looper so input still arrives. Measured
+on the emulator: 15.1 presents/second, and the app's CPU use halved.
+
+**Chinese text was blank on the device.** The first version of the text backend
+tried four hard-coded font paths and chose the first whose cmap had the
+language's probe character. A device whose CJK font has a different name (a
+vendor font: MiSans, HarmonyOS Sans, ...) fell back to a Latin font -- Latin
+worked, Chinese was blank, and nothing was logged. The backend now (a) tries the
+known paths, (b) if none can actually *rasterise* the probe, scans
+`/system/fonts` -- CJK-looking names first -- for one that can, (c) keeps every
+font that loaded and picks per character, so one font can serve Latin and another
+CJK, and (d) logs which font it is using, or that no font on the device can draw
+the language. Text is also sized the way `Paint.textSize` sizes it now
+(`stbtt_ScaleForMappingEmToPixels`, not ascent-to-descent), which matters for CJK
+where the two differ by ~45%.
+
+If a device genuinely has no font that can draw the language, dropping a
+`font.ttf` (or `.ttc`/`.otf`) into the app's files directory overrides
+everything:
+
+```sh
+adb push myfont.ttf /data/data/io.github.inotia3.native/files/font.ttf
+```
+
 ## What has been verified, and how
 
 On an `x86_64` Android 13 emulator (`-gpu swiftshader_indirect`, no window;

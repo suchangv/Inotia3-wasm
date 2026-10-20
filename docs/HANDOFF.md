@@ -684,8 +684,27 @@ not declare `JavaVM`. It is `src/falsojni.h` now.
 (23 MB), title screen, character creation (the description and stat text are the
 new TTF backend), the opening dialogue, the first map, letterboxing and touch
 mapping, and an OpenSL player starting. **Not verified**: audio output (the
-emulator ran `-no-audio`), a real GPU, background/rotation, and the save
-round-trip. docs/ANDROID.md has the setup, the layer map and that list.
+emulator ran `-no-audio`), background/rotation, and the save round-trip.
+docs/ANDROID.md has the setup, the layer map and that list.
+
+Then a real 16:10 phone found three things the emulator could not:
+
+- **the letterbox bars were garbage**: the engine covers only its 960x544
+  region and an Android surface buffer is not guaranteed to come back preserved,
+  so the bars showed whatever the buffer held. The frame now starts by clearing
+  the whole surface black;
+- **the screen flickered**: the loop presented every tick (60 Hz) while the
+  engine draws only when a timer is due (15 Hz), so every present showed the
+  *previous* frame in the other buffer. It presents only when the engine drew,
+  and sleeps on `timers_next_in()` otherwise -- 15.1 presents/second measured,
+  and half the CPU;
+- **Chinese was blank**: the text backend tried four hard-coded font paths and
+  picked the first whose cmap had the probe character, which on a device with a
+  vendor CJK font (MiSans, HarmonyOS Sans, ...) meant a Latin font for
+  everything -- Latin worked, CJK was blank, nothing was logged. It now scans
+  `/system/fonts` when the known paths cannot *rasterise* the language's probe,
+  keeps every font that loads and picks per character, and logs the choice (or
+  that nothing on the device can draw it).
 
 ---
 

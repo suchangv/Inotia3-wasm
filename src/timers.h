@@ -53,6 +53,9 @@ void timers_reset(void);
  * call does not return it again. */
 int timers_due(int64_t now, uint32_t *out, int max);
 
+/* Milliseconds until the soonest timer is due, or -1 if none is armed. */
+int64_t timers_next_in(int64_t now);
+
 /* Report the table. */
 void timers_report(void);
 

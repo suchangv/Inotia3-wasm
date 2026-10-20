@@ -1397,6 +1397,13 @@ static void spike_finish(void)
  * its stale initial value on a tick where no timer fired, and dropping the
  * guard ends the run on the very first one.
  */
+/* Set by spike_tick(): non-zero when at least one timer was due and the engine
+ * ran (and therefore drew) this tick. A display that presents on every tick --
+ * a phone at 60 Hz against an engine at 15 fps -- alternates between the frame
+ * it just drew and the *other* buffer, which still holds the frame before it:
+ * that is the flicker. The Android loop presents only when this is set. */
+int g_tick_drew;
+
 static int spike_tick(void)
 {
     /* Input first, then the timers, so the engine sees this frame's input
@@ -1442,6 +1449,7 @@ static int spike_tick(void)
 
     uint32_t due[TIMER_MAX];
     int ndue = timers_due(g_clock, due, TIMER_MAX);
+    g_tick_drew = ndue > 0;
     if (ndue) {
         spike_probe_loader();
         spike_probe_state();
@@ -1892,7 +1900,7 @@ void android_main(struct android_app *app)
 
     /* Nothing may touch GL before the surface exists: the boot sequence ends in
      * a frame. host_android_pump blocks until the window arrives. */
-    while (!host_android_have_window() && host_android_pump())
+    while (!host_android_have_window() && host_android_pump(0))
         ;
     if (!host_android_have_window()) {
         host_log("android: no window, exiting\n");
@@ -1916,15 +1924,35 @@ void android_main(struct android_app *app)
 
     host_log("=== android: frame loop ===\n");
     for (;;) {
-        if (!host_android_pump())
+        if (!host_android_pump(0))
             break;
         /* The surface can go away between the pump and the tick (home button,
          * rotation): the glue blocks in the pump until it is back. */
         if (!host_android_have_window())
             continue;
+        /* Paint the whole surface black first: the engine only covers the
+         * letterbox, and on a device whose surface buffers are not preserved
+         * the bars are whatever was in the buffer (garbage, not black). */
+        host_android_begin_frame();
         if (!spike_tick())
             break;
-        host_android_present();
+        if (g_tick_drew) {
+            /* Something was drawn: present it. */
+            host_android_present();
+        } else {
+            /* Nothing was due, so nothing was drawn -- and presenting an
+             * untouched back buffer is what makes the screen flicker: it puts
+             * the *previous* frame up for one vsync, then the next tick puts
+             * this one back. At 60 Hz against a 15 fps engine that is three
+             * flickers per frame. Sleep until the engine's next timer instead
+             * (the looper still delivers input), which also keeps the loop off
+             * the CPU -- without eglSwapBuffers nothing else paces it. */
+            int64_t wait = timers_next_in(g_clock);
+            if (wait < 0 || wait > 100)
+                wait = 16;
+            if (!host_android_pump((int)wait))
+                break;
+        }
     }
     spike_finish();
 }

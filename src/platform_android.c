@@ -504,6 +504,32 @@ int host_adjust_viewport(int32_t *x, int32_t *y, int32_t *w, int32_t *h)
     return 1;
 }
 
+/* The engine draws nothing outside the letterbox, and an Android surface's
+ * buffers are not guaranteed to be preserved: on a 16:10 tablet the top and
+ * bottom bars came up as garbage from whatever the buffer held. Clear the whole
+ * surface each frame, with the scissor off and the viewport at full size, so the
+ * engine's own clear and draws land inside the letterbox on a black field. */
+void host_android_begin_frame(void)
+{
+    if (!g_have_window)
+        return;
+    glDisable(GL_SCISSOR_TEST);
+    /* Full-size viewport for the clear: glClear ignores the viewport, but not
+     * the scissor, and this is the only way to be sure the bars are painted on
+     * drivers that keep their own scissor. */
+    glViewport(0, 0, g_surface_w, g_surface_h);
+    glClearColor(0.0f, 0.0f, 0.0f, 1.0f);
+    glClear(GL_COLOR_BUFFER_BIT | GL_DEPTH_BUFFER_BIT | GL_STENCIL_BUFFER_BIT);
+
+    /* Then put the viewport back inside the letterbox even before the engine
+     * sets one: a frame that draws without calling glViewport would otherwise
+     * fill the whole window and stretch the picture. */
+    int lx, ly, lw, lh;
+    letterbox(&lx, &ly, &lw, &lh);
+    if (lw > 0 && lh > 0)
+        glViewport(lx, g_surface_h - ly - lh, lw, lh);
+}
+
 void host_android_present(void)
 {
     if (g_have_window && g_dpy != EGL_NO_DISPLAY)
@@ -634,17 +660,20 @@ void host_android_init(struct android_app *app)
     app->onInputEvent = on_input;
 }
 
-/* Process everything the looper has, then return. Blocks while there is no
- * window, so a backgrounded app costs nothing and a foregrounded one wakes up
- * as soon as the surface arrives. Returns 0 when the app is going away. */
-int host_android_pump(void)
+/* Process the looper. `timeout_ms` 0 drains what is pending and returns; a
+ * positive value waits up to that long for input or a lifecycle event (which is
+ * how the loop sleeps: the display only updates when the engine draws, so there
+ * is no vsync blocking on eglSwapBuffers to pace it). With no window it blocks
+ * outright, because there is nothing to do until the surface comes back.
+ * Returns 0 when the app is going away. */
+int host_android_pump(int timeout_ms)
 {
     for (;;) {
         if (g_quit || g_app->destroyRequested)
             return 0;
         int events;
         struct android_poll_source *source;
-        int timeout = g_have_window ? 0 : -1;
+        int timeout = g_have_window ? timeout_ms : -1;
         int id = ALooper_pollOnce(timeout, NULL, &events, (void **)&source);
         if (id == ALOOPER_POLL_TIMEOUT)
             return 1;
@@ -652,6 +681,9 @@ int host_android_pump(void)
             source->process(g_app, source);
         if (id == ALOOPER_POLL_ERROR)
             return 1;
+        if (timeout_ms == 0)
+            return 1;      /* drain mode: one pass over what is pending */
+        timeout_ms = 0;    /* an event woke us: handled, and drain the rest */
     }
 }
 
