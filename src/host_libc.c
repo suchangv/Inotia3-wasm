@@ -17,7 +17,7 @@
 #include "compat.h"
 #include "platform.h"
 #include "asset_zip.h"
-#include "jni.h"
+#include "falsojni.h"
 #include "gl.h"
 
 #ifndef WASM_FREESTANDING

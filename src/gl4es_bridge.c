@@ -31,6 +31,7 @@
  */
 
 #include "gl.h"
+#include "platform.h"
 #include <stdio.h>
 #include "guest.h"
 #include "cpu.h"
@@ -49,9 +50,15 @@ extern void set_getprocaddress(void *(*fn)(const char *));
 
 #ifdef __EMSCRIPTEN__
 #include <emscripten/html5.h>
+#endif
+#if defined(__EMSCRIPTEN__) || defined(__ANDROID__)
 /* For the backend prototypes the wrapper below calls. gl4es never sees this
  * header -- it resolves its own pointers -- so there is no aliasing. */
 #include <GLES2/gl2.h>
+#endif
+#ifdef __ANDROID__
+#include <EGL/egl.h>
+#include <dlfcn.h>
 #endif
 
 /* ---- argument helpers ---------------------------------------------------- */
@@ -333,15 +340,51 @@ void gl4es_bridge_attach(void)
     g_gl_backend = gl4es_dispatch;
 }
 
-#ifdef __EMSCRIPTEN__
+#if defined(__EMSCRIPTEN__) || defined(__ANDROID__)
 /* gl4es resolves its backend GLES2 entry points through this. With NOEGL there
  * is no EGL to ask, so without it every gles_gl* pointer stays NULL and the
  * first call prints "gles_glXxx is NULL" and does nothing -- the engine runs
- * but the screen stays empty. Emscripten's own lookup is the right source. */
+ * but the screen stays empty. The host's own lookup is the right source:
+ * emscripten's for the page, eglGetProcAddress for Android (plus dlsym, because
+ * eglGetProcAddress is only required to return *extension* entry points and
+ * some drivers return NULL for the core ones). */
 /* The shader source gl4es hands the backend. Wrapping it here is the only place
  * to see it: gl4es generates the fixed-pipeline shader internally and calls the
  * backend's glShaderSource directly, so nothing in this port sees it otherwise.
  * A GLSL error with no source to look at is unguessable. */
+/* The *driver's* glShaderSource, not the unprefixed symbol.
+ *
+ * With STATICLIB gl4es also exports the unprefixed names (nm libGL.a shows
+ * `T glShaderSource` next to `T gl4es_glShaderSource`), and a static archive
+ * beats the shared library at link time: the call below would resolve back into
+ * gl4es' own entry point, which dereferences glstate. During
+ * initialize_gl4es() glstate does not exist yet -- testGLSL() runs first -- so
+ * that is a SIGSEGV at 0x2660 inside the loader, naming no guest code at all.
+ * Android resolves it through EGL/dlsym; the browser's libGL is a JS library
+ * and has no such alias, so there the plain symbol is already the driver's. */
+typedef void (*shader_source_fn)(unsigned, int, const char *const *,
+                                 const int *);
+
+static shader_source_fn real_shader_source(void)
+{
+    static shader_source_fn fn;
+    static int tried;
+    if (!tried) {
+        tried = 1;
+#ifdef __ANDROID__
+        fn = (shader_source_fn)(uintptr_t)eglGetProcAddress("glShaderSource");
+        if (!fn) {
+            void *h = dlopen("libGLESv2.so", RTLD_NOW | RTLD_LOCAL);
+            if (h)
+                fn = (shader_source_fn)(uintptr_t)dlsym(h, "glShaderSource");
+        }
+#else
+        fn = (shader_source_fn)(uintptr_t)glShaderSource;
+#endif
+    }
+    return fn;
+}
+
 static void gl_shader_source_wrap(unsigned shader, int count,
                                   const char *const *str, const int *len)
 {
@@ -354,7 +397,9 @@ static void gl_shader_source_wrap(unsigned shader, int count,
             host_log("  [glsl %d len=%d]\n%.*s\n  [end %d]\n", i, n, n, str[i], i);
         }
     }
-    glShaderSource(shader, count, str, len);
+    shader_source_fn fn = real_shader_source();
+    if (fn)
+        fn(shader, count, str, len);
 }
 
 /* The GLES1 fixed-point entry points gl4es expects its *backend* to provide.
@@ -433,7 +478,13 @@ static void *gl4es_get_proc(const char *name)
             return (void *)(uintptr_t)k_backend_shims[i].fn;
     if (strcmp(name, "glShaderSource") == 0)
         return (void *)(uintptr_t)gl_shader_source_wrap;
+#ifdef __ANDROID__
+    void *p = (void *)(uintptr_t)eglGetProcAddress(name);
+    if (!p)
+        p = dlsym(RTLD_DEFAULT, name);
+#else
     void *p = (void *)(uintptr_t)emscripten_webgl_get_proc_address(name);
+#endif
     /* gl4es asks for every backend entry point it might use. Logging the misses
      * is the difference between "the backend is not wired" and "this one symbol
      * has no GLES2 equivalent", which need different fixes. */
@@ -453,12 +504,12 @@ void gl4es_bridge_init(int fb_w, int fb_h)
      * framebuffer size before it initialises -- otherwise it guesses, and every
      * glOrthox and viewport the engine sets is relative to the wrong size. */
     set_getmainfbsize(fb_size);
-#ifdef __EMSCRIPTEN__
+#if defined(__EMSCRIPTEN__) || defined(__ANDROID__)
     set_getprocaddress(gl4es_get_proc);
 #endif
     initialize_gl4es();
 
-#ifdef __EMSCRIPTEN__
+#if defined(__EMSCRIPTEN__) || defined(__ANDROID__)
     /* gl4es allocates its per-context state in NewGLState(), which the EGL
      * layer calls when a context is created. With NOEGL there is no context
      * creation, so nothing calls it and `glstate` stays pointing at a
@@ -568,7 +619,17 @@ int gl4es_dispatch(const char *name, const uint32_t *args, int nargs,
 
     /* ---- viewport and clearing ---- */
     if (strcmp(name, "glViewport") == 0) {
-        gl4es_glViewport((int32_t)a0, (int32_t)a1, (int32_t)a2, (int32_t)a3);
+        int32_t vx = (int32_t)a0, vy = (int32_t)a1;
+        int32_t vw = (int32_t)a2, vh = (int32_t)a3;
+#ifdef __ANDROID__
+        /* The engine's screen is 960x544 and the window is the device's: the
+         * host scales the rect into a centred letterbox and installs the GL
+         * viewport itself, so gl4es never sees a viewport it would have to
+         * translate later. */
+        if (host_adjust_viewport(&vx, &vy, &vw, &vh))
+            return 1;
+#endif
+        gl4es_glViewport(vx, vy, vw, vh);
         return 1;
     }
     if (strcmp(name, "glScissor") == 0) {

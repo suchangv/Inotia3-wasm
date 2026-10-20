@@ -29,7 +29,7 @@
 #include "asset_zip.h"
 #include "compat.h"     /* the string helpers: no libc freestanding */
 #include "guest.h"
-#include "jni.h"
+#include "falsojni.h"
 #include "platform.h"
 #include "sound.h"
 
@@ -63,7 +63,7 @@ static sound_slot g_sound[SOUND_MAX];
  * throughput build -- they are no-ops that report success, so the engine's own
  * state machine still runs and the two hosts stay behaviourally identical
  * everywhere except the audio hardware itself. */
-#ifdef __EMSCRIPTEN__
+#if defined(__EMSCRIPTEN__) || defined(__ANDROID__)
 extern int  sound_host_open(int id, const char *name, int loop,
                             const unsigned char *data, unsigned len);
 extern void sound_host_prepare(int id);

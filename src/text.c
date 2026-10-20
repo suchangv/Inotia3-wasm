@@ -50,7 +50,7 @@
 
 #include "compat.h"    /* the string helpers, declared for freestanding */
 #include "guest.h"
-#include "jni.h"
+#include "falsojni.h"
 #include "platform.h"
 #include "text.h"
 
@@ -93,7 +93,7 @@ void text_set_buffer(uint32_t guest_addr, int width, int height)
  * Implemented in tools/text.js. `s`/`len` are a UTF-8 run of text that is not
  * NUL-terminated (it is a slice of the engine's own buffer), the guest buffers
  * are passed as host pointers because the tooling writes straight into them. */
-#ifdef __EMSCRIPTEN__
+#if defined(__EMSCRIPTEN__) || defined(__ANDROID__)
 extern int  text_host_width(const char *s, int len, int font_size);
 extern int  text_host_line_height(int font_size);
 extern int  text_host_paint(const char *s, int len, int font_size, int x, int y,
@@ -143,7 +143,7 @@ static int run_width(const uint8_t *s, int start, int end, int font_size)
 {
     if (end <= start)
         return 0;
-#ifdef __EMSCRIPTEN__
+#if defined(__EMSCRIPTEN__) || defined(__ANDROID__)
     if (host_text)
         return text_host_width((const char *) (s + start), end - start,
                                font_size);
@@ -158,7 +158,7 @@ static int run_width(const uint8_t *s, int start, int end, int font_size)
  * measurement reports, so this has to be the same number the painting uses. */
 static int line_height(int font_size)
 {
-#ifdef __EMSCRIPTEN__
+#if defined(__EMSCRIPTEN__) || defined(__ANDROID__)
     if (host_text)
         return text_host_line_height(font_size);
 #endif
@@ -345,7 +345,7 @@ static void paint_run(const uint8_t *s, int start, int end, int font_size, int x
 {
     if (end <= start)
         return;
-#ifdef __EMSCRIPTEN__
+#if defined(__EMSCRIPTEN__) || defined(__ANDROID__)
     if (host_text) {
         int max_w = stride < g_buf_w ? stride : g_buf_w;
         g_ink += text_host_paint((const char *) (s + start), end - start,

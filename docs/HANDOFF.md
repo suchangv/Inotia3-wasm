@@ -512,13 +512,11 @@ the HUD icon, and chasing it wasted a lot of time.
 The regression run is unchanged at `average over 1271 frame(s): 390385
 instructions`, and the face now renders in the oval in the browser.
 
-**Linux / Android.** The browser is the only host with the full stack
-(renderer, fonts for every language, audio); the native build is the
-debugging/measurement host and has no window on purpose. `tools/play-linux.sh`
-is the Linux answer: it builds the browser target if needed, serves it on
-localhost and opens it. A native windowed build would need SDL2 (not installed
-here), a font backend (there is no Canvas, so CJK would regress to the bitmap
-fallback) and an audio backend -- a separate project, not a build flag.
+**Linux / Android.** The browser is the host with the full stack and the native
+build is the debugging/measurement host, deliberately windowless.
+`tools/play-linux.sh` is the Linux answer: it builds the browser target if
+needed, serves it on localhost and opens it. Android is a real app now -- see
+below.
 
 ### Progress since that (2026-10-20, the differential covers the whole image)
 
@@ -621,6 +619,74 @@ does instead of taking a host SIGSEGV. `difftest.py` prefers that binary when it
 exists. The release build is unchanged -- the check is a test build, about half
 speed.
 
+### Progress since that (2026-10-20, the Android build)
+
+**There is an APK, and it plays the game.** A NativeActivity with no Java, no
+`classes.dex` and no WebView: the frame loop, input, GL and audio are native,
+and the guest runs under the same interpreter as every other build. Because the
+guest is interpreted, the APK carries `arm64-v8a` and `x86_64` and the *same*
+guest image runs on both -- the x86_64 library is what runs in an emulator, not a
+second port.
+
+```
+tools/build-android.sh                 # -> build/android/inotia3.apk
+tools/build-android.sh --install       # ... adb install -r
+```
+
+No Gradle: the script compiles with the NDK's clang, packages with `aapt2` +
+`jar` (from the JDK, so `zip` is not needed), aligns with `zipalign` and signs
+with a generated debug keystore.
+
+The four pieces that are actually new, and what each had to solve:
+
+- **`src/platform_android.c`** -- EGL with a GLES3 context (gl4es generates GLSL
+  ES 3.00), the `AInputQueue` mapped from window pixels to the engine's 960×544,
+  assets unpacked out of the APK into the app's files dir with a `chdir` so every
+  relative path in the engine keeps working, and a pump over `ALooper_pollOnce`
+  for the lifecycle. The engine still believes the screen is 960×544: every
+  `glViewport` it issues is mapped into the largest centred 960:544 rectangle,
+  and input comes back through the same mapping, so a 20:9 phone letterboxes
+  instead of stretching.
+- **`src/text_android.c`** -- stb_truetype over the phone's own fonts. The
+  engine never draws glyphs; the Java side did, with Canvas and the platform
+  fonts, and that is why the game ships no font and still has CJK. This is that
+  renderer in C: `/system/fonts/NotoSansCJK-Regular.ttc`, DroidSansFallback or
+  Roboto, picked by whether it has a glyph for the *language's* probe character,
+  with `font.ttf` in the app's files dir as an override. Measurement and paint
+  share one integer advance per character so the texture the engine sizes from
+  the measurement is exactly as wide as what is painted into it.
+- **`src/sound_android.c`** -- stb_vorbis + OpenSL ES. Everything shipped is Ogg
+  Vorbis; decoding is lazy and cached with a 48 MB LRU, because the engine
+  creates 160 handles at boot and decoding them all up front is tens of megabytes
+  for sounds the player may never hear. Looping is a re-enqueue from the
+  buffer-queue callback (OpenSL has no loop flag).
+- **`android_main()` in `src/main.c`** -- pump, tick, swap; the engine's own
+  66 ms period decides the speed, as in the browser.
+
+Two traps cost most of the bring-up, and both were silent:
+
+1. **gl4es makes `initialize_gl4es()` a `constructor(101)`.** On Android that
+   runs at `dlopen` time, before the app has set the backend lookup, so
+   `GetHardwareExtensions()` calls a null `gles_glGetString` and the process dies
+   in the loader with `SIGSEGV at 0x0` and a stack naming nothing. Fixed by
+   building gl4es with `NO_INIT_CONSTRUCTOR` and doing the initialisation in
+   `gl4es_bridge_init()`, after `set_getprocaddress()`/`set_getmainfbsize()`.
+2. **`STATICLIB` gl4es also exports the unprefixed GL names**, and a static
+   archive wins at link time: the bridge's `glShaderSource` call resolved back
+   into gl4es' own, dereferencing a `glstate` that does not exist yet. The bridge
+   now resolves the *driver's* entry point through `eglGetProcAddress`/`dlsym`.
+
+A third was self-inflicted: the port's `src/jni.h` (its own guest-JNI surface)
+shadowed the NDK's `<jni.h>` for `android/native_activity.h`, which then could
+not declare `JavaVM`. It is `src/falsojni.h` now.
+
+**Verified** on an Android 13 x86_64 emulator: install, first-run asset unpack
+(23 MB), title screen, character creation (the description and stat text are the
+new TTF backend), the opening dialogue, the first map, letterboxing and touch
+mapping, and an OpenSL player starting. **Not verified**: audio output (the
+emulator ran `-no-audio`), a real GPU, background/rotation, and the save
+round-trip. docs/ANDROID.md has the setup, the layer map and that list.
+
 ---
 
 ## What this is
@@ -674,12 +740,18 @@ src/
   text.c           the Java-side text rasteriser (the engine draws no glyphs)
   sound.c          the Java-side sound player (the .so's own one is stubbed)
   input.c          touch, as device coordinates
-  platform_*.c     host services: native / wasm-freestanding / emscripten
+  platform_*.c     host services: native / wasm-freestanding / emscripten / android
+  text_android.c   the text renderer on the phone's own fonts (stb_truetype)
+  sound_android.c  the sound player on OpenSL ES (stb_vorbis)
+  falsojni.h       the guest's JNI surface (renamed: it shadowed the NDK's jni.h)
   main.c           the runner
+android/
+  AndroidManifest.xml  NativeActivity: no Java, no dex, no WebView
 tools/
   build.sh             native | check | wasm | browser (check = GUEST_CHECK)
-  build_gl4es.sh       fetch and build gl4es into vendor/ (gitignored)
+  build-android.sh     the APK: compile, package, sign (no Gradle)
   gen_gl4es_protos.sh  regenerate gl4es_protos.h
+  build_gl4es.sh       fetch and build gl4es (emscripten or NDK); see below
   sound.js             the browser's WebAudio backend for sound.c
   text.js              the browser's Canvas2D backend for text.c
   page-options.js      browser CPU/GL options (they have to run before init)
@@ -691,8 +763,11 @@ tools/
   difftest.py          the sweep: both sides, every entry, one verdict each
   difftest.sh          the sweep over the ctors, or every FUNC symbol
   callers.py           who calls this function (finds direct BL/BLX only)
+third_party/
+  stb/             stb_truetype.h + stb_vorbis.c (public domain, Android text/audio)
 docs/
   HANDOFF.md       this file
+  ANDROID.md       the Android build: setup, layers, what is verified
   SPIKE.md         the engineering log: every bug, every finding
   REUSE.md         what off-the-shelf code exists and why each was chosen
 ```
@@ -744,6 +819,17 @@ chrome --enable-unsafe-swiftshader http://localhost:8080/spike.html
 Without it the context request returns 0, and before that message existed the
 page died in emscripten's glue with a `TypeError` inside
 `getSupportedExtensions` that named nothing at all.
+
+```sh
+tools/build-android.sh            # -> build/android/inotia3.apk (arm64 + x86_64)
+tools/build-android.sh --install  # ... and install it with adb
+```
+
+The Android build is a NativeActivity: no Java, no dex, no WebView. It needs the
+SDK's build-tools and platform, the NDK and a JDK, and no Gradle. See
+docs/ANDROID.md for the one-time setup, for what each layer is, and for the two
+gl4es traps that cost the most time (`NO_INIT_CONSTRUCTOR`, and the unprefixed
+GL symbols a static gl4es also exports).
 
 **Work on the native build.** It iterates in seconds, has a working crash
 handler that translates a host SIGSEGV back into a guest PC and register dump,
@@ -978,6 +1064,7 @@ Working:
 | Thumb-2 decoder | everything the image contains (`movw/movt`, wide data-processing, wide `ldm/stm`, `push.w/pop.w`, `ldrd/strd`); unknown encodings trap with the word |
 | ARM decoder | full coverage of the image: data processing, loads/stores incl. halfword/doubleword, block transfer, branches, multiply, BX **and BLX**, unconditional space (BLX imm, PLD/PLI, coprocessor-2 traps) |
 | Oracle | `tools/difftest.sh --all`: 5904 entries, ~4M instructions, all match |
+| Android | `tools/build-android.sh` -> `build/android/inotia3.apk` (NativeActivity, arm64 + x86_64); menu, character creation, intro and map confirmed on an API 33 emulator |
 | Boot sequence | ctors → JNI_OnLoad → nativePreInit → nativeInit → UserAgreeCallback → resumes → frames |
 | Timer table | engine clock unified with `GetSystemCurrentTime` |
 | Assets | found in the .apk, offsets delivered, the archive **opens** and its bytes are mmapped |

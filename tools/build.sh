@@ -105,7 +105,7 @@ build_browser() {
     EMSDK=${EMSDK:-$HOME/emsdk}
     EMCC=$EMSDK/upstream/emscripten/emcc
     [ -x "$EMCC" ] || { echo "   no emscripten at $EMSDK"; exit 1; }
-    GL4ES=vendor/gl4es/lib
+    GL4ES=vendor/gl4es/lib/emscripten
     [ -f "$GL4ES/libGL.a" ] || {
         echo "   no gl4es build. Run tools/build_gl4es.sh first."
         exit 1

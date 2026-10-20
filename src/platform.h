@@ -79,6 +79,33 @@ extern int g_browser_fixed;
  * startup. */
 extern int g_browser_trace;
 
+/* ---- Android (NativeActivity) -------------------------------------------
+ *
+ * The app's window, input queue and storage are the platform's; android_main()
+ * in main.c drives the engine. These are the pieces that loop cannot do
+ * itself. Implemented in platform_android.c, which also owns the EGL surface
+ * and the letterbox mapping between the engine's 960x544 and the device's
+ * window.
+ */
+#ifdef __ANDROID__
+struct android_app;
+void host_android_init(struct android_app *app);
+/* Copy libgame.so and assets.apk out of the APK, then chdir to the app's
+ * private files directory. Returns 0 on success. */
+int  host_android_prepare(void);
+/* Run the looper until it has nothing left. Blocks while there is no window;
+ * returns 0 when the activity is going away. */
+int  host_android_pump(void);
+int  host_android_have_window(void);
+void host_android_present(void);
+void host_android_window_size(int *w, int *h);
+
+/* Called for every glViewport the engine issues. The engine's screen is
+ * 960x544, the window is the device's: the host scales the rect into a centred
+ * letterbox and installs the GL viewport itself. Returns 1 if it did. */
+int host_adjust_viewport(int32_t *x, int32_t *y, int32_t *w, int32_t *h);
+#endif
+
 /* Per-instruction trace sink, written from inside the interpreter loop.
  * Format is a contract with tools/oracle.py. */
 void host_trace_open(const char *path);

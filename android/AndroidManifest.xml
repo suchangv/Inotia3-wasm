@@ -1,0 +1,51 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!--
+  Inotia 3, native Android build.
+
+  A NativeActivity: the app *is* the C engine — the ARM interpreter, the ELF
+  loader and this port's host layer. android:hasCode="false" is literal: there is
+  no Java code, no classes.dex and no WebView anywhere in the package. The frame
+  loop, input, GL (through gl4es) and audio (OpenSL ES) are all native.
+
+  Layout is landscape because the engine's UI is 480x320. The engine is told the
+  screen is 960x544 and the host letterboxes that into whatever the device has
+  (see host_adjust_viewport in src/platform_android.c), so nothing in the engine
+  depends on the phone's resolution.
+-->
+<manifest xmlns:android="http://schemas.android.com/apk/res/android"
+    package="io.github.inotia3.native">
+
+    <uses-sdk android:minSdkVersion="24" android:targetSdkVersion="34" />
+
+    <!-- gl4es generates GLSL ES 3.00 shaders, so the driver has to compile
+         them. Every GPU Android 7 runs on does. -->
+    <uses-feature android:glEsVersion="0x00030000" android:required="true" />
+    <!-- Touch-only, but a TV stick with a mouse is harmless: do not gate the
+         install on either. -->
+    <uses-feature android:name="android.hardware.touchscreen" android:required="false" />
+
+    <application
+        android:label="Inotia 3"
+        android:hasCode="false"
+        android:allowBackup="false"
+        android:extractNativeLibs="true"
+        android:hardwareAccelerated="true">
+
+        <activity
+            android:name="android.app.NativeActivity"
+            android:label="Inotia 3"
+            android:exported="true"
+            android:screenOrientation="sensorLandscape"
+            android:configChanges="orientation|keyboardHidden|screenSize|screenLayout|uiMode"
+            android:theme="@android:style/Theme.NoTitleBar.Fullscreen">
+
+            <!-- The library native_app_glue loads and calls android_main() in. -->
+            <meta-data android:name="android.app.lib_name" android:value="inotia3" />
+
+            <intent-filter>
+                <action android:name="android.intent.action.MAIN" />
+                <category android:name="android.intent.category.LAUNCHER" />
+            </intent-filter>
+        </activity>
+    </application>
+</manifest>

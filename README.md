@@ -65,6 +65,7 @@ host layer — fetch, WebGL, IDBFS — lands.)
 ```sh
 tools/build.sh native          # -> build/spike
 tools/build.sh browser         # -> build/spike.{html,js,wasm,data}
+tools/build-android.sh         # -> build/android/inotia3.apk (see docs/ANDROID.md)
 
 mkdir -p game && cp /path/to/libgame.so game/
 ./build/spike game/libgame.so --boot --frames=4200 --no-profile

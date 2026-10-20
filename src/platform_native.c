@@ -18,7 +18,7 @@
 #include "platform.h"
 #include "cpu.h"
 #include "imports.h"
-#include "jni.h"
+#include "falsojni.h"
 #include "gl.h"
 
 #include <stdio.h>

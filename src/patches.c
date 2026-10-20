@@ -17,7 +17,7 @@
 #include "guest.h"
 #include "elf.h"
 #include "cpu.h"
-#include "jni.h"
+#include "falsojni.h"
 #include "imports.h"
 #include "compat.h"
 

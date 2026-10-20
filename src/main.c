@@ -25,7 +25,7 @@
 #include "imports.h"
 #include "compat.h"
 #include "platform.h"
-#include "jni.h"
+#include "falsojni.h"
 #include "gl.h"
 #include "patches.h"
 #include "timers.h"
@@ -36,6 +36,15 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#endif
+
+#ifdef __ANDROID__
+/* android_main() is called by android_native_app_glue, not by the C runtime.
+ * The struct is only ever passed through to the platform layer, so a forward
+ * declaration is enough -- and it keeps the NDK's <jni.h> (which the glue's
+ * header drags in) out of this file, where the guest's own JNI surface is
+ * declared with deliberately different types. */
+struct android_app;
 #endif
 
 /* Returning from an entry function lands the PC here. It must not be 0: a
@@ -1519,7 +1528,13 @@ static int spike_tick(void)
              ndue,
              (unsigned long long)(d1 - d0),
              (unsigned long long)(x1 - x0),
-             reason == HALT_BUDGET ? "budget exhausted" : cpu_halt_str(reason));
+             /* A tick with nothing due did no work at all. Reporting that as
+              * "budget exhausted" (the initialised value of `reason`) reads
+              * like a run that went wrong, and on a 60 Hz display four ticks in
+              * five have no timer due; say what actually happened. */
+             ndue == 0 ? "no timer due"
+                       : reason == HALT_BUDGET ? "budget exhausted"
+                                               : cpu_halt_str(reason));
     g_total_insns += frame_insns;
     g_frames_done++;
 
@@ -1848,3 +1863,69 @@ int spike_main(void)
     return main(0, 0);
 }
 #endif
+
+#ifdef __ANDROID__
+/*
+ * Android's entry point. native_app_glue calls this on a thread of its own, not
+ * the UI thread, once the activity exists -- which is why the engine's loop can
+ * simply run here. The glue also owns the input queue and the lifecycle
+ * callbacks; platform_android.c registers them.
+ *
+ * There is no argv. The image and the asset archive are fixed names in the
+ * app's private files directory, copied out of the APK on first launch
+ * (host_android_prepare). The engine's screen is still 960x544: the window is
+ * whatever the device has, and the host letterboxes it, so nothing in the
+ * engine or in src/ needs to know a phone is involved.
+ */
+void android_main(struct android_app *app)
+{
+    host_android_init(app);
+
+    /* ~23 MB of assets on the first launch. Say so before the black screen, so
+     * a slow first start is not mistaken for a hang; `adb logcat -s inotia3`
+     * shows it. */
+    host_log("android: preparing the app directory\n");
+    if (host_android_prepare() != 0) {
+        host_log("android: cannot prepare the app directory -- giving up\n");
+        return;
+    }
+
+    /* Nothing may touch GL before the surface exists: the boot sequence ends in
+     * a frame. host_android_pump blocks until the window arrives. */
+    while (!host_android_have_window() && host_android_pump())
+        ;
+    if (!host_android_have_window()) {
+        host_log("android: no window, exiting\n");
+        return;
+    }
+
+    g_budget = 3000u * 1000u * 1000u;
+    g_do_profile = 1;
+    /* Real elapsed time, like the browser: the engine's own 66 ms frame period
+     * decides how fast the world moves, and a fixed 16 ms step would make the
+     * game run at whatever rate the interpreter manages. */
+    g_use_fixed_step = 0;
+
+    if (spike_load("libgame.so") != 0)
+        return;
+
+    host_log("\n=== android: booting ===\n");
+    if (spike_boot() != 0)
+        return;
+    input_init(spike_dispatch_event);
+
+    host_log("=== android: frame loop ===\n");
+    for (;;) {
+        if (!host_android_pump())
+            break;
+        /* The surface can go away between the pump and the tick (home button,
+         * rotation): the glue blocks in the pump until it is back. */
+        if (!host_android_have_window())
+            continue;
+        if (!spike_tick())
+            break;
+        host_android_present();
+    }
+    spike_finish();
+}
+#endif /* __ANDROID__ */

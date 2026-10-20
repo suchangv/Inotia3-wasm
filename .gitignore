@@ -32,3 +32,9 @@ vendor/
 # Framebuffer dumps from src/gl.c (SPIKE_DUMP_FB=1); debugging output, not
 # source. 44 of these were committed by accident.
 *.raw
+
+# --- Android build ---
+# android/assets/ holds copies of the game image and archive (copyrighted, see
+# game/ above) made by tools/build-android.sh; the APK and the debug keystore
+# live under build/.
+android/assets/

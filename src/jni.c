@@ -23,7 +23,7 @@
  * since the guest reads and writes their contents directly.
  */
 
-#include "jni.h"
+#include "falsojni.h"
 #include "jni_offsets.h"
 #include "guest.h"
 #include "cpu.h"
