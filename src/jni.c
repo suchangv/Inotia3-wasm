@@ -506,6 +506,51 @@ int jni_host_call(const char *name, uint32_t *args, int nargs, uint32_t *ret_lo,
         st->implemented = 1;
         return 1;
     }
+    if (strcmp(fn, "NewObjectArray") == 0) {
+        /* NewObjectArray(jsize len, jclass elementClass, jobject initial)
+         *
+         * An object array is an array of *handles*, four bytes each, not of
+         * pointers to guest memory: a jobject here is an opaque 0x40000000|index
+         * value that the guest never dereferences. Every slot starts at
+         * `initial` (normally 0), which is what the JNI spec requires and what
+         * makes a partially filled array safe to walk.
+         *
+         * This was one of the last two JNI functions reported unimplemented.
+         * Returning 0 for its handle gave the caller a null array, and a
+         * subsequent SetObjectArrayElement then wrote nowhere -- silently,
+         * because that function was missing too. Both are cheap to do
+         * correctly, so there is no reason to keep a hole whose only symptom
+         * is a null somewhere far away. */
+        uint32_t h = jni_host_new_array(4, (int)a1);
+        jni_handle *o = handle_of(h);
+        if (o && o->guest) {
+            for (int i = 0; i < (int)a1; i++)
+                ST32(o->guest + (uint32_t)i * 4u, a3);
+        }
+        *ret_lo = h;
+        st->implemented = 1;
+        return 1;
+    }
+    if (strcmp(fn, "GetObjectArrayElement") == 0) {
+        jni_handle *o = handle_of(a1);
+        uint32_t at = (uint32_t)(int32_t)a2;
+        *ret_lo = (o && o->guest && o->kind == H_ARRAY && o->elem == 4 &&
+                   at < o->len)
+                      ? LD32(o->guest + at * 4u) : 0;
+        st->implemented = 1;
+        return 1;
+    }
+    if (strcmp(fn, "SetObjectArrayElement") == 0) {
+        jni_handle *o = handle_of(a1);
+        uint32_t at = (uint32_t)(int32_t)a2;
+        if (o && o->guest && o->kind == H_ARRAY && o->elem == 4 && at < o->len)
+            ST32(o->guest + at * 4u, a3);
+        /* Bounds violations are the guest's bug; the real JNI raises
+         * ArrayIndexOutOfBoundsException, and there is no Java here to receive
+         * it. Dropping the write is the least surprising thing to do. */
+        st->implemented = 1;
+        return 1;
+    }
     if (strcmp(fn, "GetArrayLength") == 0) {
         jni_handle *o = handle_of(a1);
         *ret_lo = o ? o->len : 0;
@@ -857,6 +902,23 @@ int jni_host_call(const char *name, uint32_t *args, int nargs, uint32_t *ret_lo,
                     char text[TEXT_MAX];
                     jni_read_text_arg(args[3], text, sizeof(text));
                     *ret_lo = (uint32_t) text_measure_width(text, (int) args[4]);
+                    st->implemented = 1; return 1;
+                }
+                if (strcmp(n, "CC_MD5") == 0) {
+                    /* CC_MD5(byte[]) -> byte[16]
+                     *
+                     * WrapperProtection hashes its own state file with this and
+                     * only ever compares the result against a value it wrote
+                     * itself. The Vita port answers with a 16-byte array of
+                     * zeros (source/java.c, CC_MD5_stub) and the whole offline
+                     * port runs on that, so this is the same answer rather than
+                     * a second, untested MD5 in the host.
+                     *
+                     * It is not "unimplemented returning 0": a null array would
+                     * make the caller's own GetArrayLength read 0 and its
+                     * comparison take a different branch. A real 16-byte array
+                     * keeps the shape the Java side would have returned. */
+                    *ret_lo = jni_host_new_array(1, 16);
                     st->implemented = 1; return 1;
                 }
                 if (strcmp(n, "DrawTextInRect") == 0) {

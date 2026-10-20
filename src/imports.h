@@ -60,6 +60,21 @@ enum {
     IMPL_fopen, IMPL_fclose, IMPL_fread, IMPL_fwrite, IMPL_fseek, IMPL_fstat,
     IMPL_open, IMPL_close, IMPL_read, IMPL_write, IMPL_lseek,
     IMPL_snprintf, IMPL_sprintf, IMPL_vsnprintf, IMPL_vsprintf, IMPL_fprintf,
+    /* Directory walking and file deletion/rename. The engine's save-slot list,
+     * its delete/discard paths and the Hub backup code all reach these, and
+     * they were absent from the table entirely -- so they were reported as
+     * "never seen" rather than "known and not provided", and every one of them
+     * returned a silent 0 that reads as success. */
+    IMPL_opendir, IMPL_readdir, IMPL_closedir,
+    IMPL_remove, IMPL_rename, IMPL_lstat,
+    /* statfs(struct statfs *, ...) -- fills a bionic-shaped struct; the engine
+     * asks for free space before it writes. */
+    IMPL_statfs,
+    /* lrand48/srand48: the 48-bit LCG every Android build has. The engine's
+     * only source of randomness. */
+    IMPL_lrand48, IMPL_srand48,
+    /* fsync/raise: completion signals with no host behaviour worth modelling. */
+    IMPL_fsync, IMPL_raise,
     /* JNI table entries. They are not dispatched by this switch -- host_import
      * call routes anything named "jni/" to jni_host_call first -- but they need
      * an impl id so the report distinguishes "handled by the JNI layer" from

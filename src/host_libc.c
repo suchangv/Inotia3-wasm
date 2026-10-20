@@ -30,6 +30,7 @@
  * browser and desktop builds both do. */
 #include <stdio.h>
 #include <stdlib.h>
+#include <dirent.h>
 #include <sys/stat.h>
 #include <sys/types.h>
 #endif
@@ -809,6 +810,50 @@ static FILE *file_of(uint32_t h)
     return (h > 0 && h < FIOMAX) ? g_files[h] : NULL;
 }
 
+/* Directory handles, the same shape as file handles: 1-based, so 0 is never a
+ * valid DIR* (the guest treats NULL as failure). One guest-side dirent buffer
+ * per handle, allocated on first readdir -- see IMPL_readdir for why the entry
+ * cannot simply be the host's struct. */
+static DIR        *g_dirs[FIOMAX];
+static uint32_t    g_dirent_buf[FIOMAX];
+
+static void note_open(const char *path, int ok);
+
+static uint32_t dir_handle(DIR *d, const char *path)
+{
+    for (int i = 1; i < FIOMAX; i++) {
+        if (!g_dirs[i]) {
+            /* The dirent buffer is allocated once per handle and reused. A
+             * failed allocation (guest heap exhausted) has to close the
+             * directory rather than hand back a handle that can never produce
+             * an entry -- readdir would then be a silent "end of directory",
+             * which is the exact symptom this whole area was fixed for. */
+            if (!g_dirent_buf[i]) {
+                g_dirent_buf[i] = guest_heap_alloc(10u + 256u);
+                if (!g_dirent_buf[i]) {
+                    closedir(d);
+                    return 0;
+                }
+                memset(g_mem + g_dirent_buf[i], 0, 10u + 256u);
+            }
+            g_dirs[i] = d;
+            note_open(path, 1);
+            return (uint32_t)i;
+        }
+    }
+    closedir(d);
+    return 0;
+}
+
+static DIR *dir_of(uint32_t h)
+{
+    return (h > 0 && h < FIOMAX) ? g_dirs[h] : NULL;
+}
+
+/* lrand48's state, per IMPL_lrand48. Seeded to the POSIX default so a run that
+ * never calls srand48 still varies the way the real thing would. */
+static uint64_t g_rng_state = 0x1234ABCD330Eull;
+
 /* Log the first few opens so the worklist is the engine's own, not a guess --
  * the same principle as the import and Java-method reports. */
 static void note_open(const char *path, int ok)
@@ -1111,15 +1156,74 @@ void host_import_call(guest_import *im)
         R[1] = (uint32_t)((uint64_t)v >> 32);
         break;
     }
-    case IMPL_qsort:
-        /* Needs to re-enter the interpreter to run the guest's comparator.
-         * Deferred until the first run says whether the engine actually sorts
-         * anything on the boot path -- it costs nothing to leave it on the
-         * worklist, and re-entrancy is a design decision worth making once,
-         * deliberately, rather than inline here. */
-        host_log("host: qsort() not implemented yet (base=%08x n=%u size=%u)\n",
-                 a0, a1, a2);
+    case IMPL_qsort: {
+        /* qsort(void *base, size_t n, size_t size, int (*cmp)(const void *,
+         *                                                      const void *))
+         *
+         * The comparator is guest code, so this has to re-enter the
+         * interpreter -- the one shim in the port that does. cpu_call_guest
+         * (cpu.c) exists for exactly this and puts the interpreter's state
+         * back afterwards.
+         *
+         * Deliberately a selection sort and not a real quicksort. The arrays
+         * this engine sorts are small (inventory and list rows), the cost is
+         * dominated by guest calls rather than by the host loop, and an
+         * insertion/selection sort has no stack recursion to get wrong. It is
+         * O(n^2) comparisons where n is tens.
+         *
+         * Elements are sorted *in place* in guest memory: memcpy'ing them into
+         * a host array would hand the comparator host pointers while it expects
+         * guest ones, and the swap has to land where the caller reads it. */
+        uint32_t base = a0, n = a1, sz = a2, cmp = a3;
+        static int logged;
+        if (logged < 4) {
+            logged++;
+            host_log("  [qsort] base=%08x n=%u size=%u cmp=%08x\n",
+                     base, n, sz, cmp);
+        }
+        /* n * sz is computed in 64 bits: as a uint32_t it wraps, and a wrapped
+         * length makes guest_ok() bless a range that is actually far larger
+         * than the guest's memory -- which then faults inside the comparator
+         * instead of here, naming the wrong culprit. */
+        uint64_t span = (uint64_t)n * (uint64_t)sz;
+        if (!cmp || !sz || n < 2 || span > GUEST_MEM_SIZE ||
+            !guest_ok(base, (uint32_t)span, "qsort")) {
+            R[0] = 0;
+            break;
+        }
+        /* A scratch buffer on the host, one element wide, used only to move
+         * bytes between two guest addresses. */
+        unsigned char tmp[512];
+        int copy = (sz <= sizeof(tmp));
+        if (!copy) {
+            /* An element too large to stage. Sorting it would need a guest
+             * allocation; nothing in this engine has such an element, and
+             * guessing is worse than saying so once. */
+            host_log("  [qsort] element size %u is too large to sort -- "
+                     "leaving the array as it is\n", sz);
+            R[0] = 0;
+            break;
+        }
+        for (uint32_t i = 0; i + 1 < n; i++) {
+            uint32_t best = i;
+            for (uint32_t j = i + 1; j < n; j++) {
+                uint32_t ab[2];
+                ab[0] = base + best * sz;
+                ab[1] = base + j * sz;
+                int r = (int)cpu_call_guest(cmp, ab, 2, 4u * 1000u * 1000u);
+                if (r > 0)
+                    best = j;
+            }
+            if (best != i) {
+                uint32_t pa = base + i * sz, pb = base + best * sz;
+                memcpy(tmp, g_mem + pa, sz);
+                memmove(g_mem + pa, g_mem + pb, sz);
+                memcpy(g_mem + pb, tmp, sz);
+            }
+        }
+        R[0] = 0;
         break;
+    }
 
     /* ---- runtime ---- */
     case IMPL_abort:
@@ -1359,6 +1463,12 @@ void host_import_call(guest_import *im)
         R[0] = 0;
         break;
     }
+    case IMPL_lstat:
+        /* lstat() differs from stat() only in not following a symlink. Nothing
+         * the engine stats is a symlink, and the bionic struct layout is the
+         * same one this fills, so sharing the body is deliberate: a second
+         * implementation could drift from this one. */
+        /* FALLTHROUGH */
     case IMPL_stat: {
         /* struct stat is bionic's, and the engine only reads st_size and
          * st_mode from it. Writing the whole host struct would be wrong -- the
@@ -1497,7 +1607,149 @@ void host_import_call(guest_import *im)
         R[0] = (uint32_t)ftell(f);
         break;
     }
+    case IMPL_statfs: {
+        /* statfs(const char *path, struct statfs *buf)
+         *
+         * bionic's arm struct statfs, with 32-bit fields:
+         *   +0  f_type   +4  f_bsize  +8  f_blocks  +12 f_bfree
+         *   +16 f_bavail +20 f_files  +24 f_ffree  +28 f_fsid
+         *   +32 f_namelen +36 f_frsize +40 f_flags +44 f_spare[4]  (=64 bytes)
+         *
+         * Returning 0 without filling it -- what this used to do -- leaves the
+         * engine reading whatever was on its stack as "free space", which is a
+         * value it may act on. Reporting a large fixed volume is the honest
+         * answer for a host that has no per-mount quota to ask about, and it is
+         * what makes a "not enough space" branch not fire spuriously. */
+        if (a1 && guest_ok(a1, 64, "statfs")) {
+            memset(g_mem + a1, 0, 64);
+            ST32(a1 + 0,  0x01021994u);   /* f_type: TMPFS_MAGIC, as Android's */
+            ST32(a1 + 4,  4096u);         /* f_bsize   */
+            ST32(a1 + 8,  1u << 20);      /* f_blocks: 4 GB at 4 KB blocks */
+            ST32(a1 + 12, 1u << 19);      /* f_bfree  */
+            ST32(a1 + 16, 1u << 19);      /* f_bavail */
+            ST32(a1 + 20, 1u << 16);      /* f_files  */
+            ST32(a1 + 24, 1u << 15);      /* f_ffree  */
+            ST32(a1 + 32, 255u);          /* f_namelen */
+            ST32(a1 + 36, 4096u);         /* f_frsize */
+        }
+        R[0] = 0;
+        break;
+    }
 #endif
+
+    /* ---- directory walking ------------------------------------------------
+     *
+     * The engine's save-slot screen lists "<dir>/saveN.dat" by enumerating the
+     * directory, and its delete path calls remove(). Both were missing, so the
+     * list was always empty and a delete never happened -- and because an
+     * unimplemented import returns 0, which readdir's caller sees as "end of
+     * directory", neither failure produced a log line anywhere.
+     *
+     * DIR* and struct dirent* are guest addresses like FILE*: an opaque handle
+     * for the first, a buffer in the guest space for the second. The bionic
+     * arm struct dirent is
+     *
+     *   +0  d_ino (u32)  +4 d_off (u32)  +8 d_reclen (u16)  +10 d_name[256]
+     *
+     * i.e. name at +10, which is NOT the host layout (name at +19 here) -- so
+     * the entry is composed by hand rather than copied. */
+#ifndef WASM_FREESTANDING
+    case IMPL_opendir: {
+        guest_path(a0, g_path_buf, sizeof(g_path_buf));
+        DIR *d = opendir(g_path_buf);
+        R[0] = d ? dir_handle(d, g_path_buf) : 0;
+        break;
+    }
+    case IMPL_readdir: {
+        DIR *d = dir_of(a0);
+        if (!d) { R[0] = 0; break; }
+        struct dirent *e = readdir(d);
+        if (!e) { R[0] = 0; break; }
+        /* One buffer per DIR*, reused: the guest copies what it needs out of
+         * it before asking for the next entry (it cannot do otherwise -- the
+         * host's readdir does the same thing). */
+        int slot = (int)(a0 - 1);
+        uint32_t buf = (slot >= 0 && slot < FIOMAX) ? g_dirent_buf[slot] : 0;
+        if (!buf) { R[0] = 0; break; }
+        uint32_t nlen = (uint32_t)strlen(e->d_name);
+        if (nlen > 255u) nlen = 255u;
+        memset(g_mem + buf, 0, 10u + 256u);
+        ST32(buf + 0, (uint32_t)e->d_ino);
+        ST32(buf + 4, 0);
+        ST16(buf + 8, (uint16_t)(10u + nlen + 1u));
+        memcpy(g_mem + buf + 10, e->d_name, nlen);
+        g_mem[buf + 10 + nlen] = 0;
+        R[0] = buf;
+        break;
+    }
+    case IMPL_closedir: {
+        DIR *d = dir_of(a0);
+        if (d) { closedir(d); g_dirs[a0] = NULL; }
+        R[0] = 0;
+        break;
+    }
+    case IMPL_remove: {
+        /* remove() and unlink() are the same call for a regular file, which is
+         * all the engine deletes. A missing file reports -1 with errno ENOENT,
+         * the same as the real thing -- silently succeeding here would make a
+         * failed save come back as "deleted successfully". */
+        guest_path(a0, g_path_buf, sizeof(g_path_buf));
+        int ok = (remove(g_path_buf) == 0);
+        R[0] = ok ? 0 : (uint32_t)-1;
+        break;
+    }
+    case IMPL_rename: {
+        char from[512], to[512];
+        guest_path(a0, from, sizeof(from));
+        guest_path(a1, to, sizeof(to));
+        R[0] = (rename(from, to) == 0) ? 0 : (uint32_t)-1;
+        break;
+    }
+#endif
+
+    /* ---- misc completion signals ------------------------------------------ */
+    case IMPL_fsync: {
+        /* fsync(int fd). The engine calls this after writing a save. The bytes
+         * are already in the host's file (fwrite is unbuffered enough here for
+         * the reopen-and-verify the engine does), so there is nothing to flush
+         * that would not be flushed by fclose anyway. Reporting failure would
+         * make the engine think the save did not happen. */
+        R[0] = 0;
+        break;
+    }
+    case IMPL_raise: {
+        /* raise(int sig). Android's engine uses it as a "should not happen"
+         * assertion in a couple of places. Dying here would end every run that
+         * trips one; reporting 0 keeps the run going, and the caller's own log
+         * line is the record. */
+        R[0] = 0;
+        break;
+    }
+
+    /* ---- randomness -------------------------------------------------------
+     *
+     * lrand48/srand48 are the 48-bit LCG from POSIX:
+     *
+     *     X' = (a * X + c) mod 2^48,  a = 0x5DEECE66D, c = 0xB
+     *     return X' >> 17            (31 bits, 0 .. 2^31-1)
+     *
+     * This used to return a constant 0 -- it was not in the table at all, so
+     * the dispatcher's default left r0 untouched, and the engine's every
+     * "random" draw was the same number. Reproducing the real generator keeps
+     * the values in the range the guest expects and makes a run deterministic
+     * from srand48's seed, which is what the differential harness wants anyway.
+     */
+    case IMPL_srand48: {
+        /* srand48(long seed) */
+        g_rng_state = ((uint64_t)(uint32_t)a0 << 16) | 0x330Eu;
+        R[0] = 0;
+        break;
+    }
+    case IMPL_lrand48: {
+        g_rng_state = (g_rng_state * 0x5DEECE66Dull + 0xBull) & 0xFFFFFFFFFFFFull;
+        R[0] = (uint32_t)(g_rng_state >> 17);
+        break;
+    }
 
     /* ---- formatting ---- */
     case IMPL_snprintf:

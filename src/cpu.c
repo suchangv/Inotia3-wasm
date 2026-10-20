@@ -1540,3 +1540,74 @@ void cpu_dump_state(void)
 /* Exposed for the profile report. */
 uint64_t *cpu_profile_counts(void) { return g_prof.counts; }
 int       cpu_profile_active(void) { return g_prof.on; }
+
+/* ---- calling guest code from inside a host import ------------------------ */
+
+uint32_t cpu_call_guest(uint32_t entry, const uint32_t *args, int nargs,
+                        uint64_t budget)
+{
+    /* Everything cpu_run() clobbers that the outer frame still needs. The
+     * register file is the obvious one; g_budget and g_thumb are the ones that
+     * bite, because cpu_run overwrites both at entry and the outer loop reads
+     * the first on every instruction and the second on every decode. The
+     * profiler's lo/hi/cur cache and the trace ring go too.
+     *
+     * g_insn_count is not saved: see the header. */
+    cpu_state   save_cpu   = g_cpu;
+    uint64_t    save_budget = g_budget;
+    int         save_thumb  = g_thumb;
+    int         save_prof_cur = g_prof.cur;
+    uint32_t    save_prof_lo  = g_prof.lo, save_prof_hi = g_prof.hi;
+    int         save_have_prev = g_have_prev;
+    uint32_t    save_prev_pc   = g_prev_pc;
+    int         save_tr_i      = g_tr_i;
+
+    /* A fresh frame *below* whatever the import is using. The caller's stack
+     * arguments live at [sp], [sp+4], ... -- above the stack pointer, not
+     * below it -- so moving down is free space. 0x100 is enough to clear the
+     * arguments host_import_call has already snapshotted (24 words at most,
+     * 0x60) plus any the callee's own frame will use before its prologue
+     * subtracts its own. */
+    uint32_t sp = (save_cpu.r[13] & ~3u) - 0x100u;
+    if (nargs < 0) nargs = 0;
+    if (nargs > 16) nargs = 16;
+    if (nargs > 4) {
+        /* AAPCS: the fifth argument onward goes on the stack, **in ascending
+         * address order** -- args[4] at the lowest address. Making room first
+         * and then writing upward is what keeps that true; decrementing sp
+         * once per argument instead lays them out reversed, and the callee
+         * would read args[5] where args[4] belongs. No caller in this port
+         * passes more than four today (the qsort comparator takes two), so
+         * the bug would have waited for the first one that did. */
+        uint32_t extra = (uint32_t)(nargs - 4) * 4u;
+        sp -= extra;
+        for (int i = 4; i < nargs; i++)
+            ST32(sp + (uint32_t)(i - 4) * 4u, args[i]);
+    }
+
+    for (int i = 0; i < 13; i++)
+        g_cpu.r[i] = 0;
+    for (int i = 0; i < nargs && i < 4; i++)
+        g_cpu.r[i] = args[i];
+    g_cpu.r[13] = sp;
+    g_cpu.r[14] = RETURN_SENTINEL;
+    g_cpu.cpsr = 0x10;
+
+    cpu_run(entry | 1u, sp, budget);
+
+    uint32_t ret = g_cpu.r[0];
+
+    g_cpu       = save_cpu;
+    g_budget    = save_budget;
+    g_thumb     = save_thumb;
+    g_prof.cur  = save_prof_cur;
+    g_prof.lo   = save_prof_lo;
+    g_prof.hi   = save_prof_hi;
+    g_have_prev = save_have_prev;
+    g_prev_pc   = save_prev_pc;
+    /* The ring's contents are left as the nested call wrote them -- it ran the
+     * most recent instructions, so that is the useful history. Only the write
+     * cursor is restored, so the outer run does not overwrite it out of order. */
+    g_tr_i      = save_tr_i;
+    return ret;
+}

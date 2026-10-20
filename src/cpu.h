@@ -62,6 +62,28 @@ void cpu_init(const guest_image *img);
  * out or something traps. Returns the halt reason. */
 int cpu_run(uint32_t entry, uint32_t sp, uint64_t budget);
 
+/* Call a guest function from *inside* a host import, and come back with the
+ * interpreter in the state it was in. Only for shims that cannot be written
+ * without running guest code -- qsort's comparator is the one that exists.
+ *
+ * cpu_run() is not re-entrant as written: it owns g_cpu, g_budget, g_thumb and
+ * the profiler's current-function range, and it resets the instruction trace
+ * ring. A plain nested call would return to the outer interpreter with a
+ * different register file, the wrong instruction set and a trace that starts
+ * mid-function -- the first symptom would be a guest crash somewhere unrelated,
+ * which is exactly the class of bug this port keeps paying for. So this saves
+ * all of that, runs, and puts it back.
+ *
+ * The callee gets its own stack below the current frame (`sp` is the caller's
+ * current SP minus a safety margin) so it cannot overwrite the host import's
+ * arguments, which live on the guest stack.
+ *
+ * g_insn_count is deliberately NOT restored: it is the run's cumulative total
+ * and the caller's budget is measured against it, so a nested call has to
+ * advance it or the outer loop would never notice the work that was done. */
+uint32_t cpu_call_guest(uint32_t entry, const uint32_t *args, int nargs,
+                        uint64_t budget);
+
 void cpu_set_profile(int on);
 void cpu_dump_state(void);
 
