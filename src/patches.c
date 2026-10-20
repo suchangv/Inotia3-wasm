@@ -15,6 +15,7 @@
 
 #include "patches.h"
 #include "guest.h"
+#include "platform.h"
 #include "elf.h"
 #include "cpu.h"
 #include "falsojni.h"
@@ -365,6 +366,48 @@ void patches_apply(const guest_image *img)
      * prologue is sound. */
     patch_symbol_return(img, "excuteDirectly", 0);
     patch_symbol_return(img, "jIsCracked", 0);
+
+    /* --- the hub save folder ---------------------------------------------
+     *
+     * SAVE_Save writes ./data/<package>/<folder>/saveN.dat, where <folder> is
+     * HubSave_GetFolderName()'s answer for the "hub key" -- an account id the
+     * engine's online service is supposed to supply. Offline nothing supplies
+     * it, and the buffer it would occupy holds whatever its heap block did, so
+     * the folder the save writes into is not the folder the slot list reads:
+     * the save reports success (it really did write a file) and no slot ever
+     * appears. That is the "saved, and the slot is still empty" bug.
+     *
+     * HubSave_GetFolderName(key, out, size) is patched to write an empty string
+     * and return success, i.e. "there is no subfolder". Every save path then
+     * collapses to ./data/<package>/saveN.dat, which is both the path the engine
+     * already probes first (before the hashed ones) and the one the local,
+     * non-hub save path uses -- so save, list, load and delete all agree.
+     *
+     * Patching this rather than the key is deliberate: the key's *value* is only
+     * ever used to build this folder name, and pinning the key still left two
+     * code paths disagreeing (one calls HubSave_GetKey, the other reads the
+     * key's global), which is exactly the kind of half-fix that looks right
+     * until someone saves.
+     *
+     *     movs r0, #0        ; 2000
+     *     strb r0, [r1]      ; 7008   out[0] = 0
+     *     movs r0, #1        ; 2001   "succeeded"
+     *     bx   lr            ; 4770
+     */
+    {
+        uint32_t fn = elf_find_symbol(img, "HubSave_GetFolderName");
+        if (!fn) {
+            host_log("patches: HubSave_GetFolderName not found; saves may land "
+                     "in a folder named after a stale hub key\n");
+        } else {
+            uint32_t a = fn & ~1u;
+            ST16(a + 0, 0x2000);
+            ST16(a + 2, 0x7008);
+            ST16(a + 4, 0x2001);
+            ST16(a + 6, 0x4770);
+            host_log("patches: hub save folder pinned to the package directory\n");
+        }
+    }
 
     /* --- File::GetFullPathName -------------------------------------------
      *

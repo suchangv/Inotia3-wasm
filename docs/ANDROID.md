@@ -130,6 +130,40 @@ everything:
 adb push myfont.ttf /data/data/io.github.inotia3.native/files/font.ttf
 ```
 
+## Fixed after the second device test
+
+**A skill's sound stuttered.** The OpenSL backend created and destroyed an
+`AudioPlayer` on every `SoundPlay`. On a phone that is a round trip to the
+audioserver -- 10-13 ms measured on the emulator -- taken *inside* the frame that
+fired the skill. A voice pool (ten realised players, one per PCM format, reused)
+plus "a play request for a sound that is already sounding is a no-op" (the Java
+side it was written against, `MediaPlayer`/`SoundPool`, behaves that way) brings
+a repeat play down to **0.75 ms**, of which decoding is zero (cached) and player
+setup is zero (reused). The one remaining cost is the first play of a new
+*format*: ~3 ms to realise one player, once.
+
+Two smaller things in the same pass: the queue callback now frees the voice it
+finished with (it used to leave it "owned but silent", so the pool filled up with
+unusable voices and every play built a new player -- the 10 ms came back), and
+`SoundCreate`'s 160 handles still decode lazily, with a 48 MB LRU.
+
+**Saving said it worked and the slot stayed empty.** Not Android-specific: the
+browser had it too, and the cause is in the guest's own save path. `SAVE_Save`
+writes `./data/<package>/<folder>/saveN.dat`, where `<folder>` is
+`HubSave_GetFolderName()`'s answer for the "hub key" -- an account id the
+engine's online service supplies. Offline nothing supplies it, so the folder is
+named after whatever its heap block held, and the block is reused: the save wrote
+`<garbage A>/save0.dat` while the slot list looked in `<garbage B>/save0.dat`.
+The file was real, the reported success was real, and the slot never appeared.
+
+`patches.c` now replaces `HubSave_GetFolderName` with "there is no subfolder"
+(write an empty string, return success), so save, list, load and delete all use
+`./data/<package>/saveN.dat` -- the path the engine already probes first for
+every slot. Verified in the native build end to end: a save writes
+`save0.dat` (1427 bytes) and the next run's slot scan opens it successfully
+(`[io] open .../save0.dat ok`). The browser shares the patch, so its "saved but
+the slot is empty" is fixed by the same change.
+
 ## What has been verified, and how
 
 On an `x86_64` Android 13 emulator (`-gpu swiftshader_indirect`, no window;

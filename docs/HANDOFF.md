@@ -889,9 +889,9 @@ Gameplay is confirmed in both hosts — the native runner and the browser — wi
 the map, the character, the HUD, the minimap, the text in every language it
 ships and the sound. What is left is adjacent:
 
-- **A save slot.** After entering play the log still shows `save0.dat` missing.
-  That may be correct (nothing is saved until the player saves), but confirm a
-  new-game save round-trips.
+- **A save slot** -- fixed, needs one confirmation on a device. See "progress
+  since the Android build": the save folder was named after a hub key nothing
+  supplies, so the save went one directory and the slot list looked in another.
 - **Coverage of functions that need real arguments.** The differential sweep
   starts every function with zeroed registers, so a function that immediately
   dereferences an argument stops at its first access (`bad-mem`): the prologue

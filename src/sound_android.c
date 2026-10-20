@@ -44,10 +44,6 @@
  * played, small enough that a phone is not asked for a hundred megabytes. */
 #define PCM_BUDGET (48u * 1024u * 1024u)
 
-/* Simultaneous OpenSL players. The engine can ask for more; the oldest is
- * stopped, which is what a phone would do anyway. */
-#define VOICES 8
-
 typedef struct {
     int used;
     char name[160];
@@ -61,15 +57,11 @@ typedef struct {
     unsigned pcm_bytes;
     int rate, channels;
     unsigned stamp;              /* LRU */
-
-    SLObjectItf player_obj;
-    SLPlayItf   play;
-    SLBufferQueueItf queue;
-    SLVolumeItf volume_itf;
-    int playing;
 } snd;
 
 static snd g_snd[SND_MAX];
+
+void sound_host_stop(int id);   /* used by open() before its definition */
 
 static SLObjectItf g_engine_obj, g_mix_obj;
 static SLEngineItf g_engine;
@@ -158,124 +150,197 @@ static int decode(snd *s)
     return 1;
 }
 
-/* ---- players ------------------------------------------------------------- */
+/* ---- voices -------------------------------------------------------------
+ *
+ * A pool of realised OpenSL players, reused across sounds.
+ *
+ * The first version created (and destroyed) a player on every play. On a phone
+ * that is not a cheap object: CreateAudioPlayer + Realize is a round trip to
+ * the audioserver, tens of milliseconds, and it happens *while the frame is
+ * being simulated*. A skill that plays a sound therefore stalled the frame it
+ * was used on -- audible as a stutter that the browser, which decodes and plays
+ * asynchronously, never has.
+ *
+ * A voice is bound to one PCM format when it is created and reused for every
+ * sound that shares it (which is all of them: 44.1 kHz stereo), so after the
+ * first few plays nothing but an Enqueue + SetPlayState is left.
+ *
+ * Also: a play request for a sound that is *already* playing is ignored. The
+ * engine re-issues SoundPlay while a sound is running (the Java side it was
+ * written against, MediaPlayer/SoundPool, treats a repeat as a no-op), and
+ * restarting the buffer on every request is the other half of the stutter.
+ */
+#define VOICES 10
 
-static void player_destroy(snd *s)
+typedef struct {
+    int owner;                 /* sound id, 0 = free */
+    int rate, channels;
+    int looping;
+    int playing;
+    unsigned stamp;            /* for "steal the oldest" */
+    SLObjectItf obj;
+    SLPlayItf play;
+    SLBufferQueueItf queue;
+    SLVolumeItf vol;
+} voice;
+
+static voice g_vo[VOICES];
+
+static void voice_destroy(voice *v)
 {
-    if (s->player_obj) {
-        (*s->player_obj)->Destroy(s->player_obj);
-        s->player_obj = NULL;
-        s->play = NULL;
-        s->queue = NULL;
-        s->volume_itf = NULL;
+    if (v->obj) {
+        (*v->obj)->Destroy(v->obj);
+        v->obj = NULL;
+        v->play = NULL;
+        v->queue = NULL;
+        v->vol = NULL;
     }
-    s->playing = 0;
+    v->playing = 0;
+    v->owner = 0;
 }
 
-/* OpenSL has no "loop this buffer" flag: looping is a re-enqueue from the
- * buffer-queue callback, which is the documented pattern and the only one that
- * works for a whole-buffer player. The callback runs on OpenSL's thread, so it
- * only touches the slot's own fields. */
-static void queue_cb(SLBufferQueueItf bq, void *ctx)
+/* The callback runs on OpenSL's thread. It only touches this voice. */
+static void voice_cb(SLBufferQueueItf bq, void *ctx)
 {
-    snd *s = (snd *)ctx;
-    if (!s)
+    voice *v = (voice *)ctx;
+    if (!v)
         return;
-    if (s->loop && s->playing && s->pcm && s->pcm_bytes) {
-        (*bq)->Enqueue(bq, s->pcm, (SLuint32)s->pcm_bytes);
-        return;
-    }
-    s->playing = 0;
-}
-
-static void stop_oldest_voice(void)
-{
-    snd *oldest = NULL;
-    for (int i = 0; i < SND_MAX; i++) {
-        if (g_snd[i].used && g_snd[i].playing) {
-            if (!oldest || g_snd[i].stamp < oldest->stamp)
-                oldest = &g_snd[i];
+    if (v->looping && v->playing) {
+        if (v->owner) {
+            snd *s = &g_snd[v->owner];
+            if (s->pcm && s->pcm_bytes)
+                (*bq)->Enqueue(bq, s->pcm, (SLuint32)s->pcm_bytes);
+            return;
         }
     }
-    if (oldest) {
-        if (oldest->play)
-            (*oldest->play)->SetPlayState(oldest->play, SL_PLAYSTATE_STOPPED);
-        oldest->playing = 0;
-    }
+    /* Finished: free the voice as well as marking it silent, or the pool slowly
+     * fills with voices that are not playing but still "owned" and every later
+     * play is forced to build a new player (12 ms of audioserver round trip in
+     * the middle of a frame -- which is what the stutter was). */
+    v->playing = 0;
+    v->owner = 0;
 }
 
-static int voices_playing(void)
+static int voice_realize(voice *v, int rate, int channels)
 {
-    int n = 0;
-    for (int i = 0; i < SND_MAX; i++)
-        if (g_snd[i].used && g_snd[i].playing)
-            n++;
-    return n;
-}
-
-static int player_start(snd *s, int loop)
-{
-    if (!sl_init())
-        return 0;
-    if (!decode(s))
-        return 0;
-
-    player_destroy(s);
-
-    if (voices_playing() >= VOICES)
-        stop_oldest_voice();
+    if (v->obj && v->rate == rate && v->channels == channels)
+        return 1;
+    voice_destroy(v);
 
     SLDataLocator_AndroidSimpleBufferQueue loc_bufq = {
         SL_DATALOCATOR_ANDROIDSIMPLEBUFFERQUEUE, 1
     };
     SLDataFormat_PCM fmt = {
         SL_DATAFORMAT_PCM,
-        (SLuint32)s->channels,
-        (SLuint32)s->rate * 1000u,        /* milliHz */
+        (SLuint32)channels,
+        (SLuint32)rate * 1000u,          /* milliHz */
         SL_PCMSAMPLEFORMAT_FIXED_16,
         SL_PCMSAMPLEFORMAT_FIXED_16,
-        s->channels == 2 ? (SL_SPEAKER_FRONT_LEFT | SL_SPEAKER_FRONT_RIGHT)
-                         : SL_SPEAKER_FRONT_CENTER,
+        channels == 2 ? (SL_SPEAKER_FRONT_LEFT | SL_SPEAKER_FRONT_RIGHT)
+                      : SL_SPEAKER_FRONT_CENTER,
         SL_BYTEORDER_LITTLEENDIAN
     };
     SLDataSource src = { &loc_bufq, &fmt };
     SLDataLocator_OutputMix loc_mix = { SL_DATALOCATOR_OUTPUTMIX, g_mix_obj };
     SLDataSink sink = { &loc_mix, NULL };
-
     const SLInterfaceID ids[2] = { SL_IID_BUFFERQUEUE, SL_IID_VOLUME };
     const SLboolean req[2] = { SL_BOOLEAN_TRUE, SL_BOOLEAN_TRUE };
 
-    if ((*g_engine)->CreateAudioPlayer(g_engine, &s->player_obj, &src, &sink,
-                                       2, ids, req) != SL_RESULT_SUCCESS ||
-        (*s->player_obj)->Realize(s->player_obj, SL_BOOLEAN_FALSE) != SL_RESULT_SUCCESS) {
-        host_log("[snd] cannot create a player for %s\n", s->name);
-        player_destroy(s);
+    if ((*g_engine)->CreateAudioPlayer(g_engine, &v->obj, &src, &sink,
+                                       2, ids, req) != SL_RESULT_SUCCESS)
+        return 0;
+    if ((*v->obj)->Realize(v->obj, SL_BOOLEAN_FALSE) != SL_RESULT_SUCCESS) {
+        (*v->obj)->Destroy(v->obj);
+        v->obj = NULL;
         return 0;
     }
-    (*s->player_obj)->GetInterface(s->player_obj, SL_IID_PLAY, &s->play);
-    (*s->player_obj)->GetInterface(s->player_obj, SL_IID_BUFFERQUEUE, &s->queue);
-    (*s->player_obj)->GetInterface(s->player_obj, SL_IID_VOLUME, &s->volume_itf);
-    if (!s->play || !s->queue) {
-        player_destroy(s);
+    (*v->obj)->GetInterface(v->obj, SL_IID_PLAY, &v->play);
+    (*v->obj)->GetInterface(v->obj, SL_IID_BUFFERQUEUE, &v->queue);
+    (*v->obj)->GetInterface(v->obj, SL_IID_VOLUME, &v->vol);
+    if (!v->play || !v->queue) {
+        voice_destroy(v);
         return 0;
     }
-    s->loop = loop ? 1 : 0;
-    (*s->queue)->RegisterCallback(s->queue, queue_cb, s);
+    (*v->queue)->RegisterCallback(v->queue, voice_cb, v);
+    v->rate = rate;
+    v->channels = channels;
+    return 1;
+}
 
-    if (s->volume_itf) {
-        /* 0 mB is full scale; the engine's 0..100 maps to -60..0 dB. */
-        SLmillibel level = (SLmillibel)((s->volume - 100) * 60);
-        (*s->volume_itf)->SetVolumeLevel(s->volume_itf, level);
+/* A voice for this format: a free one with the right format, else any free one,
+ * else the oldest playing one (stopped and reused). */
+static voice *voice_acquire(int rate, int channels)
+{
+    voice *free_same = NULL, *free_any = NULL;
+    for (int i = 0; i < VOICES; i++) {
+        voice *v = &g_vo[i];
+        if (v->owner || v->playing)
+            continue;
+        if (!free_any)
+            free_any = v;
+        if (!free_same && v->obj && v->rate == rate && v->channels == channels)
+            free_same = v;
+    }
+    if (free_same)
+        return free_same;
+    if (free_any)
+        return free_any;
+
+    /* Everything is busy: take the one that has been sounding longest. */
+    voice *victim = NULL;
+    for (int i = 0; i < VOICES; i++)
+        if (!victim || g_vo[i].stamp < victim->stamp)
+            victim = &g_vo[i];
+    if (!victim)
+        return NULL;
+    if (victim->play)
+        (*victim->play)->SetPlayState(victim->play, SL_PLAYSTATE_STOPPED);
+    if (victim->queue)
+        (*victim->queue)->Clear(victim->queue);
+    victim->playing = 0;
+    victim->owner = 0;
+    return victim;
+}
+
+static int voice_start(int id)
+{
+    snd *s = &g_snd[id];
+    if (!sl_init())
+        return 0;
+    if (!decode(s))
+        return 0;
+    if (s->rate <= 0 || s->channels <= 0)
+        return 0;
+
+    /* Already sounding? Ignore. See the comment at the top of this section. */
+    for (int i = 0; i < VOICES; i++) {
+        voice *v = &g_vo[i];
+        if (v->owner == id && v->playing) {
+            s->stamp = ++g_stamp;
+            return 1;
+        }
     }
 
-    if ((*s->queue)->Enqueue(s->queue, s->pcm, (SLuint32)s->pcm_bytes) != SL_RESULT_SUCCESS ||
-        (*s->play)->SetPlayState(s->play, SL_PLAYSTATE_PLAYING) != SL_RESULT_SUCCESS) {
-        host_log("[snd] cannot start %s\n", s->name);
-        player_destroy(s);
+    voice *v = voice_acquire(s->rate, s->channels);
+    if (!v)
+        return 0;
+    if (!voice_realize(v, s->rate, s->channels))
+        return 0;
+
+    v->owner = id;
+    v->looping = s->loop;
+    v->playing = 1;
+    v->stamp = ++g_stamp;
+    if (v->vol)
+        (*v->vol)->SetVolumeLevel(v->vol, (SLmillibel)((s->volume - 100) * 60));
+    if ((*v->queue)->Enqueue(v->queue, s->pcm, (SLuint32)s->pcm_bytes) !=
+            SL_RESULT_SUCCESS ||
+        (*v->play)->SetPlayState(v->play, SL_PLAYSTATE_PLAYING) !=
+            SL_RESULT_SUCCESS) {
+        v->playing = 0;
+        v->owner = 0;
         return 0;
     }
-    s->playing = 1;
-    s->stamp = ++g_stamp;
     return 1;
 }
 
@@ -288,7 +353,7 @@ int sound_host_open(int id, const char *name, int loop,
         return 0;
     snd *s = &g_snd[id];
     /* A handle can be destroyed and recreated; start clean. */
-    player_destroy(s);
+    sound_host_stop(id);
     drop_pcm(s);
     free(s->ogg);
     s->used = 1;
@@ -316,35 +381,47 @@ void sound_host_play(int id, int loop)
 {
     if (id <= 0 || id >= SND_MAX || !g_snd[id].used)
         return;
-    player_start(&g_snd[id], loop);
+    g_snd[id].loop = loop ? 1 : 0;
+    voice_start(id);
 }
 
 void sound_host_stop(int id)
 {
     if (id <= 0 || id >= SND_MAX)
         return;
-    snd *s = &g_snd[id];
-    if (s->play)
-        (*s->play)->SetPlayState(s->play, SL_PLAYSTATE_STOPPED);
-    s->playing = 0;
+    for (int i = 0; i < VOICES; i++) {
+        voice *v = &g_vo[i];
+        if (v->owner != id)
+            continue;
+        if (v->play)
+            (*v->play)->SetPlayState(v->play, SL_PLAYSTATE_STOPPED);
+        if (v->queue)
+            (*v->queue)->Clear(v->queue);
+        v->playing = 0;
+        v->owner = 0;
+    }
 }
 
 void sound_host_pause(int id)
 {
     if (id <= 0 || id >= SND_MAX)
         return;
-    snd *s = &g_snd[id];
-    if (s->play)
-        (*s->play)->SetPlayState(s->play, SL_PLAYSTATE_PAUSED);
+    for (int i = 0; i < VOICES; i++) {
+        voice *v = &g_vo[i];
+        if (v->owner == id && v->play)
+            (*v->play)->SetPlayState(v->play, SL_PLAYSTATE_PAUSED);
+    }
 }
 
 void sound_host_resume(int id)
 {
     if (id <= 0 || id >= SND_MAX)
         return;
-    snd *s = &g_snd[id];
-    if (s->play)
-        (*s->play)->SetPlayState(s->play, SL_PLAYSTATE_PLAYING);
+    for (int i = 0; i < VOICES; i++) {
+        voice *v = &g_vo[i];
+        if (v->owner == id && v->play)
+            (*v->play)->SetPlayState(v->play, SL_PLAYSTATE_PLAYING);
+    }
 }
 
 void sound_host_volume(int id, int volume)
@@ -353,9 +430,10 @@ void sound_host_volume(int id, int volume)
         return;
     snd *s = &g_snd[id];
     s->volume = volume < 0 ? 0 : volume > 100 ? 100 : volume;
-    if (s->volume_itf) {
-        SLmillibel level = (SLmillibel)((s->volume - 100) * 60);
-        (*s->volume_itf)->SetVolumeLevel(s->volume_itf, level);
+    for (int i = 0; i < VOICES; i++) {
+        voice *v = &g_vo[i];
+        if (v->owner == id && v->vol)
+            (*v->vol)->SetVolumeLevel(v->vol, (SLmillibel)((s->volume - 100) * 60));
     }
 }
 
@@ -364,7 +442,7 @@ void sound_host_close(int id)
     if (id <= 0 || id >= SND_MAX)
         return;
     snd *s = &g_snd[id];
-    player_destroy(s);
+    sound_host_stop(id);
     drop_pcm(s);
     free(s->ogg);
     s->ogg = NULL;
