@@ -152,12 +152,14 @@ build_browser() {
     # page dies at instantiation with "Import #2 host: module is not an object
     # or function". See build_wasm(), which writes spike_freestanding.wasm.
     $EMCC -O2 -I src $DBG --pre-js tools/trap.js --pre-js tools/page-options.js \
+        --pre-js tools/idbfs.js \
         --js-library tools/sound.js --js-library tools/text.js \
         $COMMON_BROWSER src/gl4es_bridge.c src/platform_emscripten.c src/main.c \
         "$GL4ES/libGL.a" \
         -sFULL_ES2=1 -sALLOW_MEMORY_GROWTH=1 -sSTACK_SIZE=8388608 \
         -sMIN_WEBGL_VERSION=2 -sMAX_WEBGL_VERSION=2 \
         -sEXIT_RUNTIME=0 \
+        -lidbfs.js \
         -sEXPORTED_RUNTIME_METHODS=ccall,cwrap \
         -sEXPORTED_FUNCTIONS=_main,_spike_set_frames,_spike_set_dump_screen,_spike_set_gl_trace,_spike_set_fixed,_spike_set_frame_ms,_spike_set_trace,_spike_input_down,_spike_input_move,_spike_input_up,_spike_input_release_all \
         $PRELOAD \

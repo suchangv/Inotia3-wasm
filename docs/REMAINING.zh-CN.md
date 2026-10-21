@@ -44,16 +44,29 @@
   dump 控制列表，注释写着 "Removed before committing"），说明另一个 session 正在定位存档菜单。
   接手前先看 `git status` / `git diff`，别覆盖它。
 
-## P0 — 浏览器端没有持久化
+## P0 — 浏览器端没有持久化 —— **已修（IDBFS）**
 
-`host_app_data_dir()` 用的是 emscripten 的 **MEMFS**，全仓库没有 IDBFS / OPFS / `FS.syncfs`。
-两个后果：
+原来的状态：`host_app_data_dir()` 用的是 emscripten 的 **MEMFS**，全仓库没有 IDBFS /
+OPFS / `FS.syncfs`。两个后果：
 
-1. **刷新页面 = 存档全丢**，浏览器版的"存档"目前没有意义；
+1. **刷新页面 = 存档全丢**，浏览器版的"存档"没有意义；
 2. 每次刷新都要重跑 12 个数据文件的安装 —— 这就是开机 17 秒的来源。
 
-修法：把 IDBFS 挂到 `/data`，在 `pagehide` / 定时器里 `syncfs`。做完之后第二次进游戏，
-开机时间应该从十几秒掉到几秒，存档也才有地方落。
+修法（已实现）：把 IDBFS 挂到 `/data`。三处配合，缺一不可：
+
+| 位置 | 做了什么 |
+|---|---|
+| `tools/idbfs.js`（新，`--pre-js`） | `preRun` 里 `FS.mkdir('/data')` + `FS.mount(IDBFS, {}, '/data')`；用 **run dependency** 等 `FS.syncfs(true)` 完成后再放行 `main()`（否则引擎看到的还是空目录，会重装一遍）；`pagehide` / `visibilitychange→hidden` 时立刻 flush；`?nostore=1` 可关闭以做 A/B |
+| `src/host_libc.c` | `fwrite` / `rename` / `remove` / `mkdir` 成功后把路径报给 `host_storage_dirty()`；`fsync` → `host_storage_flush()`（引擎存完档自己会调，是最诚实的提交点） |
+| `src/platform_emscripten.c` | 只认 `/data/` 前缀；`EM_JS` 里调 `FS.syncfs(false)`；帧 tick 里 500 ms 合并一次，兜住没有 fsync 的写 |
+
+其余平台（`platform_native/sdl/android/wasm.c`）是空实现——真文件系统上
+"写成功"就等于"已持久"，只有浏览器才存在"写了但没保存"这个中间态。
+
+**验收**：控制台应出现 `spike: /data restored from IndexedDB: ...`；
+首次是 `(empty, first run)`，**刷新第二次应列出
+`com.com2us.inotia3.google.global`**，且不再重跑 12 个文件的安装（开机时间应明显下降）。
+注意：这一条只解决"落盘"。存档能不能存出来是下面那条 P0（存 → 读回闭环），两件事分开看。
 
 ## P1 — 宿主面剩下的洞 —— **2026-10-21 已全部修完**
 
@@ -161,7 +174,9 @@ worklist 也归零。
 - [x] **P1 宿主面的洞** —— 全部实现并验证（见上）。运行期未实现 import 归零。
 - [ ] P0 存档 / 读档闭环 —— `SAVE_SaveData` 的路径问题已由 `8949ebb` 修掉，
       但**还没有做过一次真正的存 → 读回验证**。
-- [ ] P0 浏览器持久化（IDBFS）
+- [x] **P0 浏览器持久化（IDBFS）** —— `/data` 挂 IDBFS，加载用 run dependency 阻塞
+      `main()`，写路径（fwrite/rename/remove/mkdir/fsync）上报，tick 里 500 ms 合并 flush，
+      `pagehide` 兜底。待真机刷新验证。
 - [ ] P1 Android 四项验收
 - [ ] P2 profiler 默认关、开机加速
 - [ ] P2 自定义网页外壳
@@ -169,7 +184,7 @@ worklist 也归零。
 
 ## 建议动手顺序
 
-1. **浏览器持久化（IDBFS）+ profiler 默认关掉** —— 两个都是小改动，用户直接可感。
+1. ~~**浏览器持久化（IDBFS）**~~ 已完成；profiler 默认关掉还没做。
 2. **存档端到端** —— 存一次、读回来。这也会顺带覆盖上面那批"写了但没跑过"的
    FS 路径（`opendir`/`readdir`/`remove`）。
 3. **Android 四项验收**（音频、生命周期、存档、真机性能）。

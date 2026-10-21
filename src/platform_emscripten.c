@@ -304,6 +304,62 @@ const char *host_app_data_dir(const char *package)
     return "/data/";
 }
 
+/* ---- durable storage -----------------------------------------------------
+ *
+ * /data is IDBFS on this platform (tools/idbfs.js mounts it before main runs),
+ * so a write there is invisible to the browser until FS.syncfs pushes it to
+ * IndexedDB. Before this existed, a reload came back to an empty /data: saves
+ * were gone and the engine reinstalled its 12 asset files every time.
+ *
+ * The loader tells us what changed; this decides when that becomes durable.
+ * Three triggers, and they are not redundant:
+ *
+ *   fsync         the engine's own "the save is committed" point, so sync now;
+ *   the frame tick  catches writes that never get an fsync, coalesced to at
+ *                 most one sync per SPIKE_SYNC_MS so a burst of small writes
+ *                 costs one IndexedDB transaction and not fifty;
+ *   pagehide / visibilitychange  in the pre-js, because the page can go away
+ *                 between frames and C never gets another turn.
+ */
+#define SPIKE_SYNC_MS 500.0
+
+EM_JS(void, spike_storage_sync, (void), {
+    if (typeof FS === 'undefined') return;
+    FS.syncfs(false, function (err) {
+        if (err) console.error('spike: syncfs failed: ' + err);
+    });
+});
+
+static int    g_storage_dirty;
+static double g_storage_since;      /* when the current dirty burst started */
+
+void host_storage_dirty(const char *path)
+{
+    /* Only the app's own directory is persisted. The engine also writes
+     * scratch files next to the trace output, and those live in MEMFS on
+     * purpose -- syncing them would put a per-frame log into IndexedDB. */
+    if (!path || strncmp(path, "/data/", 6) != 0)
+        return;
+    if (!g_storage_dirty)
+        g_storage_since = emscripten_get_now();
+    g_storage_dirty = 1;
+}
+
+void host_storage_flush(void)
+{
+    if (!g_storage_dirty)
+        return;
+    g_storage_dirty = 0;
+    g_storage_since = emscripten_get_now();
+    spike_storage_sync();
+}
+
+void host_storage_tick(void)
+{
+    if (g_storage_dirty && emscripten_get_now() - g_storage_since >= SPIKE_SYNC_MS)
+        host_storage_flush();
+}
+
 /* ---- the main loop -------------------------------------------------------
  *
  * The engine runs one tick per requestAnimationFrame rather than in a
@@ -326,6 +382,7 @@ static int (*g_tick)(void);
 static void spike_tick_thunk(void *arg)
 {
     (void)arg;
+    host_storage_tick();
     if (!g_tick())
         emscripten_cancel_main_loop();
 }

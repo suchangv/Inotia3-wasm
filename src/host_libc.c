@@ -1440,6 +1440,8 @@ void host_import_call(guest_import *im)
          * it. One level at a time is all it asks for. */
         guest_path(a0, g_path_buf, sizeof(g_path_buf));
         R[0] = (mkdir(g_path_buf, 0777) == 0) ? 0 : (uint32_t)-1;
+        if (R[0] == 0)
+            host_storage_dirty(g_path_buf);
         break;
     }
     case IMPL_fstat: {
@@ -1526,6 +1528,13 @@ void host_import_call(guest_import *im)
     case IMPL_fwrite: {
         FILE *f = file_of(a3);
         R[0] = (f && a0) ? (uint32_t)fwrite(g_mem + a0, a1, a2, f) : 0;
+        /* Bytes have landed in the host's file, which on the browser is MEMFS:
+         * still only RAM until IDBFS is told. Path decides -- writes under the
+         * app's data directory are the ones that have to survive a reload
+         * (saves, the installed assets, the settings file); everything else
+         * the engine writes is under the trace/scratch names and does not. */
+        if (R[0] && a3 < FIOMAX)
+            host_storage_dirty(g_file_path[a3]);
         break;
     }
     case IMPL_fseek: {
@@ -1696,6 +1705,8 @@ void host_import_call(guest_import *im)
         guest_path(a0, g_path_buf, sizeof(g_path_buf));
         int ok = (remove(g_path_buf) == 0);
         R[0] = ok ? 0 : (uint32_t)-1;
+        if (ok)
+            host_storage_dirty(g_path_buf);
         break;
     }
     case IMPL_rename: {
@@ -1703,6 +1714,13 @@ void host_import_call(guest_import *im)
         guest_path(a0, from, sizeof(from));
         guest_path(a1, to, sizeof(to));
         R[0] = (rename(from, to) == 0) ? 0 : (uint32_t)-1;
+        /* A save that goes .tmp -> save0.dat only touches the filesystem here:
+         * no fwrite after this, so without this call the rename would be lost
+         * on reload and the save would be missing its final name. */
+        if (R[0] == 0) {
+            host_storage_dirty(from);
+            host_storage_dirty(to);
+        }
         break;
     }
 #endif
@@ -1713,7 +1731,13 @@ void host_import_call(guest_import *im)
          * are already in the host's file (fwrite is unbuffered enough here for
          * the reopen-and-verify the engine does), so there is nothing to flush
          * that would not be flushed by fclose anyway. Reporting failure would
-         * make the engine think the save did not happen. */
+         * make the engine think the save did not happen.
+         *
+         * In the browser that reasoning is wrong: the bytes are in MEMFS, and
+         * MEMFS does not survive a reload until FS.syncfs runs. This is the
+         * clearest "commit the save" point the engine offers, so it is also the
+         * point where the browser build makes it durable. */
+        host_storage_flush();
         R[0] = 0;
         break;
     }

@@ -229,3 +229,13 @@ const char *host_language(void)
     const char *l = getenv("SPIKE_LANG");
     return (l && *l) ? l : "en";
 }
+
+/* ---- durable storage -----------------------------------------------------
+ *
+ * Nothing to do off the browser: /data is a real directory, so a successful
+ * fwrite is already as durable as the platform can make it. The browser is the
+ * only host where "written" and "saved" are different states -- see
+ * platform_emscripten.c. */
+void host_storage_dirty(const char *path) { (void)path; }
+void host_storage_flush(void) { }
+void host_storage_tick(void) { }

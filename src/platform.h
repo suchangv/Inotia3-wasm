@@ -177,4 +177,22 @@ void host_loong_window_size(int *w, int *h);
 void host_trace_open(const char *path);
 void host_trace_close(void);
 
+/* ---- durable storage -----------------------------------------------------
+ *
+ * The loader reports every write it makes under the app's data directory and
+ * the platform decides when that becomes durable. On a real filesystem there is
+ * nothing to do and these are no-ops. In the browser /data is IDBFS, so
+ * "durable" means FS.syncfs -- without it a reload silently loses every save,
+ * which is what the browser build used to do.
+ *
+ *   host_storage_dirty(path)  something under /data changed (cheap, prefix test)
+ *   host_storage_flush()      make it durable now (the engine called fsync)
+ *   host_storage_tick()       once per frame: rate-limited flush of anything
+ *                             still pending, for writes that never get an
+ *                             fsync
+ */
+void host_storage_dirty(const char *path);
+void host_storage_flush(void);
+void host_storage_tick(void);
+
 #endif /* PLATFORM_H */

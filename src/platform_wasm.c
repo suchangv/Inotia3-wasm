@@ -333,3 +333,13 @@ void host_trace_insn(uint32_t pc, const uint32_t *r, uint32_t cpsr)
 {
     (void)pc; (void)r; (void)cpsr;
 }
+
+/* ---- durable storage -----------------------------------------------------
+ *
+ * Nothing to do off the browser: /data is a real directory, so a successful
+ * fwrite is already as durable as the platform can make it. The browser is the
+ * only host where "written" and "saved" are different states -- see
+ * platform_emscripten.c. */
+void host_storage_dirty(const char *path) { (void)path; }
+void host_storage_flush(void) { }
+void host_storage_tick(void) { }
