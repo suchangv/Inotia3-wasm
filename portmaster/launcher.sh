@@ -178,6 +178,19 @@ printf '%s\n' "sockets:  $(ls "${XDG_RUNTIME_DIR:-/run/user/0}" 2>/dev/null | tr
 printf '%s\n' "dri:      $(ls /dev/dri 2>/dev/null | tr '\n' ' ')"
 # -l on purpose: a broken symlink lists fine without it, and libmali is
 # normally a chain of symlinks.
+# Optional per-install overrides: one KEY=VALUE per line in env.txt, next to the
+# game files (SPIKE_ROTATE=270 to turn the picture the other way,
+# SDL_VIDEODRIVER=wayland to force a backend, SPIKE_LANG=zh-CN, ...). Editing a
+# text file on the SD card beats re-downloading the whole port to try a value.
+if [ -f env.txt ]; then
+    printf '%s\n' '--- env.txt ---'
+    while IFS= read -r line; do
+        case "$line" in ''|'#'*) continue ;; esac
+        printf '%s\n' "    $line"
+        export "$line" 2>/dev/null || printf '%s\n' "    (bad line: $line)"
+    done < env.txt
+fi
+
 printf '%s\n' '--- gl libraries ---'
 for l in /usr/lib/libEGL.so* /usr/lib/libGLESv2.so* /usr/lib/libmali* \
          /usr/lib/libgbm* /usr/lib/libdrm.so* /usr/lib/libwayland-client.so* ; do
@@ -185,54 +198,31 @@ for l in /usr/lib/libEGL.so* /usr/lib/libGLESv2.so* /usr/lib/libmali* \
     ls -l "$l" 2>&1 | sed 's/^/    /'
 done
 
-# Which vendor GL library to preload, if the probe says we have to.
-glpre=
-for l in /usr/lib/libmali.so.1 /usr/lib/libmali.so /lib/libmali.so.1 /usr/lib/libEGL.so.1; do
-    [ -e "$l" ] && glpre=$l && break
-done
-
-# The probe is the only place where SDL's silent fallback gets explained, and
-# it is also the cheapest way to test the two known fixes for "cannot
-# initialize GL": preloading the vendor library (static TLS is sized at process
-# start -- a libmali that wants initial-exec TLS only loads from LD_PRELOAD),
-# and naming the GL library by absolute path (firmwares whose loader cache does
-# not cover /usr/lib).
+# Ask every driver, then use the first one that actually produced a window and
+# a GL context. On this firmware (weston) wayland connects but its EGL path
+# fails, while KMSDRM works and reports the panel's native 720x960 portrait
+# mode -- which the engine host rotates, since SDL2's KMSDRM backend cannot.
+# On a firmware without a compositor it is the other way round, and this picks
+# wayland (or X11) instead. SPIKE_VIDEO overrides the choice.
 set +x
 printf '%s\n' '--- video driver probe ---'
 probe=$("$ENGINE" --vdprobe 2>&1)
 printf '%s\n' "$probe" | sed 's/^/    /'
-case "$probe" in
-*"window ok"*)
-    ;;
-*)
-    if [ -n "$glpre" ]; then
-        printf '%s\n' "--- retry: LD_PRELOAD=$glpre ---"
-        p2=$(LD_PRELOAD="$glpre" "$ENGINE" --vdprobe 2>&1)
-        printf '%s\n' "$p2" | sed 's/^/    /'
-        case "$p2" in
-        *"window ok"*)
-            export LD_PRELOAD="$glpre"
-            printf '%s\n' "--- using LD_PRELOAD=$glpre ---"
-            ;;
-        esac
-    fi
-    if [ -z "${LD_PRELOAD:-}" ]; then
-        for g in /usr/lib/libGLESv2.so.2 /usr/lib/libEGL.so.1; do
-            [ -e "$g" ] || continue
-            printf '%s\n' "--- retry: SDL_VIDEO_GL_DRIVER=$g ---"
-            p3=$(SDL_VIDEO_GL_DRIVER="$g" "$ENGINE" --vdprobe 2>&1)
-            printf '%s\n' "$p3" | sed 's/^/    /'
-            case "$p3" in
-            *"window ok"*)
-                export SDL_VIDEO_GL_DRIVER="$g"
-                printf '%s\n' "--- using SDL_VIDEO_GL_DRIVER=$g ---"
-                break
-                ;;
-            esac
-        done
-    fi
-    ;;
-esac
+if [ -n "${SDL_VIDEODRIVER:-}" ]; then
+    :   # env.txt asked for a specific driver; keep it
+elif [ -n "${SPIKE_VIDEO:-}" ]; then
+    SDL_VIDEODRIVER=$SPIKE_VIDEO
+else
+    SDL_VIDEODRIVER=$(printf '%s\n' "$probe" \
+        | grep -E '^[[:space:]]*[A-Za-z0-9_]+[[:space:]]+.*window ok' \
+        | head -1 | awk '{print $1}')
+fi
+if [ -n "$SDL_VIDEODRIVER" ]; then
+    export SDL_VIDEODRIVER
+    printf '%s\n' "--- using SDL_VIDEODRIVER=$SDL_VIDEODRIVER ---"
+else
+    printf '%s\n' '--- no driver could create a window; letting SDL choose ---'
+fi
 set -x
 printf '%s\n' '--- files ---'
 ls -l "$ENGINE" libs/libSDL2-2.0.so.0 2>&1

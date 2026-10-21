@@ -73,6 +73,17 @@ static SDL_Window   *g_win;
 static SDL_GLContext g_ctx;
 static SDL_GameController *g_pad;
 static int g_surface_w, g_surface_h;
+
+/* Rotation. KMSDRM on this panel reports a 720x960 portrait drawable because
+ * that is the connector's native mode; the compositor normally rotates it, and
+ * SDL2's KMSDRM backend cannot. So when the drawable is portrait and the
+ * content is landscape, the engine renders into an FBO at content size and the
+ * present pass blits it rotated. 0 = off (the normal path, unchanged). */
+static int g_rotate;            /* 0, 90, 180, 270 */
+static int g_rotate_given;      /* --rotate=/SPIKE_ROTATE overrides the guess */
+static unsigned g_fbo, g_fbo_tex, g_fbo_rb;
+static unsigned g_copy_tex;     /* FBO -> texture copy, drawn rotated */
+static int g_fbo_ok;
 static int g_running = 1;
 static int g_gl_inited;
 
@@ -339,6 +350,55 @@ static int gl_start(void)
     }
     gl4es_bridge_init(CONTENT_W, CONTENT_H);
     g_gl_inited = 1;
+
+    /* A portrait drawable with landscape content means the panel's native mode
+     * is rotated and nobody rotated it for us: render offscreen and blit
+     * rotated. Guessing 90 is what every one of these panels needs; --rotate or
+     * SPIKE_ROTATE overrides it (0 disables). */
+    if (!g_rotate_given && g_surface_h > g_surface_w)
+        g_rotate = 90;
+    if (g_rotate == 90 || g_rotate == 270 || g_rotate == 180) {
+        glGenTextures(1, &g_fbo_tex);
+        glBindTexture(GL_TEXTURE_2D, g_fbo_tex);
+        glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA, CONTENT_W, CONTENT_H, 0,
+                     GL_RGBA, GL_UNSIGNED_BYTE, NULL);
+        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR);
+        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
+        /* 960x544 is not a power of two: ES2 only allows NPOT textures with
+         * CLAMP_TO_EDGE, otherwise the texture is incomplete and samples as
+         * black -- which is exactly what a missing line here looks like. */
+        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, 0x812F /* CLAMP_TO_EDGE */);
+        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, 0x812F);
+        glGenTextures(1, &g_copy_tex);
+        glBindTexture(GL_TEXTURE_2D, g_copy_tex);
+        glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA, CONTENT_W, CONTENT_H, 0,
+                     GL_RGBA, GL_UNSIGNED_BYTE, NULL);
+        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR);
+        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
+        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, 0x812F);
+        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, 0x812F);
+        glGenFramebuffers(1, &g_fbo);
+        glBindFramebuffer(GL_FRAMEBUFFER, g_fbo);
+        glFramebufferTexture2D(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT0,
+                               GL_TEXTURE_2D, g_fbo_tex, 0);
+        glGenRenderbuffers(1, &g_fbo_rb);
+        glBindRenderbuffer(GL_RENDERBUFFER, g_fbo_rb);
+        glRenderbufferStorage(GL_RENDERBUFFER, 0x88F0 /* GL_DEPTH24_STENCIL8 */,
+                              CONTENT_W, CONTENT_H);
+        glFramebufferRenderbuffer(GL_FRAMEBUFFER, 0x821A /* GL_DEPTH_STENCIL_ATTACHMENT */,
+                                  GL_RENDERBUFFER, g_fbo_rb);
+        g_fbo_ok = (glCheckFramebufferStatus(GL_FRAMEBUFFER) ==
+                    GL_FRAMEBUFFER_COMPLETE);
+        glBindFramebuffer(GL_FRAMEBUFFER, 0);
+        if (!g_fbo_ok)
+            host_log("gl: rotation requested (%d) but the FBO is incomplete; "
+                     "falling back to letterbox\n", g_rotate);
+
+        else
+            host_log("gl: drawable %dx%d, rendering %dx%d into an FBO and "
+                     "rotating %d degrees\n", g_surface_w, g_surface_h,
+                     CONTENT_W, CONTENT_H, g_rotate);
+    }
     return 1;
 }
 
@@ -365,14 +425,50 @@ static void letterbox(int *x, int *y, int *w, int *h)
     }
 }
 
+static int rotating(void) { return g_rotate != 0 && g_fbo_ok; }
+
+/* Where the engine draws: the window, letterboxed -- or the whole FBO when the
+ * picture is rotated, because then the FBO *is* the content. */
+static void content_target(int *x, int *y, int *w, int *h)
+{
+    if (rotating()) {
+        *x = 0; *y = 0; *w = CONTENT_W; *h = CONTENT_H;
+        return;
+    }
+    letterbox(x, y, w, h);
+}
+
+static void target_size(int *w, int *h)
+{
+    if (rotating()) { *w = CONTENT_W; *h = CONTENT_H; }
+    else { *w = g_surface_w; *h = g_surface_h; }
+}
+
+/* The rotated picture's footprint: the content's axes are swapped, so the
+ * aspect ratio to fit is CONTENT_H x CONTENT_W. */
+static void letterbox_rot(int *x, int *y, int *w, int *h)
+{
+    int sw = g_surface_w, sh = g_surface_h;
+    int rw = CONTENT_H, rh = CONTENT_W;
+    if (sw <= 0 || sh <= 0) { *x = 0; *y = 0; *w = rw; *h = rh; return; }
+    int64_t w1 = (int64_t)sh * rw / rh;
+    if (w1 <= sw) {
+        *w = (int)w1; *h = sh; *x = (sw - *w) / 2; *y = 0;
+    } else {
+        int64_t h1 = (int64_t)sw * rh / rw;
+        *w = sw; *h = (int)h1; *x = 0; *y = (sh - *h) / 2;
+    }
+}
+
 int host_adjust_viewport(int32_t *x, int32_t *y, int32_t *w, int32_t *h)
 {
     (void)x; (void)y; (void)w; (void)h;
-    int lx, ly, lw, lh;
-    letterbox(&lx, &ly, &lw, &lh);
+    int lx, ly, lw, lh, tw, th;
+    content_target(&lx, &ly, &lw, &lh);
+    target_size(&tw, &th);
     if (lw <= 0 || lh <= 0)
         return 0;
-    glViewport(lx, g_surface_h - ly - lh, lw, lh);
+    glViewport(lx, th - ly - lh, lw, lh);
     return 1;
 }
 
@@ -495,8 +591,21 @@ int host_sdl_vdprobe(void)
 
 /* ---- start-up ------------------------------------------------------------ */
 
+void host_sdl_set_rotation(int deg)
+{
+    if (deg == 0 || deg == 90 || deg == 180 || deg == 270) {
+        g_rotate = deg;
+        g_rotate_given = 1;
+    }
+}
+
 int host_sdl_init(void)
 {
+    {
+        const char *rot = getenv("SPIKE_ROTATE");
+        if (rot && *rot)
+            host_sdl_set_rotation(atoi(rot));
+    }
     if (SDL_Init(SDL_INIT_VIDEO | SDL_INIT_GAMECONTROLLER | SDL_INIT_EVENTS) != 0) {
         host_log("sdl: init failed: %s\n", SDL_GetError());
         return 1;
@@ -601,7 +710,7 @@ static void cursor_nudge(double dt_ms)
 static void cursor_screen(int *sx, int *sy)
 {
     int lx, ly, lw, lh;
-    letterbox(&lx, &ly, &lw, &lh);
+    content_target(&lx, &ly, &lw, &lh);
     *sx = lx + (int)(cur.x * (float)lw / CONTENT_W);
     *sy = ly + (int)(cur.y * (float)lh / CONTENT_H);
 }
@@ -665,20 +774,21 @@ static void cursor_draw(void)
         have_tex = 1;
         cursor_texture();
     }
-    int sx, sy;
+    int sx, sy, tw, th;
     cursor_screen(&sx, &sy);
     int lx, ly, lw, lh;
-    letterbox(&lx, &ly, &lw, &lh);
+    content_target(&lx, &ly, &lw, &lh);
+    target_size(&tw, &th);
     float scale = (float)lw / CONTENT_W;
     if (scale <= 0.0f) scale = 1.0f;
     float w = 16.0f * scale, h = 16.0f * scale;
 
     /* glViewport is the whole window here: this pass is raw GLES1 through
      * gl4es, in window pixels, on top of the engine's finished frame. */
-    gl4es_glViewport(0, 0, g_surface_w, g_surface_h);
+    gl4es_glViewport(0, 0, tw, th);
     gl4es_glMatrixMode(0x1701 /* GL_PROJECTION */);
     gl4es_glLoadIdentity();
-    gl4es_glOrthof(0.0f, (float)g_surface_w, (float)g_surface_h, 0.0f, -1.0f, 1.0f);
+    gl4es_glOrthof(0.0f, (float)tw, (float)th, 0.0f, -1.0f, 1.0f);
     gl4es_glMatrixMode(0x1700 /* GL_MODELVIEW */);
     gl4es_glLoadIdentity();
     /* The engine leaves depth testing, culling, alpha test and scissor in
@@ -739,6 +849,22 @@ static void cursor_set(int x, int y)
 static void window_to_content(int wx, int wy, int *cx, int *cy)
 {
     int lx, ly, lw, lh;
+    if (rotating()) {
+        int dx, dy, dw, dh;
+        letterbox_rot(&dx, &dy, &dw, &dh);
+        if (dw <= 0 || dh <= 0) { *cx = 0; *cy = 0; return; }
+        float u = (float)(wx - dx) / (float)dw;   /* across the rotated picture */
+        float v = (float)(wy - dy) / (float)dh;   /* down it */
+        switch (g_rotate) {
+        case 90:  *cx = (int)(v * CONTENT_W);
+                  *cy = (int)((1.0f - u) * CONTENT_H); break;
+        case 180: *cx = (int)((1.0f - u) * CONTENT_W);
+                  *cy = (int)(v * CONTENT_H); break;
+        default:  *cx = (int)((1.0f - v) * CONTENT_W);
+                  *cy = (int)(u * CONTENT_H); break;
+        }
+        return;
+    }
     letterbox(&lx, &ly, &lw, &lh);
     *cx = (wx - lx) * CONTENT_W / (lw > 0 ? lw : CONTENT_W);
     *cy = (wy - ly) * CONTENT_H / (lh > 0 ? lh : CONTENT_H);
@@ -849,23 +975,33 @@ void host_sdl_begin_frame(void)
     }
     if (!g_gl_inited)
         return;
+    glBindFramebuffer(GL_FRAMEBUFFER,
+                      (rotating() && !getenv("SPIKE_SHOT_FB")) ? g_fbo : 0);
+    int tw, th;
+    target_size(&tw, &th);
     glDisable(GL_SCISSOR_TEST);
-    glViewport(0, 0, g_surface_w, g_surface_h);
+    glViewport(0, 0, tw, th);
     glClearColor(0.0f, 0.0f, 0.0f, 1.0f);
     glClear(GL_COLOR_BUFFER_BIT | GL_DEPTH_BUFFER_BIT | GL_STENCIL_BUFFER_BIT);
     int lx, ly, lw, lh;
-    letterbox(&lx, &ly, &lw, &lh);
+    content_target(&lx, &ly, &lw, &lh);
     if (lw > 0 && lh > 0)
-        glViewport(lx, g_surface_h - ly - lh, lw, lh);
+        glViewport(lx, th - ly - lh, lw, lh);
 }
 
 /* Read the framebuffer into a PPM (P6). PPM because a screenshot tool is not
  * something a handheld has, and this needs no library to write. */
-static void screenshot(const char *path)
+static void screenshot(const char *path, int from_fbo)
 {
     if (!g_gl_inited)
         return;
+    /* from_fbo reads the engine's own frame (upright 960x544); otherwise the
+     * window buffer as it stands. Binding happens here only for the FBO, so the
+     * window read uses whatever is actually current. */
+    if (from_fbo)
+        glBindFramebuffer(GL_FRAMEBUFFER, g_fbo);
     int w = g_surface_w, h = g_surface_h;
+    if (from_fbo) { w = CONTENT_W; h = CONTENT_H; }
     unsigned char *rgb = (unsigned char *)host_alloc((size_t)w * h * 3);
     unsigned char *row = (unsigned char *)host_alloc((size_t)w * 4);
     for (int y = 0; y < h; y++) {
@@ -889,18 +1025,81 @@ static void screenshot(const char *path)
     free(rgb);
 }
 
+/* Present the FBO rotated. The rotation lives in the texture coordinates:
+ * the quad always covers the letterboxed (axis-swapped) footprint, and which
+ * content corner lands on which screen corner decides the direction. */
+static void present_rotated(void)
+{
+    int dx, dy, dw, dh;
+    letterbox_rot(&dx, &dy, &dw, &dh);
+
+    /* Copy the frame into a texture gl4es knows about, then draw that rotated.
+     * A texture *rendered into* cannot be sampled through gl4es (its cached copy
+     * stays empty); a texture filled by the copy inside gl4es can. */
+    glActiveTexture(0x84C0 /* GL_TEXTURE0 */);
+    glBindTexture(0x0DE1, g_copy_tex);
+    glCopyTexSubImage2D(0x0DE1, 0, 0, 0, 0, 0, CONTENT_W, CONTENT_H);
+
+    glBindFramebuffer(GL_FRAMEBUFFER, 0);
+    glDisable(GL_SCISSOR_TEST);
+    glViewport(0, 0, g_surface_w, g_surface_h);
+    glClearColor(0.0f, 0.0f, 0.0f, 1.0f);
+    glClear(GL_COLOR_BUFFER_BIT);
+
+    gl4es_glMatrixMode(0x1701);
+    gl4es_glLoadIdentity();
+    gl4es_glOrthof(0.0f, (float)g_surface_w, (float)g_surface_h, 0.0f, -1.0f, 1.0f);
+    gl4es_glMatrixMode(0x1700);
+    gl4es_glLoadIdentity();
+    gl4es_glDisable(0x0B71 /* DEPTH_TEST */);
+    gl4es_glDisable(0x0B44);
+    gl4es_glDisable(0x0B90);
+    gl4es_glDisable(0x0BC0);
+    gl4es_glDisable(0x0BE2);
+    gl4es_glDisable(0x0C11);
+    gl4es_glEnable(0x0DE1);
+    gl4es_glBindTexture(0x0DE1, g_copy_tex);
+    gl4es_glTexEnvi(0x2300, 0x2200, 0x1E01 /* REPLACE */);
+    gl4es_glColor4f(1.0f, 1.0f, 1.0f, 1.0f);
+    gl4es_glEnable(0x8074);
+    gl4es_glEnable(0x8078);
+
+    float x0 = (float)dx, y0 = (float)dy;
+    float x1 = (float)(dx + dw), y1 = (float)(dy + dh);
+    float verts[8] = { x0, y0, x1, y0, x0, y1, x1, y1 };
+    float uv[8];
+    switch (g_rotate) {
+    case 90:  uv[0]=0; uv[1]=0; uv[2]=0; uv[3]=1; uv[4]=1; uv[5]=0; uv[6]=1; uv[7]=1; break;
+    case 180: uv[0]=1; uv[1]=1; uv[2]=0; uv[3]=1; uv[4]=1; uv[5]=0; uv[6]=0; uv[7]=0; break;
+    default:  uv[0]=1; uv[1]=1; uv[2]=1; uv[3]=0; uv[4]=0; uv[5]=1; uv[6]=0; uv[7]=0; break;
+    }
+    gl4es_glVertexPointer(2, 0x1406, 0, verts);
+    gl4es_glTexCoordPointer(2, 0x1406, 0, uv);
+    gl4es_glDrawArrays(0x0005, 0, 4);
+}
+
 void host_sdl_present(void)
 {
     if (!g_gl_inited)
         return;
     cursor_draw();
+    if (rotating())
+        present_rotated();
+    /* SPIKE_SHOT_FB=1: capture what is about to be shown, i.e. the window
+     * buffer, instead of the content. The only way to check the rotation
+     * without a portrait panel on the bench. */
+    if (g_sdl_shot && getenv("SPIKE_SHOT_FB") && g_sdl_shot_frame <= 0) {
+        g_sdl_shot_frame = -1;
+        screenshot(g_sdl_shot, 0);   /* the window buffer, as drawn */
+        g_sdl_shot = NULL;
+    }
     SDL_GL_SwapWindow(g_win);
     if (g_sdl_shot) {
         /* --shot=FILE[@FRAME]: FRAME presented frames first, then once. */
         if (g_sdl_shot_frame > 0)
             g_sdl_shot_frame--;
         else {
-            screenshot(g_sdl_shot);
+            screenshot(g_sdl_shot, rotating());
             g_sdl_shot = NULL;
         }
     }
