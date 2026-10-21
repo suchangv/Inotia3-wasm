@@ -192,6 +192,15 @@
   footer a:hover { text-decoration: underline; }
   .notice { background: #fffdf5; border: 1px solid #f0e6c8; border-radius: 10px; padding: 10px 12px; }
   .notice b { color: var(--warn); }
+  /* The source is the one link on this page a visitor is likely to want, so it
+   * is bigger and on its own line instead of buried in the credits sentence. */
+  .source { margin: 16px 0 10px; }
+  .source a {
+    display: inline-flex; align-items: center; gap: 7px;
+    font-size: 17px; font-weight: 600; color: var(--accent); text-decoration: none;
+  }
+  .source a:hover { text-decoration: underline; }
+  .source .en { display: block; font-size: 12px; font-weight: 400; color: #8592a6; margin-top: 3px; }
   .notice .en { display: block; margin-top: 4px; color: #8a7440; }
 
   /* iOS cannot hide its chrome for a web page, and 添加到主屏幕 is the only way
@@ -314,9 +323,14 @@
       <span class="en">This page ships no game data. Use your own legally obtained APK; it stays in
       your browser's IndexedDB and is never uploaded.</span>
     </p>
+    <p class="source">
+      <a href="https://github.com/suchangv/Inotia3-wasm">
+        github.com/suchangv/Inotia3-wasm <span aria-hidden="true">↗</span>
+      </a>
+      <span class="en">源码 / Source code — the page, the interpreter and the build.</span>
+    </p>
     <p>
-      移植与逆向：<a href="https://github.com/MetalSyntax/Inotia3-vita">Inotia3-vita</a>（PS Vita 原生版）·
-      源码：<a href="https://github.com/suchangv/Inotia3-wasm">Inotia3-wasm</a>
+      移植与逆向：<a href="https://github.com/MetalSyntax/Inotia3-vita">Inotia3-vita</a>（PS Vita 原生版）
     </p>
     <p>
       正确性对照：<a href="https://github.com/unicorn-engine/unicorn">unicorn-engine</a>（逐指令差分）·
