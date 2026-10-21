@@ -28,8 +28,12 @@ ROOT=$(pwd)
 SDL="$ROOT/vendor/SDL2"
 VER=2.30.9
 TARGET=${1:-native}
-DRM_H=${SYSROOT_DRM_H:-/usr/include}
-DRM_LIB=${SYSROOT_DRM_LIB:-/usr/lib/aarch64-linux-gnu}
+# tools/fetch-deps.sh puts every cross dependency in vendor/deps: headers from
+# the vendor packages plus GL/EGL in their own directory (so the host's libc
+# headers are never on the include path).
+DEPS="$ROOT/vendor/deps"
+DRM_H=${SYSROOT_DRM_H:-$DEPS/usr/include}
+DRM_LIB=${SYSROOT_DRM_LIB:-$DEPS/usr/lib/aarch64-linux-gnu}
 # AARCH64_SYSROOT: build the handheld binary against an *older* glibc than the
 # host's. PortMaster firmware ships whatever glibc its distro froze years ago,
 # and a binary linked against this Debian's 2.41 dies with "GLIBC_2.34 not
@@ -40,10 +44,10 @@ SYSROOT=${AARCH64_SYSROOT:-}
 # port both compile against them. Copy the host's (they are arch-independent
 # declarations) into one directory and point this at it:
 #   mkdir -p /tmp/gl && cp -r /usr/include/{GL,GLES,GLES2,GLES3,EGL,KHR} /tmp/gl/
-GLINC=${AARCH64_GL_INC:-}
-# Optional: an extracted aarch64 libasound2-dev, so SDL2 has an audio backend.
-ALSA_INC=${ALSA_INCLUDE_DIR:-}
-ALSA_LIB=${ALSA_LIBRARY:-}
+GLINC=${AARCH64_GL_INC:-$DEPS/gl-include}
+# An aarch64 libasound2-dev, so SDL2 has an audio backend.
+ALSA_INC=${ALSA_INCLUDE_DIR:-$DEPS/usr/include}
+ALSA_LIB=${ALSA_LIBRARY:-$DEPS/usr/lib/aarch64-linux-gnu/libasound.so}
 
 mkdir -p "$ROOT/vendor"
 if [ ! -d "$SDL" ]; then
@@ -79,6 +83,31 @@ aarch64)
         "${DRM_H%/include}" "$DRM_H" > "$ROOT/vendor/pkgconfig/libdrm.pc"
     printf 'prefix=%s\nincludedir=%s\n\nName: gbm\nDescription: gbm\nVersion: 22.3\nCflags: -I${includedir}\nLibs: -lgbm\n' \
         "${DRM_H%/include}" "$DRM_H" > "$ROOT/vendor/pkgconfig/gbm.pc"
+    # Wayland: the CFW on this handheld runs weston, so KMSDRM is refused
+    # (weston holds DRM master) and wayland is the only video backend that can
+    # work. SDL2 needs four pkg-config modules it does not bundle; wayland-egl
+    # and wayland-cursor come from the runtime package, and the generated
+    # protocols come from SDL's own wayland-protocols/ directory, so only
+    # wayland-scanner (a host program) and the headers are needed.
+    #
+    #   curl -O .../libwayland-dev_1.21.0-1_arm64.deb        (headers, .pc)
+    #   curl -O .../libwayland-{client,cursor,egl}*_arm64.deb (the .so files)
+    #   curl -O .../libxkbcommon-dev_1.5.0-1_arm64.deb        (headers, .pc)
+    #   curl -O .../libxkbcommon0_1.5.0-1_arm64.deb
+    #   dpkg-deb -x <each> /tmp/wayland-arm64
+    #   WAYLAND_ROOT=/tmp/wayland-arm64 tools/build_sdl2.sh aarch64
+    WL=${WAYLAND_ROOT:-}
+    [ -z "$WL" ] && [ -f "$DEPS/usr/include/wayland-client.h" ] && WL=$DEPS
+    if [ -n "$WL" ]; then
+        # EGL comes from the header-only directory: never /usr/include.
+        printf 'prefix=%s\nincludedir=%s\n\nName: egl\nDescription: EGL\nVersion: 1.5\nCflags: -I${includedir}\nLibs: -lEGL\n' \
+            "$ROOT/vendor/deps" "${GLINC:-/usr/include}" > "$ROOT/vendor/pkgconfig/egl.pc"
+        for mod in wayland-client wayland-egl wayland-cursor xkbcommon; do
+            printf 'prefix=%s\nincludedir=%s\nlibdir=%s\n\nName: %s\nDescription: %s\nVersion: 1.21.0\nCflags: -I${includedir}\nLibs: -L${libdir} -l%s\n' \
+                "$WL/usr" "$WL/usr/include" "$WL/usr/lib/aarch64-linux-gnu" \
+                "$mod" "$mod" "$mod" > "$ROOT/vendor/pkgconfig/$mod.pc"
+        done
+    fi
     PKG_CONFIG_PATH="$ROOT/vendor/pkgconfig:$PKG_CONFIG_PATH"
     export PKG_CONFIG_PATH
     # A symlink is enough for the linker; the device only needs libdrm.so.2.
@@ -93,7 +122,8 @@ aarch64)
         -DCMAKE_EXE_LINKER_FLAGS="$SYSFLAGS -L$ROOT/vendor/sysroot-aarch64/lib" \
         -DCMAKE_SHARED_LINKER_FLAGS="$SYSFLAGS -L$ROOT/vendor/sysroot-aarch64/lib" \
         -DSDL_STATIC=OFF -DSDL_SHARED=ON -DSDL_TEST=OFF \
-        -DSDL_X11=OFF -DSDL_WAYLAND=OFF -DSDL_KMSDRM=ON \
+        -DSDL_X11=OFF -DSDL_WAYLAND=$([ -n "$WL" ] && echo ON || echo OFF) \
+        -DSDL_WAYLAND_SHARED=ON -DSDL_WAYLAND_LIBDECOR=OFF -DSDL_KMSDRM=ON \
         -DSDL_VULKAN=OFF -DSDL_ALSA=ON -DSDL_PULSEAUDIO=OFF \
         -DSDL_JACK=OFF -DSDL_PIPEWIRE=OFF \
         ${ALSA_INC:+-DALSA_INCLUDE_DIR=$ALSA_INC} \

@@ -127,6 +127,7 @@ void *host_gl_proc(const char *name);
  */
 #ifdef SPIKE_SDL
 int  host_sdl_init(void);
+int  host_sdl_vdprobe(void);   /* --vdprobe: ask every video driver why */
 void host_sdl_finish(void);
 /* Process events, waiting up to `timeout_ms` for one. Returns 0 to quit. */
 int  host_sdl_pump(int timeout_ms);

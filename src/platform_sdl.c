@@ -385,6 +385,76 @@ static struct {
     int down;                  /* button held */
 } cur = { CONTENT_W / 2.0f, CONTENT_H / 2.0f, 1, 0, 0 };
 
+/* ---- video driver probe --------------------------------------------------
+ * "sdl: video driver offscreen" on the device, with no explanation, is one
+ * round trip that a log can save: SDL falls back silently when a driver's init
+ * fails, so the reason it *refused* KMSDRM never reaches the log. Ask each
+ * driver directly and print its own error.
+ *
+ *   ./inotia3 --vdprobe
+ *
+ * Harmless everywhere: it opens and closes the video subsystem once per driver
+ * and never starts the engine.
+ */
+int host_sdl_vdprobe(void)
+{
+    /* Unbuffered: when a driver's GL path takes the process down, everything
+     * printed up to that point must already be in the log. */
+    setvbuf(stdout, NULL, _IONBF, 0);
+
+    int n = SDL_GetNumVideoDrivers();
+    printf("video drivers: %d\n", n);
+    for (int i = 0; i < n; i++)
+        printf("  [%d] %s\n", i, SDL_GetVideoDriver(i));
+    printf("env: XDG_RUNTIME_DIR=%s WAYLAND_DISPLAY=%s DISPLAY=%s\n",
+           getenv("XDG_RUNTIME_DIR") ? getenv("XDG_RUNTIME_DIR") : "(unset)",
+           getenv("WAYLAND_DISPLAY") ? getenv("WAYLAND_DISPLAY") : "(unset)",
+           getenv("DISPLAY") ? getenv("DISPLAY") : "(unset)");
+
+    for (int i = 0; i < n; i++) {
+        const char *name = SDL_GetVideoDriver(i);
+        if (SDL_VideoInit(name) != 0) {
+            printf("%-9s init FAILED: %s\n", name, SDL_GetError());
+            continue;
+        }
+        SDL_DisplayMode dm;
+        if (SDL_GetDesktopDisplayMode(0, &dm) != 0)
+            dm.w = dm.h = 0;
+        printf("%-9s init ok (active=%s) desktop %dx%d, %d display(s)\n",
+               name, SDL_GetCurrentVideoDriver(), dm.w, dm.h,
+               SDL_GetNumVideoDisplays());
+
+        /* A window and a GL context are the two things that actually fail on
+         * a handheld: weston holding DRM master shows up here, not in init.
+         * Everything is torn down between drivers so one driver's leftovers
+         * cannot poison the next report. */
+        SDL_Window *w = SDL_CreateWindow(
+            "probe", SDL_WINDOWPOS_CENTERED, SDL_WINDOWPOS_CENTERED,
+            320, 240, SDL_WINDOW_OPENGL | SDL_WINDOW_HIDDEN);
+        if (!w) {
+            printf("%-9s   window FAILED: %s\n", name, SDL_GetError());
+        } else {
+            SDL_GL_SetAttribute(SDL_GL_CONTEXT_PROFILE_MASK,
+                                SDL_GL_CONTEXT_PROFILE_ES);
+            SDL_GL_SetAttribute(SDL_GL_CONTEXT_MAJOR_VERSION, 2);
+            SDL_GL_SetAttribute(SDL_GL_CONTEXT_MINOR_VERSION, 0);
+            SDL_GLContext ctx = SDL_GL_CreateContext(w);
+            if (!ctx) {
+                printf("%-9s   window ok, GL FAILED: %s\n", name,
+                       SDL_GetError());
+            } else {
+                /* No glGetString: this binary has gl4es linked in and its
+                 * strings go through gl4es' own init. The real run logs them. */
+                printf("%-9s   window ok, GL context created\n", name);
+                SDL_GL_DeleteContext(ctx);
+            }
+            SDL_DestroyWindow(w);
+        }
+        SDL_VideoQuit();
+    }
+    return 0;
+}
+
 /* ---- start-up ------------------------------------------------------------ */
 
 int host_sdl_init(void)
@@ -393,8 +463,19 @@ int host_sdl_init(void)
         host_log("sdl: init failed: %s\n", SDL_GetError());
         return 1;
     }
+    const char *drv = SDL_GetCurrentVideoDriver();
     host_log("sdl: video driver %s, %d joystick(s)\n",
-             SDL_GetCurrentVideoDriver(), SDL_NumJoysticks());
+             drv, SDL_NumJoysticks());
+    host_log("sdl: XDG_RUNTIME_DIR=%s WAYLAND_DISPLAY=%s\n",
+             getenv("XDG_RUNTIME_DIR") ? getenv("XDG_RUNTIME_DIR") : "(unset)",
+             getenv("WAYLAND_DISPLAY") ? getenv("WAYLAND_DISPLAY") : "(unset)");
+    /* SDL falls back to a headless driver without saying why the real ones
+     * refused. Say it here, once, instead of making the next log reader guess. */
+    if (drv && (strcmp(drv, "offscreen") == 0 || strcmp(drv, "dummy") == 0)) {
+        host_log("sdl: WARNING headless driver (%d available): "
+                 "rerun with --vdprobe to see why the others refused\n",
+                 SDL_GetNumVideoDrivers());
+    }
 
     Uint32 flags = SDL_WINDOW_OPENGL | SDL_WINDOW_ALLOW_HIGHDPI;
     if (!g_sdl_windowed)

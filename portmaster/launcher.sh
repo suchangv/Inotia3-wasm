@@ -171,6 +171,14 @@ export LD_LIBRARY_PATH
 # the log, which is the one thing we cannot otherwise see from the Ports menu.
 printf '%s\n' '--- loader check ---'
 ( LD_TRACE_LOADED_OBJECTS=1 "$ENGINE" ) 2>&1 | sed 's/^/    /'
+# The video stack, in one place. On this CFW weston owns the display, so the
+# question is always "is there a wayland socket, and can EGL be found".
+printf '%s\n' "wayland:  XDG_RUNTIME_DIR=${XDG_RUNTIME_DIR:-unset} WAYLAND_DISPLAY=${WAYLAND_DISPLAY:-unset}"
+printf '%s\n' "sockets:  $(ls "${XDG_RUNTIME_DIR:-/run/user/0}" 2>/dev/null | tr '\n' ' ')"
+printf '%s\n' "dri:      $(ls /dev/dri 2>/dev/null | tr '\n' ' ')"
+printf '%s\n' "gl:       $(ls /usr/lib/libEGL* /usr/lib/libGLES* /usr/lib/libmali* /usr/lib/libwayland* 2>/dev/null | tr '\n' ' ')"
+printf '%s\n' "--- video driver probe ---"
+"$ENGINE" --vdprobe 2>&1 | sed 's/^/    /'
 printf '%s\n' '--- files ---'
 ls -l "$ENGINE" libs/libSDL2-2.0.so.0 2>&1
 

@@ -188,6 +188,11 @@ build_sdl() {
 # The same for the handheld: aarch64, statically linked against gl4es, SDL2 from
 # libs/ next to the binary (see tools/build-portmaster.sh).
 build_handheld() {
+    # SDL2 carries a NEEDED on libasound.so.2, so the link needs an aarch64
+    # libasound to resolve against (tools/fetch-deps.sh provides one).
+    if [ -z "${AARCH64_LINK_LIBS:-}" ] && [ -f "$(pwd)/vendor/deps/usr/lib/aarch64-linux-gnu/libasound.so" ]; then
+        AARCH64_LINK_LIBS="$(pwd)/vendor/deps/usr/lib/aarch64-linux-gnu/libasound.so"
+    fi
     echo "== handheld (aarch64) =="
     CC=${CROSS_CC:-aarch64-linux-gnu-gcc}
     # See tools/build_sdl2.sh: AARCH64_SYSROOT pins the glibc the binary is

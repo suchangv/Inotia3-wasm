@@ -1588,6 +1588,8 @@ static int spike_sdl_run(int argc, char **argv)
             so = argv[i] + 5;
         else if (strcmp(argv[i], "--windowed") == 0)
             g_sdl_windowed = 1;
+        else if (strcmp(argv[i], "--vdprobe") == 0)
+            return host_sdl_vdprobe();
         else if (strncmp(argv[i], "--frames=", 9) == 0)
             g_sdl_frames = atoi(argv[i] + 9);
         else if (strncmp(argv[i], "--cursor=", 9) == 0) {
