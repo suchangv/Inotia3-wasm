@@ -138,6 +138,7 @@ void host_sdl_begin_frame(void);
 void host_sdl_present(void);
 
 extern int  g_sdl_windowed;        /* --windowed: 960x544 window */
+extern int  g_sdl_no_hooks;        /* --no-hooks: interpreter does the divides */
 extern int  g_sdl_frames;          /* --frames=N: stop after N engine frames */
 extern const char *g_sdl_shot;     /* --shot=FILE: write a PPM */
 extern int  g_sdl_shot_frame;      /* presented frames to wait before the shot */

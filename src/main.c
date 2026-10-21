@@ -22,6 +22,7 @@
 #include "guest.h"
 #include "elf.h"
 #include "cpu.h"
+#include "host_hooks.h"
 #include "imports.h"
 #include "compat.h"
 #include "platform.h"
@@ -133,13 +134,45 @@ static void spike_finish(void);
 static uint32_t spike_call1(uint32_t fn, uint32_t a0);
 static void spike_dispatch_event(int type, int p1, int p2, int touch_count);
 
+/* Scripted taps have to be *held* for a frame or two: the engine samples touch
+ * state per frame, and a DOWN and an UP in the same tick is a click it can
+ * legitimately never see (the first version of --tap did exactly that and the
+ * menus ignored it). */
+static int g_tap_up_at = -1;
+
 static void spike_scripted_taps(void)
 {
+    if (g_tap_up_at >= 0 && g_frames_done >= g_tap_up_at) {
+        int x = g_taps[g_tap_next - 1].x, y = g_taps[g_tap_next - 1].y;
+#ifdef SPIKE_SDL
+        /* The SDL host feeds the engine through input.c's FIFO, not through the
+         * JNI event path the oracle uses; a scripted tap has to use the same
+         * channel a finger does or it is simply never seen. */
+        input_push_up(0, x, y, host_now() * 1000.0);
+#else
+        spike_dispatch_event(INPUT_UP, 1, (x << 16) | y, 1);
+#endif
+        g_tap_up_at = -1;
+    }
+#ifdef SPIKE_SDL
+    /* Move first, two frames early: the engine caches the touch position and a
+     * DOWN without a preceding MOVE lands wherever the last move was (the
+     * centre), which is why a same-frame move+down never pressed a button. */
+    if (g_tap_next < g_ntaps &&
+        g_frames_done + 2 == g_taps[g_tap_next].frame)
+        input_push_move(0, g_taps[g_tap_next].x, g_taps[g_tap_next].y,
+                        host_now() * 1000.0);
+#endif
     while (g_tap_next < g_ntaps && g_taps[g_tap_next].frame <= g_frames_done) {
         int x = g_taps[g_tap_next].x, y = g_taps[g_tap_next].y;
         host_log("  [tap] frame %d at device (%d,%d)\n", g_frames_done, x, y);
+#ifdef SPIKE_SDL
+        input_push_move(0, x, y, host_now() * 1000.0);
+        input_push_down(0, x, y, host_now() * 1000.0);
+#else
         spike_dispatch_event(INPUT_DOWN, 1, (x << 16) | y, 1);
-        spike_dispatch_event(INPUT_UP,   1, (x << 16) | y, 1);
+#endif
+        g_tap_up_at = g_frames_done + 3;
         g_tap_next++;
     }
 }
@@ -1596,6 +1629,8 @@ static int spike_sdl_run(int argc, char **argv)
             g_sdl_windowed = 1;
         else if (strncmp(argv[i], "--rotate=", 9) == 0)
             host_sdl_set_rotation(atoi(argv[i] + 9));
+        else if (strcmp(argv[i], "--no-hooks") == 0)
+            g_sdl_no_hooks = 1;
         else if (strcmp(argv[i], "--vdprobe") == 0)
             return host_sdl_vdprobe();
         else if (strncmp(argv[i], "--frames=", 9) == 0)
@@ -1647,6 +1682,11 @@ static int spike_sdl_run(int argc, char **argv)
         host_sdl_finish();
         return 1;
     }
+    /* Replace the guest's libgcc division helpers with host arithmetic: they
+     * are half the instructions in a frame (see host_hooks.h). --no-hooks
+     * exists so the hooked and unhooked builds can be compared. */
+    if (!g_sdl_no_hooks)
+        host_hooks_install(&g_img);
     g_budget = 3000u * 1000u * 1000u;
     cpu_profile_clear();          /* report on the frame loop, not on the boot */
     /* Profiling costs a counter bump per guest instruction (~2-5%), so the game

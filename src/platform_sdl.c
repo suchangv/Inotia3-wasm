@@ -89,6 +89,7 @@ static int g_gl_inited;
 
 /* Command line (parsed in main.c and handed over). */
 int  g_sdl_windowed;          /* windowed instead of fullscreen-desktop */
+int  g_sdl_no_hooks;          /* --no-hooks: leave the guest's libgcc alone */
 int  g_sdl_frames;            /* stop after N engine frames, 0 = forever */
 const char *g_sdl_shot;       /* write a PPM once this is set */
 int  g_sdl_shot_frame;
@@ -715,6 +716,8 @@ int host_sdl_init(void)
 void host_sdl_finish(void)
 {
     if (getenv("SPIKE_DEBUG")) {
+        extern void host_hooks_report(void);
+        host_hooks_report();
         /* Where the interpreter's time went, by guest function: the frame
          * lines say how many instructions per frame, this says whose. */
         extern void spike_report_profile(int n);

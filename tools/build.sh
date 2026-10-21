@@ -35,7 +35,7 @@ find_wasm_ld() {
     return 1
 }
 
-COMMON="src/util.c src/elf_loader.c src/cpu.c src/imports.c src/host_libc.c src/jni.c src/gl.c src/patches.c src/timers.c src/asset_zip.c src/input.c src/text.c src/sound.c"
+COMMON="src/util.c src/elf_loader.c src/cpu.c src/host_hooks.c src/imports.c src/host_libc.c src/jni.c src/gl.c src/patches.c src/timers.c src/asset_zip.c src/input.c src/text.c src/sound.c"
 COMMON_BROWSER="$COMMON"
 
 build_native() {

@@ -20,6 +20,7 @@
  */
 
 #include "cpu.h"
+#include "host_hooks.h"
 #include "guest.h"
 #include "imports.h"
 #include "compat.h"
@@ -842,6 +843,18 @@ int cpu_run(uint32_t entry, uint32_t sp, uint64_t budget)
                         prof_transfer(pc);
                         continue;
                     }
+                    /* Not in the stub page: the host patched a guest
+                     * function's entry (host_hooks.c). Answer it and return
+                     * through LR, the same way an import does. */
+                    if (host_hook_dispatch(ins & 0xFF)) {
+                        g_have_prev = 0;
+                        val = R[14];
+                        g_thumb = (val & 1) != 0;
+                        pc = val & ~1u;
+                        R[15] = pc;
+                        prof_transfer(pc);
+                        continue;
+                    }
                     return HALT_HALTED;
                 } else {
                     return trap(pc, ins, 2);
@@ -1041,6 +1054,23 @@ int cpu_run(uint32_t entry, uint32_t sp, uint64_t budget)
              * plus 8; the PLT relies on this to find its GOT base, so it is
              * set here and every operand read below just uses R[15]. */
             R[15] = next + 4;
+
+            /* BKPT in ARM state, placed by the host at a guest function entry
+             * (host_hooks.c). The index lives in imm12 so a patched function
+             * needs no stub: the first instruction is replaced and the return
+             * goes through LR like an import. */
+            if ((ins & 0x0FF000F0u) == 0x01200070u) {
+                if (host_hook_dispatch((int)((ins >> 8) & 0xFFFu))) {
+                    g_have_prev = 0;
+                    uint32_t ret = R[14];
+                    g_thumb = (ret & 1u) != 0;
+                    pc = ret & ~1u;
+                    R[15] = pc;
+                    prof_transfer(pc);
+                    continue;
+                }
+                return HALT_HALTED;
+            }
 
             uint32_t cond = ins >> 28;
             if (cond == 0xf) {
