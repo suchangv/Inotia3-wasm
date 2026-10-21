@@ -254,8 +254,7 @@
       没有 APK？<a href="https://www.bing.com/search?q=inotia3+apk" target="_blank"
       rel="noopener noreferrer">在 Bing 搜索 “inotia3 apk”</a><br>
       <span class="en">No APK yet? <a href="https://www.bing.com/search?q=inotia3+apk"
-      target="_blank" rel="noopener noreferrer">Search Bing for “inotia3 apk”</a>. The page
-      hosts none; download it from wherever you got the game.</span>
+      target="_blank" rel="noopener noreferrer">Search Bing for “inotia3 apk”</a>.</span>
     </p>
   </footer>
 </div>
@@ -308,11 +307,16 @@ window.Module = {
     if (n > 1024 * 1024) return (n / 1048576).toFixed(1) + ' MB';
     return Math.round(n / 1024) + ' KB';
   }
-  function renderMeta() {
+  /* `ready` is the authority on whether an APK is loaded, not the size we
+   * happen to know: a module that cannot report sizes (older cached build) used
+   * to leave the page saying "APK 已就绪" above "未导入", which is worse than
+   * saying nothing about the size. */
+  function renderMeta(hasApk) {
     var rows = [
-      ['APK 文件 / APK', facts.apk ? kb(facts.apk) : '未导入 / not imported',
-       facts.apk ? '<button id="btn-clear" type="button" class="clear">清除 / Clear</button>' : ''],
-      ['引擎镜像 / libgame.so', facts.so ? kb(facts.so) : '—', ''],
+      ['APK 文件 / APK',
+       facts.apk ? kb(facts.apk) : (hasApk ? '已导入 / imported' : '未导入 / not imported'),
+       hasApk ? '<button id="btn-clear" type="button" class="clear">清除 / Clear</button>' : ''],
+      ['引擎镜像 / libgame.so', facts.so ? kb(facts.so) : (hasApk ? '已导入 / imported' : '—'), ''],
       ['存档 / Saves', facts.saves ? facts.saves + ' 个文件 / files' : '—', '']
     ];
     metaEl.innerHTML = rows.map(function (r) {
@@ -332,7 +336,7 @@ window.Module = {
     try {
       await api.clearApk();
       facts.apk = 0; facts.so = 0;
-      renderMeta();
+      renderMeta(false);
       say('已清除 APK，可以重新导入。<b>存档未受影响。</b>',
           'APK cleared, ready for another import. <b>Saves untouched.</b>', 'ok');
     } catch (e) {
@@ -368,7 +372,7 @@ window.Module = {
         var info = api.info();
         facts.apk = info.apk; facts.so = info.so;
       } catch (e) { /* older module: keep whatever we know */ }
-      renderMeta();
+      renderMeta(true);
     }
   }
 
@@ -376,7 +380,7 @@ window.Module = {
     api = window.Module && window.Module.spike;
     if (!api) { setTimeout(boot, 60); return; }
     api.onState(applyState);
-    renderMeta();
+    renderMeta(api.state && (api.state() === 'ready' || api.state() === 'running'));
   }
 
   async function readFile(input) {
@@ -393,7 +397,7 @@ window.Module = {
       if (!f) return;
       var r = await api.importApk(f.buf);
       facts.apk = r.apk; facts.so = r.so;
-      renderMeta();
+      renderMeta(true);
       say('已导入（' + kb(r.apk) + '），引擎镜像 ' + kb(r.so) +
           '。下次打开直接从浏览器缓存读取。',
           'Imported (' + kb(r.apk) + '), image ' + kb(r.so) +
@@ -483,7 +487,7 @@ window.Module = {
       say('正在打包 /data…', 'Packing /data…');
       api.flush();
       var r = await api.exportSaves();
-      facts.saves = r.files; renderMeta();
+      facts.saves = r.files; renderMeta(true);
       var d = new Date(), pad = function (n) { return (n < 10 ? '0' : '') + n; };
       var name = 'inotia3-saves-' + d.getFullYear() + pad(d.getMonth() + 1) + pad(d.getDate()) +
                  '-' + pad(d.getHours()) + pad(d.getMinutes()) + '.zip';
@@ -506,7 +510,7 @@ window.Module = {
       var f = await readFile(fileSaves);
       if (!f) return;
       var r = await api.importSaves(f.buf);
-      facts.saves = r.files; renderMeta();
+      facts.saves = r.files; renderMeta(true);
       say('已导入 ' + r.files + ' 个文件到 /data，已持久化。<b>刷新页面</b>后游戏内即可看到。',
           'Imported ' + r.files + ' files into /data and persisted them. <b>Reload</b> to see them in game.', 'ok');
     } catch (e) {

@@ -9,7 +9,7 @@
 // (APK, and /data through IDBFS), are large, and must never be duplicated into
 // the Cache API where a version bump would silently drop them.
 
-const VERSION = 'inotia3-wasm-v4';
+const VERSION = 'inotia3-wasm-v5';
 const SHELL = [
   './',
   './index.html',
@@ -61,6 +61,29 @@ self.addEventListener('fetch', (e) => {
       } catch (err) {
         return (await caches.match('./index.html')) || (await caches.match('./')) ||
                Response.error();
+      }
+    })());
+    return;
+  }
+
+  // The module itself is network-first. It is the one asset whose stale copy
+  // produces a page that half works -- the HTML is updated by the navigation
+  // path above, so a cached module leaves the two out of step and the symptom is
+  // a contradiction in the UI rather than an error. The browser's own HTTP cache
+  // absorbs the cost of asking.
+  const isModule = url.pathname.endsWith('/inotia3.js') ||
+                   url.pathname.endsWith('/inotia3.wasm');
+  if (isModule) {
+    e.respondWith((async () => {
+      try {
+        const fresh = await fetch(req);
+        if (fresh.ok) {
+          const cache = await caches.open(VERSION);
+          cache.put(req, fresh.clone());
+        }
+        return fresh;
+      } catch (err) {
+        return (await caches.match(req)) || Response.error();
       }
     })());
     return;
