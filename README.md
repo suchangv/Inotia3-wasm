@@ -1,3 +1,7 @@
+<p align="right">
+  <a href="https://suchangv.github.io/inotia3-wasm/"><b>▶ 在浏览器里试玩 · Play in the browser</b></a>
+</p>
+
 # Inotia 3 → WebAssembly
 
 Running the Android build of Inotia 3 in a browser, by executing its original ARM
@@ -30,6 +34,7 @@ the translation is worth building.
 ## Layout
 
 ```
+web/               the published page (index.html, sw.js, manifest, icons)
 src/
   guest.h          fixed guest address space (144 MB, one flat buffer)
   elf.h/.c         ELF32/ARM reader, relocation, symbol index
@@ -38,7 +43,7 @@ src/
   host_libc.c      bionic shims + the guest heap allocator
   platform_*.c     host services (native now, browser later)
   main.c           the spike runner
-tools/build.sh     native and wasm32 builds
+tools/build.sh     native, wasm32, browser (dev) and web (published) builds
 ```
 
 ### Two design choices worth knowing
@@ -86,6 +91,19 @@ default and is a measurement tool, not a setting -- see
 [docs/PERFORMANCE.md](docs/PERFORMANCE.md). In the browser the same knob is
 `?framems=N`, and `?fixed=1` forces the deterministic 16 ms tick that headless
 verification uses.
+
+## The web page
+
+[**suchangv.github.io/inotia3-wasm**](https://suchangv.github.io/inotia3-wasm/) is
+this port running as a static page. It ships **no game data**: the player imports
+their own APK once, the page keeps it in IndexedDB and boots the engine from it,
+and saves can be exported and imported as zip files.
+
+`web/` holds it — `index.html` (the page), `sw.js` + `manifest.webmanifest` +
+`icons/` (installable, offline-capable shell). `tools/build.sh web` produces the
+two files the page loads (`inotia3.js`, `inotia3.wasm`) with no `--preload-file`,
+which is what makes a public build possible at all; `tools/build.sh browser` is
+the same host with the game preloaded, for development.
 
 ## Game files are not in this repository
 
