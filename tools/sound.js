@@ -28,7 +28,18 @@
  * `$`-prefixed names are the documented way to share a helper between library
  * functions, and each function that uses it lists it in __deps.
  */
+/* Exposed for the page (web/index.html) rather than for C: iOS only lifts its
+ * audio-session restriction for a resume that happens inside a gesture, and the
+ * gesture is a DOM event the engine never sees. A __postset is used instead of a
+ * C-called import because emscripten drops library functions nothing references
+ * -- the first attempt at this silently raised ReferenceError inside its own
+ * try/catch and the page was simply silent. */
 mergeInto(LibraryManager.library, {
+    $PAudio__postset: [
+        "Module['spikeAudioPrime'] = function () { return PAudio.ensure() ? 1 : 0; };",
+        "Module['spikeAudioUnlock'] = function () { return PAudio.unlock(); };"
+    ].join(''),
+
     $PAudio: {
         ctx: null,
         slots: [],          /* handle (from sound.c) -> slot */
@@ -86,6 +97,67 @@ mergeInto(LibraryManager.library, {
             }
         },
 
+        /* Bookkeeping for a decoded buffer, whichever decoder produced it. */
+        accept: function (slot, buf) {
+            slot.buffer = buf;
+            slot.decoding = false;
+            PAudio.pcm += buf.length * 4;
+            PAudio.note(slot.id);
+            PAudio.evict(slot.id);
+            if (PAudio.decoded < 8 || PAudio.decoded % 25 === 24) {
+                console.log('[snd] decoded ' + slot.name + ' ' +
+                            buf.duration.toFixed(2) + 's ' +
+                            buf.sampleRate + 'Hz  pcm=' +
+                            Math.round(PAudio.pcm / 1048576) + 'MB');
+            }
+            PAudio.decoded++;
+            if (slot.want) { slot.want = false; PAudio.start(slot); }
+        },
+
+        /* The browser could not decode it, which on Safari means Vorbis. Hand
+         * the bytes to the page's separate decoder module (web/vorbis.js) if it
+         * installed one. Absent, unmounted or failing, this stays silent -- by
+         * design: the game must not depend on it. */
+        decodeWithPage: function (slot, ctx, err) {
+            var hook = (typeof Module !== 'undefined' && Module) ? Module['spikeVorbisDecode'] : null;
+            function fail(why) {
+                slot.decoding = false;
+                if ((PAudio.failures = (PAudio.failures || 0) + 1) <= 6)
+                    console.warn('[snd] decode failed: ' + slot.name + ': ' + why);
+            }
+            if (!hook) { fail(err && err.message ? err.message : err); return; }
+            Promise.resolve().then(function () {
+                return hook(slot.bytes);
+            }).then(function (r) {
+                var buf = ctx.createBuffer(r.channels, r.frames, r.rate);
+                for (var c = 0; c < r.channels; c++) buf.copyToChannel(r.pcm[c], c);
+                if (!PAudio.vorbis_fallback) {
+                    PAudio.vorbis_fallback = true;
+                    console.log('[snd] decodeAudioData has no Vorbis here; using web/vorbis.js');
+                }
+                PAudio.accept(slot, buf);
+            }).catch(function (e) {
+                fail(e && e.message ? e.message : e);
+            });
+        },
+
+        /* Resume the context and kick the audio session awake. iOS only grants
+         * this inside a user gesture -- the page calls the exported wrapper from
+         * the start click and from pointerdown. */
+        unlock: function () {
+            var ctx = PAudio.ensure();
+            if (!ctx) return 0;
+            try {
+                if (ctx.state === 'suspended' && ctx.resume) ctx.resume();
+                var b = ctx.createBuffer(1, 1, ctx.sampleRate || 44100);
+                var src = ctx.createBufferSource();
+                src.buffer = b;
+                src.connect(ctx.destination);
+                src.start(0);
+            } catch (e) { /* already running */ }
+            return 1;
+        },
+
         decode: function (slot) {
             if (slot.buffer || slot.decoding || !slot.bytes) return;
             var ctx = PAudio.ensure();
@@ -99,27 +171,8 @@ mergeInto(LibraryManager.library, {
              * silent for the rest of the session. A copy is a few hundred KB,
              * once per play that follows an eviction. */
             ctx.decodeAudioData(slot.bytes.slice().buffer,
-                function (buf) {
-                    slot.buffer = buf;
-                    slot.decoding = false;
-                    PAudio.pcm += buf.length * 4;
-                    PAudio.note(slot.id);
-                    PAudio.evict(slot.id);
-                    if (PAudio.decoded < 8 || PAudio.decoded % 25 === 24) {
-                        console.log('[snd] decoded ' + slot.name + ' ' +
-                                    buf.duration.toFixed(2) + 's ' +
-                                    buf.sampleRate + 'Hz  pcm=' +
-                                    Math.round(PAudio.pcm / 1048576) + 'MB');
-                    }
-                    PAudio.decoded++;
-                    if (slot.want) { slot.want = false; PAudio.start(slot); }
-                },
-                function (err) {
-                    slot.decoding = false;
-                    if ((PAudio.failures = (PAudio.failures || 0) + 1) <= 6)
-                        console.warn('[snd] decode failed: ' + slot.name + ': ' +
-                                     (err && err.message ? err.message : err));
-                });
+                function (buf) { PAudio.accept(slot, buf); },
+                function (err) { PAudio.decodeWithPage(slot, ctx, err); });
         },
 
         stopSource: function (slot) {

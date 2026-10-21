@@ -100,7 +100,10 @@ their own APK once, the page keeps it in IndexedDB and boots the engine from it,
 and saves can be exported and imported as zip files.
 
 `web/` holds it — `index.html` (the page), `sw.js` + `manifest.webmanifest` +
-`icons/` (installable, offline-capable shell). `tools/build.sh web` produces the
+`icons/` (installable, offline-capable shell), and `vorbis.js` + `vorbis.wasm`
+(the Ogg Vorbis decoder Safari does not have, fetched only after the browser's
+own decoder refuses a sound — built by `tools/build_vorbis.sh`, kept out of
+`inotia3.wasm` on purpose: see `src/vorbis_wasm.c`). `tools/build.sh web` produces the
 two files the page loads (`inotia3.js`, `inotia3.wasm`) with no `--preload-file`,
 which is what makes a public build possible at all; `tools/build.sh browser` is
 the same host with the game preloaded, for development.

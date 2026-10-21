@@ -300,6 +300,9 @@ window.Module = {
 };
 </script>
 <script src="inotia3.js"></script>
+<!-- Separate wasm module, fetched only if the browser cannot decode Vorbis.
+     Deliberately outside inotia3.wasm: see web/vorbis.js. -->
+<script src="vorbis.js"></script>
 
 <script>
 (function () {
@@ -474,6 +477,12 @@ window.Module = {
   btnStart.onclick = function () {
     if (api.state() !== 'ready') return;          // greyed out without an APK
 
+    // Inside the gesture, which is the only place iOS lets the audio session be
+    // unlocked. Best effort: if the module has no audio, this is a no-op.
+    try {
+      if (window.Module && Module.spikeAudioUnlock) Module.spikeAudioUnlock();
+    } catch (e) { /* no WebAudio: silent */ }
+
     stageEl.hidden = false;
     immersiveOn();
     try {
@@ -528,6 +537,15 @@ window.Module = {
   /* Anything that escapes a handler lands here rather than only in the console:
    * "the game does not start" on a phone with no devtools open is otherwise a
    * black canvas and no way to report what happened. */
+  // iOS suspends the audio context when the app is backgrounded or a call comes
+  // in, and only a gesture may resume it -- so any touch may be the one that
+  // brings the sound back. A no-op once the context is running.
+  document.addEventListener('pointerdown', function () {
+    try {
+      if (window.Module && Module.spikeAudioUnlock) Module.spikeAudioUnlock();
+    } catch (e) { /* ignore */ }
+  }, { passive: true });
+
   window.addEventListener('error', function (e) {
     var msg = (e && (e.message || (e.error && e.error.message))) || 'unknown error';
     if (!window.__spikeBooted) say('启动失败：<b>' + msg + '</b>',
