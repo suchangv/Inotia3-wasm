@@ -1,0 +1,20 @@
+{
+  "name": "艾诺迪亚 3 · WebAssembly",
+  "short_name": "Inotia 3",
+  "description": "在浏览器里执行原版 Android libgame.so 的艾诺迪亚 3 移植（ARM 解释器 + gl4es）。游戏素材由使用者自备。",
+  "lang": "zh-CN",
+  "start_url": "./index.html",
+  "scope": "./",
+  "id": "./",
+  "display": "standalone",
+  "display_override": ["fullscreen", "standalone"],
+  "orientation": "landscape",
+  "background_color": "#f5f7fa",
+  "theme_color": "#f5f7fa",
+  "categories": ["games"],
+  "icons": [
+    { "src": "icons/icon-192.png", "sizes": "192x192", "type": "image/png", "purpose": "any" },
+    { "src": "icons/icon-512.png", "sizes": "512x512", "type": "image/png", "purpose": "any" },
+    { "src": "icons/icon-512-maskable.png", "sizes": "512x512", "type": "image/png", "purpose": "maskable" }
+  ]
+}

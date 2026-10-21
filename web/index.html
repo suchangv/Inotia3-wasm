@@ -4,6 +4,14 @@
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <meta name="color-scheme" content="light">
+<link rel="manifest" href="manifest.webmanifest">
+<meta name="theme-color" content="#f5f7fa">
+<link rel="icon" href="icons/icon-192.png" sizes="192x192" type="image/png">
+<link rel="apple-touch-icon" href="icons/apple-touch-icon.png">
+<meta name="apple-mobile-web-app-capable" content="yes">
+<meta name="apple-mobile-web-app-status-bar-style" content="default">
+<meta name="apple-mobile-web-app-title" content="Inotia 3">
+<meta name="mobile-web-app-capable" content="yes">
 <title>艾诺迪亚 3 · WebAssembly</title>
 <!--
   Deployed copy: suchangv.github.io/inotia3-wasm/index.html
@@ -97,6 +105,21 @@
   .hint { text-align: center; color: var(--ink-2); font-size: 13px; margin: 10px 0 0; }
   .hint .en { display: block; color: #8592a6; font-size: 12px; }
 
+  /* Fullscreen: 开始游戏 asks for it on the click, because that is the only
+   * moment a browser accepts the request. The canvas is letterboxed into the
+   * screen rather than stretched -- the engine renders 960x544 and its input
+   * mapping divides by the element's rect, so any distortion would also put the
+   * touch targets in the wrong place. */
+  .stage:fullscreen, .stage:-webkit-full-screen {
+    display: flex; align-items: center; justify-content: center;
+    background: #05070a; padding: 0; margin: 0; width: 100%; height: 100%;
+  }
+  .stage:fullscreen canvas, .stage:-webkit-full-screen canvas {
+    width: 100vw; height: 100vh; max-width: none; aspect-ratio: auto;
+    object-fit: contain; border: 0; border-radius: 0; box-shadow: none;
+  }
+  .stage:fullscreen .hint, .stage:-webkit-full-screen .hint { display: none; }
+
   footer {
     margin-top: 28px; padding-top: 18px; border-top: 1px solid var(--line);
     color: var(--ink-2); font-size: 13px;
@@ -107,35 +130,6 @@
   .notice { background: #fffdf5; border: 1px solid #f0e6c8; border-radius: 10px; padding: 10px 12px; }
   .notice b { color: var(--warn); }
   .notice .en { display: block; margin-top: 4px; color: #8a7440; }
-
-  /* toast ---------------------------------------------------------------- */
-  .toast {
-    position: fixed; left: 50%; bottom: 24px; z-index: 50;
-    max-width: min(580px, calc(100% - 28px));
-    background: #fff; border: 1px solid var(--line); border-radius: 12px;
-    box-shadow: 0 12px 32px rgba(16, 24, 40, .14);
-    padding: 14px 40px 14px 16px;
-    transform: translateX(-50%) translateY(10px); opacity: 0;
-    pointer-events: none; transition: opacity .18s ease, transform .18s ease;
-  }
-  .toast.show { opacity: 1; transform: translateX(-50%) translateY(0); pointer-events: auto; }
-  .toast .t-zh { font-weight: 600; margin-bottom: 2px; }
-  .toast .t-en { font-size: 12px; color: #8592a6; margin-bottom: 8px; }
-  .toast .t-body { color: var(--ink-2); font-size: 13px; display: flex; flex-wrap: wrap;
-                   gap: 8px; align-items: center; }
-  .toast .t-body .b-en { color: #8592a6; font-size: 12px; }
-  .toast a {
-    display: inline-block; color: var(--accent); font-weight: 600; text-decoration: none;
-    border: 1px solid #d5e2fd; background: #f4f8ff; border-radius: 8px;
-    padding: 5px 10px; font-size: 13px;
-  }
-  .toast a:hover { background: #eaf1fe; text-decoration: underline; }
-  .toast .t-close {
-    position: absolute; top: 6px; right: 8px; border: 0; background: none;
-    color: #98a3b3; font-size: 18px; line-height: 1; padding: 4px 6px; cursor: pointer;
-    border-radius: 6px;
-  }
-  .toast .t-close:hover { background: #f2f5fa; color: var(--ink); }
 
   @media (max-width: 560px) {
     body { padding: 24px 14px 48px; }
@@ -201,14 +195,14 @@
       正确性对照：<a href="https://github.com/unicorn-engine/unicorn">unicorn-engine</a>（逐指令差分）·
       GPU 转译：<a href="https://github.com/ptitSeb/gl4es">gl4es</a>
     </p>
+    <p>
+      没有 APK？<a href="https://www.bing.com/search?q=inotia3+apk" target="_blank"
+      rel="noopener noreferrer">在 Bing 搜索 “inotia3 apk”</a><br>
+      <span class="en">No APK yet? <a href="https://www.bing.com/search?q=inotia3+apk"
+      target="_blank" rel="noopener noreferrer">Search Bing for “inotia3 apk”</a>. The page
+      hosts none; download it from wherever you got the game.</span>
+    </p>
   </footer>
-</div>
-
-<div id="toast" class="toast" role="status" aria-live="polite">
-  <button class="t-close" id="toast-close" aria-label="关闭 / Close">×</button>
-  <div class="t-zh" id="toast-zh"></div>
-  <div class="t-en" id="toast-en"></div>
-  <div class="t-body" id="toast-body"></div>
 </div>
 
 <input id="file-apk"   type="file" accept=".apk,.zip,application/vnd.android.package-archive,application/zip" hidden>
@@ -237,23 +231,7 @@ window.Module = {
   var fileApk = $('file-apk'), fileSaves = $('file-saves');
   var api = null, facts = { apk: 0, so: 0, saves: 0 };
 
-  var SEARCH = 'https://www.bing.com/search?q=inotia3+apk';
-
-  /* ---- toast -------------------------------------------------------------
-   * Bilingual like the rest of the page, and it can carry one action link --
-   * which is the point of it here: "you need an APK" is not actionable without
-   * saying where to look, and the page itself must never host one. */
-  var toastEl = $('toast'), toastTimer = 0;
-  function toast(zh, en, body) {
-    $('toast-zh').textContent = zh;
-    $('toast-en').textContent = en;
-    $('toast-body').innerHTML = body || '';
-    toastEl.classList.add('show');
-    clearTimeout(toastTimer);
-    toastTimer = setTimeout(function () { toastEl.classList.remove('show'); }, 12000);
-  }
-  $('toast-close').onclick = function () { toastEl.classList.remove('show'); };
-
+  /* ---- state ------------------------------------------------------------- */
   function say(zh, en, tone) {
     statusEl.className = 'status' + (tone ? ' ' + tone : '');
     statusEl.innerHTML = '<span class="zh">' + zh + '</span>' +
@@ -279,7 +257,7 @@ window.Module = {
   function applyState(state) {
     var hasApk = state === 'ready' || state === 'running';
     btnApk.disabled = state === 'booting';
-    btnStart.disabled = state === 'booting' || state === 'running';   // clickable without an APK: it explains why not
+    btnStart.disabled = !hasApk || state === 'running';
     btnExport.disabled = state === 'booting';
     btnImport.disabled = state === 'booting';
     btnStart.querySelector('.zh').textContent = state === 'running' ? '游戏运行中' : '开始游戏';
@@ -333,24 +311,23 @@ window.Module = {
   };
 
   btnStart.onclick = function () {
-    var state = api.state();
-    if (state !== 'ready' && state !== 'running') {
-      // The engine cannot start without an image, and the honest answer is not a
-      // disabled button but a pointer to where an APK comes from. This page
-      // never hosts one, so the search happens on Bing, not here.
-      say('还没有可运行的游戏文件：先导入 APK。',
-          'Nothing to run yet: import an APK first.', 'warn');
-      toast('请先导入 APK', 'Import an APK first',
-            '<span>没有 APK 就没有 libgame.so，引擎无法启动。' +
-            '<span class="b-en"> Without the APK there is no libgame.so to run.</span></span>' +
-            '<a href="' + SEARCH + '" target="_blank" rel="noopener noreferrer">' +
-            '在 Bing 搜索 “inotia3 apk” / Search on Bing</a>');
-      return;
-    }
+    if (api.state() !== 'ready') return;          // greyed out without an APK
+
+    // Ask for fullscreen from inside the click: it is the only place a browser
+    // grants it, and the first frame after it looks right because the canvas is
+    // letterboxed by CSS rather than resized.
+    var stage = stageEl;
+    var req = stage.requestFullscreen || stage.webkitRequestFullscreen;
+    try {
+      if (req) {
+        var p = req.call(stage);
+        if (p && p.catch) p.catch(function () { /* refused: stay windowed */ });
+      }
+    } catch (e) { /* older Safari throws synchronously */ }
+
     try {
       stageEl.hidden = false;
       api.start();
-      window.scrollTo({ top: stageEl.offsetTop - 16, behavior: 'smooth' });
     } catch (e) {
       stageEl.hidden = true;
       say('无法开始：<b>' + (e && e.message ? e.message : e) + '</b>',
@@ -398,6 +375,19 @@ window.Module = {
   };
 
   boot();
+
+  /* ---- PWA ---------------------------------------------------------------
+   * sw.js is only served over HTTPS (or localhost), so a plain `python3 -m
+   * http.server` on a LAN address silently has no service worker -- which is
+   * fine, the page works without one. */
+  if ('serviceWorker' in navigator && (location.protocol === 'https:' ||
+      location.hostname === 'localhost' || location.hostname === '127.0.0.1')) {
+    window.addEventListener('load', function () {
+      navigator.serviceWorker.register('sw.js').catch(function (e) {
+        console.warn('spike: service worker registration failed', e);
+      });
+    });
+  }
 })();
 </script>
 </body>
