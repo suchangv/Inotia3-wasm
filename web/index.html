@@ -1,0 +1,404 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="color-scheme" content="light">
+<title>艾诺迪亚 3 · WebAssembly</title>
+<!--
+  Deployed copy: suchangv.github.io/inotia3-wasm/index.html
+  Source of truth: github.com/suchangv/Inotia3-wasm — web/index.html
+  The module beside it (inotia3.js / inotia3.wasm) is `tools/build.sh web`.
+-->
+<style>
+  :root {
+    --bg: #f5f7fa;
+    --card: #ffffff;
+    --ink: #1b2430;
+    --ink-2: #69758a;
+    --line: #e3e8ef;
+    --line-2: #d6dde8;
+    --accent: #2f6fed;
+    --accent-dark: #2560d8;
+    --ok: #17845c;
+    --warn: #a2560a;
+    --shadow: 0 1px 2px rgba(16, 24, 40, .04), 0 8px 24px rgba(16, 24, 40, .06);
+  }
+  * { box-sizing: border-box; }
+  html, body { margin: 0; background: var(--bg); color: var(--ink); }
+  body {
+    font: 15px/1.6 -apple-system, BlinkMacSystemFont, "Segoe UI", "PingFang SC",
+          "Hiragino Sans GB", "Microsoft YaHei", Roboto, sans-serif;
+    padding: 40px 20px 64px;
+    -webkit-font-smoothing: antialiased;
+  }
+  .wrap { max-width: 880px; margin: 0 auto; }
+
+  header { margin-bottom: 24px; }
+  h1 { font-size: 26px; line-height: 1.25; margin: 0 0 8px; letter-spacing: -.01em; }
+  h1 .tag {
+    font-size: 12px; font-weight: 600; letter-spacing: .06em; text-transform: uppercase;
+    color: var(--accent); background: #eaf1fe; border: 1px solid #d5e2fd;
+    border-radius: 999px; padding: 3px 9px; vertical-align: 5px; margin-left: 8px;
+  }
+  .sub { margin: 0; color: var(--ink-2); }
+  .sub .en { display: block; font-size: 13px; color: #8592a6; margin-top: 4px; }
+  .sub code { background: #eef2f7; border-radius: 4px; padding: 1px 5px; font-size: 13px; }
+
+  .card {
+    background: var(--card); border: 1px solid var(--line); border-radius: 14px;
+    box-shadow: var(--shadow); padding: 20px;
+  }
+
+  .grid { display: grid; grid-template-columns: 1fr 1fr; gap: 12px; }
+  button.act {
+    font: inherit; border-radius: 10px; padding: 11px 16px 12px;
+    border: 1px solid var(--line-2); background: #fff; color: var(--ink);
+    cursor: pointer; transition: background .12s, border-color .12s, transform .04s;
+    text-align: center; line-height: 1.35;
+  }
+  button.act .zh { display: block; font-weight: 600; font-size: 15px; }
+  button.act .en {
+    display: block; font-size: 12px; font-weight: 500; color: var(--ink-2); margin-top: 3px;
+  }
+  button.act:hover:not(:disabled) { background: #f2f5fa; }
+  button.act:active:not(:disabled) { transform: translateY(1px); }
+  button.act:focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; }
+  button.act:disabled { cursor: not-allowed; background: #fafbfd; border-color: var(--line); }
+  button.act:disabled .zh { color: #a7b1c0; }
+  button.act:disabled .en { color: #bcc5d2; }
+  button.act.primary { background: var(--accent); border-color: var(--accent); color: #fff; }
+  button.act.primary .en { color: rgba(255, 255, 255, .82); }
+  button.act.primary:hover:not(:disabled) { background: var(--accent-dark); border-color: var(--accent-dark); }
+  button.act.primary:disabled { background: #c9d6f2; border-color: #c9d6f2; }
+  button.act.primary:disabled .zh { color: #fff; }
+  button.act.primary:disabled .en { color: rgba(255, 255, 255, .8); }
+
+  .status { margin: 16px 2px 0; color: var(--ink-2); min-height: 3em; }
+  .status .zh { display: block; }
+  .status .en { display: block; font-size: 13px; color: #8592a6; }
+  .status b { color: var(--ink); font-weight: 600; }
+  .status.ok b { color: var(--ok); }
+  .status.warn b { color: var(--warn); }
+
+  .meta { margin: 12px 2px 0; font-size: 13px; color: var(--ink-2); }
+  .meta div { padding: 4px 0; border-top: 1px dashed var(--line); }
+  .meta div:first-child { border-top: 0; }
+  .meta .k { color: var(--ink-2); }
+  .meta .v { color: var(--ink); font-weight: 500; }
+
+  .stage { margin-top: 20px; }
+  .stage canvas {
+    display: block; width: 100%; max-width: 960px; margin: 0 auto;
+    aspect-ratio: 960 / 544; height: auto;
+    background: #0d1117; border: 1px solid var(--line); border-radius: 12px;
+    box-shadow: var(--shadow); touch-action: none;
+  }
+  .hint { text-align: center; color: var(--ink-2); font-size: 13px; margin: 10px 0 0; }
+  .hint .en { display: block; color: #8592a6; font-size: 12px; }
+
+  footer {
+    margin-top: 28px; padding-top: 18px; border-top: 1px solid var(--line);
+    color: var(--ink-2); font-size: 13px;
+  }
+  footer p { margin: 6px 0; }
+  footer a { color: var(--accent); text-decoration: none; }
+  footer a:hover { text-decoration: underline; }
+  .notice { background: #fffdf5; border: 1px solid #f0e6c8; border-radius: 10px; padding: 10px 12px; }
+  .notice b { color: var(--warn); }
+  .notice .en { display: block; margin-top: 4px; color: #8a7440; }
+
+  /* toast ---------------------------------------------------------------- */
+  .toast {
+    position: fixed; left: 50%; bottom: 24px; z-index: 50;
+    max-width: min(580px, calc(100% - 28px));
+    background: #fff; border: 1px solid var(--line); border-radius: 12px;
+    box-shadow: 0 12px 32px rgba(16, 24, 40, .14);
+    padding: 14px 40px 14px 16px;
+    transform: translateX(-50%) translateY(10px); opacity: 0;
+    pointer-events: none; transition: opacity .18s ease, transform .18s ease;
+  }
+  .toast.show { opacity: 1; transform: translateX(-50%) translateY(0); pointer-events: auto; }
+  .toast .t-zh { font-weight: 600; margin-bottom: 2px; }
+  .toast .t-en { font-size: 12px; color: #8592a6; margin-bottom: 8px; }
+  .toast .t-body { color: var(--ink-2); font-size: 13px; display: flex; flex-wrap: wrap;
+                   gap: 8px; align-items: center; }
+  .toast .t-body .b-en { color: #8592a6; font-size: 12px; }
+  .toast a {
+    display: inline-block; color: var(--accent); font-weight: 600; text-decoration: none;
+    border: 1px solid #d5e2fd; background: #f4f8ff; border-radius: 8px;
+    padding: 5px 10px; font-size: 13px;
+  }
+  .toast a:hover { background: #eaf1fe; text-decoration: underline; }
+  .toast .t-close {
+    position: absolute; top: 6px; right: 8px; border: 0; background: none;
+    color: #98a3b3; font-size: 18px; line-height: 1; padding: 4px 6px; cursor: pointer;
+    border-radius: 6px;
+  }
+  .toast .t-close:hover { background: #f2f5fa; color: var(--ink); }
+
+  @media (max-width: 560px) {
+    body { padding: 24px 14px 48px; }
+    .grid { grid-template-columns: 1fr; }
+    h1 { font-size: 22px; }
+  }
+</style>
+</head>
+<body>
+<div class="wrap">
+  <header>
+    <h1>艾诺迪亚 3 <span class="tag">WebAssembly</span></h1>
+    <p class="sub">
+      在浏览器里直接执行原版 Android 的 <code>libgame.so</code>：ARM 解释器 + gl4es 把
+      GLES1 定点管线转成 WebGL2。没有 Dalvik，没有重写游戏逻辑。
+      <span class="en">Runs the original Android libgame.so in your browser: an ARM interpreter
+      plus gl4es translating the engine's GLES1 fixed-function calls to WebGL2.</span>
+    </p>
+  </header>
+
+  <section class="card">
+    <div class="grid">
+      <button id="btn-start"  class="act primary" disabled>
+        <span class="zh">开始游戏</span><span class="en">Start Game</span>
+      </button>
+      <button id="btn-apk" class="act" disabled>
+        <span class="zh">导入 APK</span><span class="en">Import APK</span>
+      </button>
+      <button id="btn-export" class="act" disabled>
+        <span class="zh">导出存档</span><span class="en">Export Saves</span>
+      </button>
+      <button id="btn-import" class="act" disabled>
+        <span class="zh">导入存档</span><span class="en">Import Saves</span>
+      </button>
+    </div>
+    <p id="status" class="status" aria-live="polite">
+      <span class="zh">正在加载引擎…</span><span class="en">Loading the engine…</span>
+    </p>
+    <div id="meta" class="meta" hidden></div>
+  </section>
+
+  <section id="stage" class="stage" hidden>
+    <canvas id="canvas" width="960" height="544"></canvas>
+    <p class="hint">
+      用摇杆移动指针、按下面键点击 —— 引擎只认识屏幕，触摸会映射成它的按钮。
+      <span class="en">Move the pointer with the stick and press the face buttons to tap;
+      the engine only knows a screen, so touch is mapped onto its buttons.</span>
+    </p>
+  </section>
+
+  <footer>
+    <p class="notice">
+      <b>版权说明</b>：本页面<strong>不包含任何游戏素材</strong>。请使用你自己合法获得的 APK
+      （Com2uS 的《Inotia 3》）。APK 只保存在你浏览器的 IndexedDB 里，<strong>不会上传</strong>。
+      <span class="en">This page ships no game data. Use your own legally obtained APK; it stays in
+      your browser's IndexedDB and is never uploaded.</span>
+    </p>
+    <p>
+      移植与逆向：<a href="https://github.com/MetalSyntax/Inotia3-vita">Inotia3-vita</a>（PS Vita 原生版）·
+      源码：<a href="https://github.com/suchangv/Inotia3-wasm">Inotia3-wasm</a>
+    </p>
+    <p>
+      正确性对照：<a href="https://github.com/unicorn-engine/unicorn">unicorn-engine</a>（逐指令差分）·
+      GPU 转译：<a href="https://github.com/ptitSeb/gl4es">gl4es</a>
+    </p>
+  </footer>
+</div>
+
+<div id="toast" class="toast" role="status" aria-live="polite">
+  <button class="t-close" id="toast-close" aria-label="关闭 / Close">×</button>
+  <div class="t-zh" id="toast-zh"></div>
+  <div class="t-en" id="toast-en"></div>
+  <div class="t-body" id="toast-body"></div>
+</div>
+
+<input id="file-apk"   type="file" accept=".apk,.zip,application/vnd.android.package-archive,application/zip" hidden>
+<input id="file-saves" type="file" accept=".zip,application/zip" hidden>
+
+<script>
+// The engine is loaded with Module.spikeUI = true, which gates main() on a run
+// dependency: nothing runs until 开始游戏 releases it, and the page is the one
+// that feeds the module its files. Everything file-shaped lives in
+// tools/webapp.js inside the module; here it is only buttons and status.
+window.Module = {
+  spikeUI: true,
+  canvas: document.getElementById('canvas'),
+  print: function (t) { console.log(t); },
+  printErr: function (t) { console.error(t); }
+};
+</script>
+<script src="inotia3.js"></script>
+
+<script>
+(function () {
+  var $ = function (id) { return document.getElementById(id); };
+  var statusEl = $('status'), metaEl = $('meta'), stageEl = $('stage');
+  var btnStart = $('btn-start'), btnApk = $('btn-apk'),
+      btnExport = $('btn-export'), btnImport = $('btn-import');
+  var fileApk = $('file-apk'), fileSaves = $('file-saves');
+  var api = null, facts = { apk: 0, so: 0, saves: 0 };
+
+  var SEARCH = 'https://www.bing.com/search?q=inotia3+apk';
+
+  /* ---- toast -------------------------------------------------------------
+   * Bilingual like the rest of the page, and it can carry one action link --
+   * which is the point of it here: "you need an APK" is not actionable without
+   * saying where to look, and the page itself must never host one. */
+  var toastEl = $('toast'), toastTimer = 0;
+  function toast(zh, en, body) {
+    $('toast-zh').textContent = zh;
+    $('toast-en').textContent = en;
+    $('toast-body').innerHTML = body || '';
+    toastEl.classList.add('show');
+    clearTimeout(toastTimer);
+    toastTimer = setTimeout(function () { toastEl.classList.remove('show'); }, 12000);
+  }
+  $('toast-close').onclick = function () { toastEl.classList.remove('show'); };
+
+  function say(zh, en, tone) {
+    statusEl.className = 'status' + (tone ? ' ' + tone : '');
+    statusEl.innerHTML = '<span class="zh">' + zh + '</span>' +
+                         '<span class="en">' + en + '</span>';
+  }
+  function kb(n) {
+    if (!n) return '—';
+    if (n > 1024 * 1024) return (n / 1048576).toFixed(1) + ' MB';
+    return Math.round(n / 1024) + ' KB';
+  }
+  function renderMeta() {
+    var rows = [
+      ['APK 文件 / APK', facts.apk ? kb(facts.apk) : '未导入 / not imported'],
+      ['引擎镜像 / libgame.so', facts.so ? kb(facts.so) : '—'],
+      ['存档 / Saves', facts.saves ? facts.saves + ' 个文件 / files' : '—']
+    ];
+    metaEl.innerHTML = rows.map(function (r) {
+      return '<div><span class="k">' + r[0] + '：</span><span class="v">' + r[1] + '</span></div>';
+    }).join('');
+    metaEl.hidden = false;
+  }
+
+  function applyState(state) {
+    var hasApk = state === 'ready' || state === 'running';
+    btnApk.disabled = state === 'booting';
+    btnStart.disabled = state === 'booting' || state === 'running';   // clickable without an APK: it explains why not
+    btnExport.disabled = state === 'booting';
+    btnImport.disabled = state === 'booting';
+    btnStart.querySelector('.zh').textContent = state === 'running' ? '游戏运行中' : '开始游戏';
+    btnStart.querySelector('.en').textContent = state === 'running' ? 'Game Running' : 'Start Game';
+    if (state === 'booting') {
+      say('正在加载引擎…', 'Loading the engine…');
+    } else if (state === 'no-apk') {
+      say('先导入你自己的 APK：<b>只导一次</b>，之后从浏览器缓存读取。',
+          'Import your own APK first — once; later visits read it from the browser cache.');
+    } else if (state === 'ready') {
+      say('<b>APK 已就绪。</b>可以开始游戏了。',
+          '<b>APK ready.</b> Press Start Game when you are.', 'ok');
+    } else if (state === 'running') {
+      say('<b>游戏已启动。</b>', '<b>Game running.</b>', 'ok');
+    }
+    if (hasApk) renderMeta();
+  }
+
+  function boot() {
+    api = window.Module && window.Module.spike;
+    if (!api) { setTimeout(boot, 60); return; }
+    api.onState(applyState);
+    renderMeta();
+  }
+
+  async function readFile(input) {
+    var f = input.files && input.files[0];
+    if (!f) return null;
+    return { name: f.name, size: f.size, buf: await f.arrayBuffer() };
+  }
+
+  btnApk.onclick = function () { fileApk.click(); };
+  fileApk.onchange = async function () {
+    try {
+      say('正在读取 APK 并解出 libgame.so…', 'Reading the APK and extracting libgame.so…');
+      var f = await readFile(fileApk);
+      if (!f) return;
+      var r = await api.importApk(f.buf);
+      facts.apk = r.apk; facts.so = r.so;
+      renderMeta();
+      say('已导入 <b>' + f.name + '</b>（' + kb(r.apk) + '），引擎镜像 ' + kb(r.so) +
+          '。下次打开直接从浏览器缓存读取。',
+          'Imported <b>' + f.name + '</b> (' + kb(r.apk) + '), image ' + kb(r.so) +
+          '. Next visit loads it from the browser cache.', 'ok');
+    } catch (e) {
+      say('导入失败：<b>' + (e && e.message ? e.message : e) + '</b>',
+          'Import failed: ' + (e && e.message ? e.message : e), 'warn');
+    } finally {
+      fileApk.value = '';
+    }
+  };
+
+  btnStart.onclick = function () {
+    var state = api.state();
+    if (state !== 'ready' && state !== 'running') {
+      // The engine cannot start without an image, and the honest answer is not a
+      // disabled button but a pointer to where an APK comes from. This page
+      // never hosts one, so the search happens on Bing, not here.
+      say('还没有可运行的游戏文件：先导入 APK。',
+          'Nothing to run yet: import an APK first.', 'warn');
+      toast('请先导入 APK', 'Import an APK first',
+            '<span>没有 APK 就没有 libgame.so，引擎无法启动。' +
+            '<span class="b-en"> Without the APK there is no libgame.so to run.</span></span>' +
+            '<a href="' + SEARCH + '" target="_blank" rel="noopener noreferrer">' +
+            '在 Bing 搜索 “inotia3 apk” / Search on Bing</a>');
+      return;
+    }
+    try {
+      stageEl.hidden = false;
+      api.start();
+      window.scrollTo({ top: stageEl.offsetTop - 16, behavior: 'smooth' });
+    } catch (e) {
+      stageEl.hidden = true;
+      say('无法开始：<b>' + (e && e.message ? e.message : e) + '</b>',
+          'Could not start: ' + (e && e.message ? e.message : e), 'warn');
+    }
+  };
+
+  btnExport.onclick = async function () {
+    try {
+      say('正在打包 /data…', 'Packing /data…');
+      api.flush();
+      var r = await api.exportSaves();
+      facts.saves = r.files; renderMeta();
+      var d = new Date(), pad = function (n) { return (n < 10 ? '0' : '') + n; };
+      var name = 'inotia3-saves-' + d.getFullYear() + pad(d.getMonth() + 1) + pad(d.getDate()) +
+                 '-' + pad(d.getHours()) + pad(d.getMinutes()) + '.zip';
+      var url = URL.createObjectURL(new Blob([r.bytes], { type: 'application/zip' }));
+      var a = document.createElement('a');
+      a.href = url; a.download = name; a.click();
+      setTimeout(function () { URL.revokeObjectURL(url); }, 4000);
+      say('已导出 <b>' + name + '</b>（' + r.files + ' 个文件，' + kb(r.total) + '）。',
+          'Exported <b>' + name + '</b> (' + r.files + ' files, ' + kb(r.total) + ').', 'ok');
+    } catch (e) {
+      say('导出失败：<b>' + (e && e.message ? e.message : e) + '</b>',
+          'Export failed: ' + (e && e.message ? e.message : e), 'warn');
+    }
+  };
+
+  btnImport.onclick = function () { fileSaves.click(); };
+  fileSaves.onchange = async function () {
+    try {
+      say('正在解压存档…', 'Unpacking the saves…');
+      var f = await readFile(fileSaves);
+      if (!f) return;
+      var r = await api.importSaves(f.buf);
+      facts.saves = r.files; renderMeta();
+      say('已导入 ' + r.files + ' 个文件到 /data，已持久化。<b>刷新页面</b>后游戏内即可看到。',
+          'Imported ' + r.files + ' files into /data and persisted them. <b>Reload</b> to see them in game.', 'ok');
+    } catch (e) {
+      say('导入存档失败：<b>' + (e && e.message ? e.message : e) + '</b>',
+          'Import failed: ' + (e && e.message ? e.message : e), 'warn');
+    } finally {
+      fileSaves.value = '';
+    }
+  };
+
+  boot();
+})();
+</script>
+</body>
+</html>

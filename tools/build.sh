@@ -171,7 +171,8 @@ build_browser() {
 # --preload-file at all. Nothing of the game ships with it -- the player imports
 # their own APK on the page (tools/webapp.js keeps it in IndexedDB) and the
 # engine is started from what they imported. Output is build/inotia3.js +
-# build/inotia3.wasm, which is what suchangv.github.io/inotia3-wasm/ serves.
+# build/inotia3.wasm; the page that loads them is web/index.html here, published
+# as suchangv.github.io/inotia3-wasm/index.html together with those two files.
 #
 #   tools/build.sh web              -> build/inotia3.js (+ .wasm)
 build_web() {
