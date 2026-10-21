@@ -148,13 +148,6 @@
   body.immersive #fs-exit { display: block; }
   body.immersive { overflow: hidden; }
 
-  /* Once the game is running the page is a game screen, not a document: no
-   * text selection, no long-press callout, no dragging the canvas away. */
-  body.playing, body.playing * {
-    -webkit-user-select: none; user-select: none;
-    -webkit-touch-callout: none; -webkit-tap-highlight-color: transparent;
-  }
-  body.playing { overscroll-behavior: none; }
 
   footer {
     margin-top: 28px; padding-top: 18px; border-top: 1px solid var(--line);
@@ -380,6 +373,13 @@ window.Module = {
   function immersiveOn() {
     document.body.classList.add('immersive');
     stageEl.classList.add('pseudo');          // the overlay is the fallback look
+    // On iOS the overlay only hides the page, not the browser's own chrome. A
+    // one-pixel scroll is the documented trick to collapse the address bar; the
+    // second call covers the case where the first happens before layout settles.
+    try {
+      window.scrollTo(0, 1);
+      setTimeout(function () { window.scrollTo(0, 1); }, 80);
+    } catch (e) { /* not iOS */ }
     var stage = stageEl;
     var req = stage.requestFullscreen || stage.webkitRequestFullscreen ||
               stage.webkitRequestFullScreen;
@@ -407,46 +407,19 @@ window.Module = {
     }
   });
 
-  /* ---- playing: the page stops behaving like a document ------------------ */
-  function setPlaying(on) {
-    document.body.classList.toggle('playing', on);
-  }
-  // Long-press on iOS starts a selection and a callout menu on top of the
-  // canvas; these all get in the way of a game that only wants touches.
-  ['contextmenu', 'selectstart', 'dragstart'].forEach(function (ev) {
-    document.addEventListener(ev, function (e) {
-      if (document.body.classList.contains('playing')) e.preventDefault();
-    }, { passive: false });
-  });
-
-  /* iOS and iPadOS get their own document. There is no element fullscreen on
-   * iPhone, and the fake one still lives inside browser chrome that reappears on
-   * any scroll; a page whose body is one canvas is the closest thing to a game
-   * screen WebKit allows, and it is what the home-screen icon launches. */
-  var IS_IOS = /iPad|iPhone|iPod/.test(navigator.userAgent) ||
-               (navigator.platform === 'MacIntel' && navigator.maxTouchPoints > 1);
-
   btnStart.onclick = function () {
     if (api.state() !== 'ready') return;          // greyed out without an APK
-
-    if (IS_IOS) {
-      api.flush();                 // saves/APK state is already in IndexedDB
-      location.href = 'game.html';
-      return;
-    }
 
     // Audio first, and still inside the gesture: iOS only lifts the audio
     // session restriction for a resume/unlock that happens here.
     api.audioUnlock();
 
     stageEl.hidden = false;
-    setPlaying(true);
     immersiveOn();
     try {
       api.start();
     } catch (e) {
       stageEl.hidden = true;
-      setPlaying(false);
       immersiveOff();
       say('无法开始：<b>' + (e && e.message ? e.message : e) + '</b>',
           'Could not start: ' + (e && e.message ? e.message : e), 'warn');
@@ -498,6 +471,21 @@ window.Module = {
       fileSaves.value = '';
     }
   };
+
+  /* Anything that escapes a handler lands here rather than only in the console:
+   * "the game does not start" on a phone with no devtools open is otherwise a
+   * black canvas and no way to report what happened. */
+  window.addEventListener('error', function (e) {
+    var msg = (e && (e.message || (e.error && e.error.message))) || 'unknown error';
+    if (!window.__spikeBooted) say('启动失败：<b>' + msg + '</b>',
+                                   'Failed to start: ' + msg, 'warn');
+    else say('运行时错误：<b>' + msg + '</b>', 'Runtime error: ' + msg, 'warn');
+  });
+  window.addEventListener('unhandledrejection', function (e) {
+    var r = e && e.reason;
+    var msg = (r && (r.message || r)) || 'unhandled rejection';
+    say('运行时错误：<b>' + msg + '</b>', 'Runtime error: ' + msg, 'warn');
+  });
 
   boot();
 

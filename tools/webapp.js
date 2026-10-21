@@ -215,18 +215,45 @@
     } catch (e) { return false; }
   }
 
+  /* IndexedDB gives back whatever structured clone put in, and that is not the
+   * same thing on every engine: Safari has been known to hand back a Blob where
+   * an ArrayBuffer was written. `new Uint8Array(blob)` is an empty array rather
+   * than an error, so the page would happily "start" with a 0-byte APK and sit
+   * on a black screen -- so both shapes are accepted, and a size that cannot be
+   * a real APK is treated as "not imported". */
+  async function asBytes(v) {
+    if (!v) return null;
+    if (v instanceof ArrayBuffer) return v;
+    if (ArrayBuffer.isView(v))
+      return v.buffer.slice(v.byteOffset, v.byteOffset + v.byteLength);
+    if (typeof Blob !== 'undefined' && v instanceof Blob) {
+      try { return await v.arrayBuffer(); } catch (e) { return null; }
+    }
+    return null;
+  }
+
   async function loadGameFromCache() {
-    var apk = await idbGet('apk');
-    if (!apk) return false;
-    var so = await idbGet('libgame.so');
-    if (!so) {
-      // Stored before libgame.so was cached separately: derive it once.
+    var apk = await asBytes(await idbGet('apk'));
+    if (!apk || apk.byteLength < 1024 * 1024) {   // a real APK is tens of MB
+      if (apk) console.warn('spike: stored APK is only ' + apk.byteLength + ' B; ignoring it');
+      return false;
+    }
+    var so = await asBytes(await idbGet('libgame.so'));
+    if (!so || so.byteLength < 256 * 1024) {
+      // Stored before libgame.so was cached separately, or the copy did not
+      // survive: derive it again from the APK.
       so = await extractLibgame(apk);
       if (so) await idbPut('libgame.so', so);
     }
     if (!so) return false;
     FS.writeFile(GAME_FILES.apk, new Uint8Array(apk));
     FS.writeFile(GAME_FILES.so, new Uint8Array(so));
+    var wrote = 0;
+    try { wrote = FS.stat(GAME_FILES.apk).size; } catch (e) { wrote = 0; }
+    if (wrote !== apk.byteLength) {
+      console.error('spike: /assets.apk is ' + wrote + ' B, expected ' + apk.byteLength);
+      return false;
+    }
     console.log('spike: game files from IndexedDB -- apk ' + apk.byteLength +
                 ' B, libgame.so ' + so.byteLength + ' B');
     return true;
@@ -257,8 +284,12 @@
       var so = await extractLibgame(arrayBuffer);
       if (!so)
         throw new Error('APK 里没有 lib/armeabi/libgame.so，可能不是 Inotia 3 的包');
-      await idbPut('apk', arrayBuffer);
-      await idbPut('libgame.so', so);
+      // Blob in storage, bytes in MEMFS: a Blob is what every engine's
+      // structured clone stores most predictably, and Safari's IndexedDB has
+      // been the one that turned ArrayBuffers into Blobs on read.
+      try { await idbPut('apk', new Blob([u8], { type: 'application/vnd.android.package-archive' })); }
+      catch (e) { await idbPut('apk', arrayBuffer); }
+      await idbPut('libgame.so', new Blob([new Uint8Array(so)]));
       FS.writeFile(GAME_FILES.apk, u8);
       FS.writeFile(GAME_FILES.so, new Uint8Array(so));
       // The engine's install step will rewrite /data; keep whatever is there.
