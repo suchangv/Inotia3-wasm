@@ -581,6 +581,15 @@ int host_sdl_vdprobe(void)
                  * strings go through gl4es' own init. The real run logs them. */
                 printf("%-9s   window ok, GL context created\n", name);
                 SDL_GL_DeleteContext(ctx);
+                /* The rest are not tested: on this class of device probing
+                 * KMSDRM means taking DRM master from the compositor for a
+                 * moment, and doing that on every launch is how a port breaks
+                 * the compositor it is trying to live inside. */
+                SDL_DestroyWindow(w);
+                SDL_VideoQuit();
+                printf("stopping here: %s works, and the others would take the "
+                       "display\n", name);
+                return 0;
             }
             SDL_DestroyWindow(w);
         }
@@ -623,6 +632,18 @@ int host_sdl_init(void)
                  "rerun with --vdprobe to see why the others refused\n",
                  SDL_GetNumVideoDrivers());
     }
+
+    /* Before CreateWindow, not after: SDL loads the GL library while creating an
+     * OPENGL window, and without the ES profile set here it would load desktop
+     * GL (libGL.so.1). Firmware images ship libGLESv2/libEGL and no libGL, so
+     * that ordering makes every window fail with "cannot initialize OpenGL". */
+    SDL_GL_SetAttribute(SDL_GL_CONTEXT_PROFILE_MASK, SDL_GL_CONTEXT_PROFILE_ES);
+    SDL_GL_SetAttribute(SDL_GL_CONTEXT_MAJOR_VERSION, 3);
+    SDL_GL_SetAttribute(SDL_GL_CONTEXT_MINOR_VERSION, 0);
+    SDL_GL_SetAttribute(SDL_GL_DOUBLEBUFFER, 1);
+    SDL_GL_SetAttribute(SDL_GL_DEPTH_SIZE, 24);
+    SDL_GL_SetAttribute(SDL_GL_STENCIL_SIZE, 8);
+    SDL_GL_SetAttribute(SDL_GL_ALPHA_SIZE, 8);
 
     Uint32 flags = SDL_WINDOW_OPENGL | SDL_WINDOW_ALLOW_HIGHDPI;
     if (!g_sdl_windowed)
