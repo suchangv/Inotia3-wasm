@@ -56,7 +56,7 @@
 /* The engine's screen. main.c/jni.c answer GetRealScreenWidth/Height with the
  * same pair; everything here works in that space and scales at the last step. */
 #define CONTENT_W 960
-#define CONTENT_H 720
+#define CONTENT_H 544
 
 /* gl4es' GLES1 entry points, for the cursor sprite. The rest of the GL work is
  * the engine's, through gl4es_bridge.c. */
@@ -735,8 +735,8 @@ void host_sdl_finish(void)
  * so small pushes are controllable), and it is the *content* coordinates that
  * count: the pointer is mapped into the same 960x544 box the engine draws into.
  */
-#define CURSOR_SPEED   620.0f   /* content px/s at full deflection */
-#define CURSOR_DEADZONE 0.18f
+#define CURSOR_SPEED   1000.0f  /* content px/s at full deflection */
+#define CURSOR_DEADZONE 0.22f
 #define CURSOR_HIDE_MS 3000.0
 
 static void cursor_nudge(double dt_ms)
@@ -1044,14 +1044,19 @@ static void input_events(double dt_ms)
 
 int host_sdl_pump(int timeout_ms)
 {
+    static double last;
     /* Wait for an event (or the timeout) without burning a core: with no engine
      * frame to present there is no swap to block on. Sleeping here is also what
      * keeps a 15 fps engine off 100% of the CPU. */
-    if (timeout_ms > 0) {
-        if (SDL_WaitEventTimeout(NULL, timeout_ms) == 0)
-            return g_running;
-    }
-    input_events(1000.0 / 60.0);
+    double t0 = host_now();
+    if (timeout_ms > 0)
+        SDL_WaitEventTimeout(NULL, timeout_ms);
+    double dt = (t0 - last) * 1000.0;
+    last = t0;
+    /* First call, a resumed session or a stall: fall back to a frame's worth. */
+    if (dt <= 0.0 || dt > 250.0)
+        dt = 1000.0 / 60.0;
+    input_events(dt);
     return g_running;
 }
 
@@ -1192,6 +1197,26 @@ void host_sdl_present(void)
         else {
             screenshot(g_sdl_shot, rotating());
             g_sdl_shot = NULL;
+        }
+    }
+    /* Frame-time statistics: "it feels slow" becomes numbers with
+     * SPIKE_DEBUG=1 in env.txt. Includes the engine's own pacing, since these
+     * are presented frames. */
+    if (getenv("SPIKE_DEBUG")) {
+        static double prev, sum, best = 1e9, worst;
+        static int n;
+        double now = host_now() * 1000.0;
+        if (prev > 0.0) {
+            double d = now - prev;
+            if (d < best) best = d;
+            if (d > worst) worst = d;
+            sum += d;
+        }
+        prev = now;
+        if (++n == 75) {
+            host_log("perf: %.1f ms/frame avg (min %.1f, max %.1f) over %d "
+                     "presented frames\n", sum / (n - 1), best, worst, n);
+            sum = 0; n = 0; best = 1e9; worst = 0;
         }
     }
 }
