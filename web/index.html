@@ -132,9 +132,18 @@
     width: 100vw; height: 100vh; max-width: none; aspect-ratio: auto;
     object-fit: contain; border: 0; border-radius: 0; box-shadow: none;
   }
-  .stage:fullscreen .hint, .stage:-webkit-full-screen .hint, .stage.pseudo .hint {
+  .stage:fullscreen .hint, .stage:-webkit-full-screen .hint, .stage.pseudo .hint,
+  .stage:fullscreen .stage-bar, .stage:-webkit-full-screen .stage-bar,
+  .stage.pseudo .stage-bar {
     display: none;
   }
+  .stage-bar { display: flex; justify-content: center; margin-top: 12px; }
+  .fs-btn {
+    font: 600 13px/1 inherit; color: var(--ink); background: #fff;
+    border: 1px solid var(--line-2); border-radius: 999px; padding: 9px 16px;
+    cursor: pointer;
+  }
+  .fs-btn:hover { background: #f2f5fa; }
 
   /* One tap to leave pseudo-fullscreen: iOS has no Esc key. */
   #fs-exit {
@@ -233,6 +242,11 @@
       <span class="en">Move the pointer with the stick and press the face buttons to tap;
       the engine only knows a screen, so touch is mapped onto its buttons.</span>
     </p>
+    <!-- Leaving fullscreen used to be a one-way door: the only thing that
+         entered it was the start button, which is disabled while running. -->
+    <div class="stage-bar">
+      <button id="fs-enter" type="button" class="fs-btn">进入全屏 / Fullscreen</button>
+    </div>
   </section>
 
   <footer>
@@ -447,6 +461,7 @@ window.Module = {
     document.body.classList.remove('immersive');
   }
   $('fs-exit').onclick = immersiveOff;
+  $('fs-enter').onclick = immersiveOn;
   document.addEventListener('fullscreenchange', function () {
     // Leaving real fullscreen by any route (F11, Esc, system gesture) should
     // also drop the overlay and the scroll lock.
@@ -459,10 +474,6 @@ window.Module = {
   btnStart.onclick = function () {
     if (api.state() !== 'ready') return;          // greyed out without an APK
 
-    // Audio first, and still inside the gesture: iOS only lifts the audio
-    // session restriction for a resume/unlock that happens here.
-    api.audioUnlock();
-
     stageEl.hidden = false;
     immersiveOn();
     try {
@@ -474,13 +485,6 @@ window.Module = {
           'Could not start: ' + (e && e.message ? e.message : e), 'warn');
     }
   };
-
-  // iOS suspends the audio context when the app is backgrounded or the phone
-  // rings, and the resume has to come from a gesture -- so any touch may be the
-  // one that brings the sound back. It is a null-op once the context runs.
-  document.addEventListener('pointerdown', function () {
-    if (api && api.state() === 'running') api.audioUnlock();
-  }, { passive: true });
 
   btnExport.onclick = async function () {
     try {

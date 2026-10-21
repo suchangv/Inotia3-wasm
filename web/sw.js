@@ -9,7 +9,7 @@
 // (APK, and /data through IDBFS), are large, and must never be duplicated into
 // the Cache API where a version bump would silently drop them.
 
-const VERSION = 'inotia3-wasm-v5';
+const VERSION = 'inotia3-wasm-v6';
 const SHELL = [
   './',
   './index.html',

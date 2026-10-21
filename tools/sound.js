@@ -86,60 +86,6 @@ mergeInto(LibraryManager.library, {
             }
         },
 
-        /* Bookkeeping for a decoded buffer, whichever decoder produced it. */
-        accept: function (slot, buf) {
-            slot.buffer = buf;
-            slot.decoding = false;
-            PAudio.pcm += buf.length * 4;
-            PAudio.note(slot.id);
-            PAudio.evict(slot.id);
-            if (PAudio.decoded < 8 || PAudio.decoded % 25 === 24) {
-                console.log('[snd] decoded ' + slot.name + ' ' +
-                            buf.duration.toFixed(2) + 's ' +
-                            buf.sampleRate + 'Hz  pcm=' +
-                            Math.round(PAudio.pcm / 1048576) + 'MB');
-            }
-            PAudio.decoded++;
-            if (slot.want) { slot.want = false; PAudio.start(slot); }
-        },
-
-        /* Vorbis decoded in the module, for browsers that have no Vorbis
-         * decoder of their own -- that is Safari, and therefore every iOS
-         * device: decodeAudioData rejects on all 160 of this game's sounds and
-         * the port is silent. src/sound_vorbis.c wraps stb_vorbis for exactly
-         * this case; only the fallback path pays for it.
-         *
-         * The PCM travels through the wasm heap, so the input copy and the
-         * output buffer are both freed here rather than left for GC. */
-        decodeWithStb: function (slot, ctx) {
-            var u8 = slot.bytes;
-            var inPtr = _malloc(u8.length);
-            var outPtr = _malloc(16);
-            if (!inPtr || !outPtr) {
-                if (inPtr) _free(inPtr);
-                if (outPtr) _free(outPtr);
-                return null;
-            }
-            HEAPU8.set(u8, inPtr);
-            var ok = _spike_vorbis_decode(inPtr, u8.length,
-                                          outPtr, outPtr + 4, outPtr + 8, outPtr + 12);
-            var channels = HEAP32[outPtr >> 2];
-            var rate     = HEAP32[(outPtr + 4) >> 2];
-            var frames   = HEAP32[(outPtr + 8) >> 2];
-            var pcm      = HEAP32[(outPtr + 12) >> 2];
-            _free(inPtr);
-            _free(outPtr);
-            if (!ok || !channels || !frames || !pcm) return null;
-            var buf = ctx.createBuffer(channels, frames, rate);
-            var base = pcm >> 2;
-            for (var c = 0; c < channels; c++) {
-                buf.copyToChannel(HEAPF32.subarray(base + c * frames,
-                                                   base + (c + 1) * frames), c);
-            }
-            _spike_vorbis_free(pcm);
-            return buf;
-        },
-
         decode: function (slot) {
             if (slot.buffer || slot.decoding || !slot.bytes) return;
             var ctx = PAudio.ensure();
@@ -153,18 +99,22 @@ mergeInto(LibraryManager.library, {
              * silent for the rest of the session. A copy is a few hundred KB,
              * once per play that follows an eviction. */
             ctx.decodeAudioData(slot.bytes.slice().buffer,
-                function (buf) { PAudio.accept(slot, buf); },
-                function (err) {
-                    var buf = PAudio.decodeWithStb(slot, ctx);
-                    if (buf) {
-                        if (!PAudio.vorbis_fallback) {
-                            PAudio.vorbis_fallback = true;
-                            console.log('[snd] decodeAudioData cannot do Vorbis here; ' +
-                                        'using the module decoder (stb_vorbis)');
-                        }
-                        PAudio.accept(slot, buf);
-                        return;
+                function (buf) {
+                    slot.buffer = buf;
+                    slot.decoding = false;
+                    PAudio.pcm += buf.length * 4;
+                    PAudio.note(slot.id);
+                    PAudio.evict(slot.id);
+                    if (PAudio.decoded < 8 || PAudio.decoded % 25 === 24) {
+                        console.log('[snd] decoded ' + slot.name + ' ' +
+                                    buf.duration.toFixed(2) + 's ' +
+                                    buf.sampleRate + 'Hz  pcm=' +
+                                    Math.round(PAudio.pcm / 1048576) + 'MB');
                     }
+                    PAudio.decoded++;
+                    if (slot.want) { slot.want = false; PAudio.start(slot); }
+                },
+                function (err) {
                     slot.decoding = false;
                     if ((PAudio.failures = (PAudio.failures || 0) + 1) <= 6)
                         console.warn('[snd] decode failed: ' + slot.name + ': ' +
@@ -302,31 +252,6 @@ mergeInto(LibraryManager.library, {
         if (!slot) return;
         slot.volume = volume;
         if (slot.gain) slot.gain.gain.value = volume / 100;
-    },
-
-    /* Audio contexts on iOS start suspended and only resume from inside a user
-     * gesture. The page calls these from its start button and from pointerdown;
-     * the silent one-sample buffer is the established way to make Safari switch
-     * the audio session from "ambient" to "playback", and costs nothing on the
-     * browsers that do not need it. */
-    sound_host_audio_prime__deps: ['$PAudio'],
-    sound_host_audio_prime: function () {
-        return PAudio.ensure() ? 1 : 0;
-    },
-
-    sound_host_audio_unlock__deps: ['$PAudio'],
-    sound_host_audio_unlock: function () {
-        var ctx = PAudio.ensure();
-        if (!ctx) return 0;
-        if (ctx.state === 'suspended' && ctx.resume) ctx.resume();
-        try {
-            var b = ctx.createBuffer(1, 1, ctx.sampleRate || 44100);
-            var s = ctx.createBufferSource();
-            s.buffer = b;
-            s.connect(ctx.destination);
-            s.start(0);
-        } catch (e) { /* already running, or an old browser without any of it */ }
-        return 1;
     },
 
     sound_host_close__deps: ['$PAudio'],

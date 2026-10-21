@@ -73,11 +73,6 @@ extern void sound_host_pause(int id);
 extern void sound_host_resume(int id);
 extern void sound_host_volume(int id, int volume);
 extern void sound_host_close(int id);
-/* Not tied to any one sound: create the audio context early, and resume it from
- * a user gesture. iOS only unlocks audio from inside a gesture, and the page's
- * "start" click is the one it gets; see tools/sound.js and web/index.html. */
-extern int  sound_host_audio_prime(void);
-extern int  sound_host_audio_unlock(void);
 #else
 static int  sound_host_open(int id, const char *name, int loop,
                             const unsigned char *data, unsigned len)
@@ -89,8 +84,6 @@ static void sound_host_pause(int id) { (void) id; }
 static void sound_host_resume(int id) { (void) id; }
 static void sound_host_volume(int id, int volume) { (void) id; (void) volume; }
 static void sound_host_close(int id) { (void) id; }
-static int  sound_host_audio_prime(void) { return 1; }
-static int  sound_host_audio_unlock(void) { return 1; }
 #endif
 
 #ifndef WASM_FREESTANDING
@@ -196,16 +189,6 @@ int sound_prepare(int handle)
     int id = slot_of(handle);
     if (!id)
         return -1;
-    /* The context is created on the first prepare rather than at boot: it is
-     * the earliest point every host has reached the sound system, and on the
-     * browser an AudioContext created here comes back suspended, which the
-     * page's click then resumes. Creating it is not what iOS forbids --
-     * starting playback outside a gesture is. */
-    static int primed;
-    if (!primed) {
-        primed = 1;
-        sound_host_audio_prime();
-    }
     /* The host decides what "prepare" costs: it has the bytes and knows how
      * big they are (see tools/sound.js -- small effects decode now so the
      * first swing is not late, background music waits). */
@@ -226,19 +209,6 @@ int sound_play(int handle, int loop)
             host_log("[snd] SoundPlay(%d \"%s\", loop=%d)\n", id,
                      g_sound[id].name, loop);
         }
-    }
-    /* The page unlocks audio from a click, but on iOS the context can be
-     * suspended again later (backgrounding, a phone call), and the C side is
-     * the only place that sees the next play. A no-op once it is running.
-     *
-     * This call also keeps sound_host_audio_unlock in the build: it is called
-     * from JavaScript only, and emscripten drops library functions nothing in
-     * the module references -- which made the page's unlock silently raise
-     * ReferenceError inside its own try/catch. */
-    static int unlocked;
-    if (!unlocked) {
-        unlocked = 1;
-        sound_host_audio_unlock();
     }
     sound_host_play(id, loop);
     return 0;
