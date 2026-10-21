@@ -59,6 +59,12 @@
   }
 
   .grid { display: grid; grid-template-columns: 1fr 1fr; gap: 12px; }
+  /* The three save actions read as one group: they all operate on /data, and
+   * putting them on their own row is what makes 清除 sit next to the two it
+   * undoes. */
+  .grid.saves { grid-template-columns: repeat(3, 1fr); margin-top: 12px; }
+  .grid.saves .act .zh { font-size: 14px; }
+  .grid.saves .act .en { font-size: 11px; }
   button.act {
     font: inherit; border-radius: 10px; padding: 11px 16px 12px;
     border: 1px solid var(--line-2); background: #fff; color: var(--ink);
@@ -79,6 +85,9 @@
   button.act.primary .en { color: rgba(255, 255, 255, .82); }
   button.act.primary:hover:not(:disabled) { background: var(--accent-dark); border-color: var(--accent-dark); }
   button.act.primary:disabled { background: #c9d6f2; border-color: #c9d6f2; }
+  button.act.danger .zh { color: #a33333; }
+  button.act.danger:hover:not(:disabled) { background: #fff5f5; border-color: #f0c9c9; }
+  button.act.danger:disabled .zh { color: #c9a3a3; }
   button.act.primary:disabled .zh { color: #fff; }
   button.act.primary:disabled .en { color: rgba(255, 255, 255, .8); }
 
@@ -161,8 +170,22 @@
     -webkit-backdrop-filter: blur(6px);
   }
   #fs-exit:hover { background: rgba(20, 26, 36, .78); }
+  #btn-home {
+    position: fixed; top: 10px; left: 10px; z-index: 70; display: none;
+    font: 600 13px/1 inherit; color: #fff; background: rgba(20, 26, 36, .58);
+    border: 1px solid rgba(255, 255, 255, .28); border-radius: 999px;
+    padding: 9px 14px; cursor: pointer; backdrop-filter: blur(6px);
+    -webkit-backdrop-filter: blur(6px);
+  }
+  #btn-home:hover { background: rgba(20, 26, 36, .78); }
+  body.immersive #btn-home.show { display: block; }
   body.immersive #fs-exit { display: block; }
   body.immersive { overflow: hidden; }
+  /* Everything behind the canvas is black while playing. The page itself is
+   * light, and the letterbox bands (large on a 4:3 iPad) were showing that
+   * light background through -- on both iOS and Android. */
+  html.immersive, body.immersive { background: #05070a; }
+  .stage:fullscreen::backdrop, .stage:-webkit-full-screen::backdrop { background: #05070a; }
 
 
   footer {
@@ -202,9 +225,37 @@
     border: 0; background: none; color: #98a3b3; padding: 6px 8px; font-size: 16px;
   }
 
+  /* Confirmation for the one action that destroys something. A plain dialog
+   * element is fine on current browsers, but this is a page that also has to
+   * work on older iOS Safari, and the markup here is six lines. */
+  .modal {
+    position: fixed; inset: 0; z-index: 80; display: none;
+    align-items: center; justify-content: center; padding: 20px;
+    background: rgba(12, 16, 24, .42); backdrop-filter: blur(2px);
+  }
+  .modal.show { display: flex; }
+  .modal-card {
+    background: #fff; border: 1px solid var(--line); border-radius: 14px;
+    box-shadow: 0 20px 48px rgba(16, 24, 40, .22);
+    max-width: 420px; width: 100%; padding: 20px;
+  }
+  .modal-card h2 { font-size: 17px; margin: 0 0 2px; }
+  .modal-card .en { font-size: 12px; color: #8592a6; margin-bottom: 12px; }
+  .modal-card p { margin: 0 0 6px; color: var(--ink-2); font-size: 13px; }
+  .modal-card p.en { margin-bottom: 16px; }
+  .modal-actions { display: flex; gap: 10px; justify-content: flex-end; }
+  .modal-actions button {
+    font: 600 13px/1 inherit; border-radius: 9px; padding: 10px 16px; cursor: pointer;
+    border: 1px solid var(--line-2); background: #fff; color: var(--ink);
+  }
+  .modal-actions button:hover { background: #f2f5fa; }
+  .modal-actions button.danger { background: #c0392b; border-color: #c0392b; color: #fff; }
+  .modal-actions button.danger:hover { background: #a93325; border-color: #a93325; }
+
   @media (max-width: 560px) {
     body { padding: 24px 14px 48px; }
     .grid { grid-template-columns: 1fr; }
+    .grid.saves { grid-template-columns: 1fr; }
     h1 { font-size: 22px; }
   }
 </style>
@@ -229,11 +280,16 @@
       <button id="btn-apk" class="act" disabled>
         <span class="zh">导入 APK</span><span class="en">Import APK</span>
       </button>
+    </div>
+    <div class="grid saves">
       <button id="btn-export" class="act" disabled>
         <span class="zh">导出存档</span><span class="en">Export Saves</span>
       </button>
       <button id="btn-import" class="act" disabled>
         <span class="zh">导入存档</span><span class="en">Import Saves</span>
+      </button>
+      <button id="btn-clear-saves" class="act danger" disabled>
+        <span class="zh">清除存档</span><span class="en">Delete Saves</span>
       </button>
     </div>
     <p id="status" class="status" aria-live="polite">
@@ -283,6 +339,21 @@
 <input id="file-apk"   type="file" hidden>
 <input id="file-saves" type="file" hidden>
 <button id="fs-exit" type="button">退出全屏 / Exit</button>
+<button id="btn-home" type="button">回到首页 / Home</button>
+
+<div id="modal" class="modal" role="dialog" aria-modal="true" aria-labelledby="modal-title">
+  <div class="modal-card">
+    <h2 id="modal-title">清除所有存档？</h2>
+    <div class="en">Delete every save?</div>
+    <p>会删除 <code>/data</code> 下的所有存档、设置与备份，已安装的游戏资源保留，下次启动不需要重装。此操作无法撤销。</p>
+    <p class="en">Removes every save, setting and backup under <code>/data</code>. Installed
+    assets are kept, so nothing has to be reinstalled. This cannot be undone.</p>
+    <div class="modal-actions">
+      <button id="modal-cancel" type="button">取消 / Cancel</button>
+      <button id="modal-ok" type="button" class="danger">清除 / Delete</button>
+    </div>
+  </div>
+</div>
 
 <div id="ios-hint" class="ios-hint">
   <div class="txt">
@@ -316,7 +387,8 @@ window.Module = {
   var $ = function (id) { return document.getElementById(id); };
   var statusEl = $('status'), metaEl = $('meta'), stageEl = $('stage');
   var btnStart = $('btn-start'), btnApk = $('btn-apk'),
-      btnExport = $('btn-export'), btnImport = $('btn-import');
+      btnExport = $('btn-export'), btnImport = $('btn-import'),
+      btnClearSaves = $('btn-clear-saves');
   var fileApk = $('file-apk'), fileSaves = $('file-saves');
   var api = null, facts = { apk: 0, so: 0, saves: 0 };
 
@@ -375,6 +447,7 @@ window.Module = {
     btnStart.disabled = !hasApk || state === 'running';
     btnExport.disabled = state === 'booting';
     btnImport.disabled = state === 'booting';
+    btnClearSaves.disabled = state === 'booting';
     btnStart.querySelector('.zh').textContent = state === 'running' ? '游戏运行中' : '开始游戏';
     btnStart.querySelector('.en').textContent = state === 'running' ? 'Game Running' : 'Start Game';
     if (state === 'booting') {
@@ -467,7 +540,24 @@ window.Module = {
     canvas.style.height = Math.max(1, Math.round(544 * s)) + 'px';
   }
 
+  /* iPhone in landscape gets no exit button -- it is in the middle of the
+   * picture, the game is the only thing on screen, and leaving is what the
+   * system gesture is for. In portrait there is a band of empty screen and no
+   * other way out, so it gets 回到首页 / Home instead. */
+  var IS_IOS = /iPad|iPhone|iPod/.test(navigator.userAgent) ||
+               (navigator.platform === 'MacIntel' && navigator.maxTouchPoints > 1);
+  function updateImmersiveButtons() {
+    var landscape;
+    try { landscape = window.matchMedia('(orientation: landscape)').matches; }
+    catch (e) { landscape = window.innerWidth > window.innerHeight; }
+    var exit = $('fs-exit'), home = $('btn-home');
+    exit.style.display = (IS_IOS && landscape) ? 'none' : '';
+    var wantHome = IS_IOS && !landscape && document.body.classList.contains('immersive');
+    home.classList.toggle('show', wantHome);
+  }
+
   function immersiveOn() {
+    document.documentElement.classList.add('immersive');
     document.body.classList.add('immersive');
     stageEl.classList.add('pseudo');          // the overlay is the fallback look
     // On iOS the overlay only hides the page, not the browser's own chrome. A
@@ -479,6 +569,7 @@ window.Module = {
     } catch (e) { /* not iOS */ }
     layoutStage();
     requestAnimationFrame(layoutStage);      // after iOS has resized its chrome
+    updateImmersiveButtons();
     var stage = stageEl;
     var req = stage.requestFullscreen || stage.webkitRequestFullscreen ||
               stage.webkitRequestFullScreen;
@@ -495,13 +586,22 @@ window.Module = {
     }
     stageEl.classList.remove('pseudo');
     document.body.classList.remove('immersive');
+    document.documentElement.classList.remove('immersive');
+    $('btn-home').classList.remove('show');
     layoutStage();
+    updateImmersiveButtons();
   }
+  function onViewportChange() { layoutStage(); updateImmersiveButtons(); }
   ['resize', 'orientationchange', 'fullscreenchange', 'webkitfullscreenchange']
-    .forEach(function (ev) { window.addEventListener(ev, layoutStage); });
-  if (window.visualViewport) window.visualViewport.addEventListener('resize', layoutStage);
+    .forEach(function (ev) { window.addEventListener(ev, onViewportChange); });
+  if (window.visualViewport)
+    window.visualViewport.addEventListener('resize', onViewportChange);
 
   $('fs-exit').onclick = immersiveOff;
+  // Leaving the game is a navigation, not an exit from immersive mode: the page
+  // behind is the one that owns importing and saves, and reloading it re-reads
+  // both from IndexedDB.
+  $('btn-home').onclick = function () { location.href = './'; };
   $('fs-enter').onclick = immersiveOn;
   document.addEventListener('fullscreenchange', function () {
     // Leaving real fullscreen by any route (F11, Esc, system gesture) should
@@ -552,6 +652,50 @@ window.Module = {
     } catch (e) {
       say('导出失败：<b>' + (e && e.message ? e.message : e) + '</b>',
           'Export failed: ' + (e && e.message ? e.message : e), 'warn');
+    }
+  };
+
+  /* ---- clear saves -------------------------------------------------------
+   * The only destructive button, so it goes through a modal. Enter/Escape and a
+   * click on the backdrop all work, and focus lands on Cancel rather than on
+   * "delete" -- a stray Enter should not remove a save. */
+  var modal = $('modal');
+  function confirmClear() {
+    return new Promise(function (resolve) {
+      modal.classList.add('show');
+      $('modal-cancel').focus();
+      function done(ok) {
+        modal.classList.remove('show');
+        document.removeEventListener('keydown', onKey);
+        modal.removeEventListener('click', onBackdrop);
+        $('modal-ok').onclick = null;
+        $('modal-cancel').onclick = null;
+        resolve(ok);
+      }
+      function onKey(e) {
+        if (e.key === 'Escape') done(false);
+        if (e.key === 'Enter') done(true);
+      }
+      function onBackdrop(e) { if (e.target === modal) done(false); }
+      document.addEventListener('keydown', onKey);
+      modal.addEventListener('click', onBackdrop);
+      $('modal-ok').onclick = function () { done(true); };
+      $('modal-cancel').onclick = function () { done(false); };
+    });
+  }
+
+  btnClearSaves.onclick = async function () {
+    if (!await confirmClear()) return;
+    try {
+      say('正在清除存档…', 'Deleting saves…');
+      var r = await api.clearSaves();
+      facts.saves = 0;
+      renderMeta(true);
+      say('已清除 <b>' + r.files + '</b> 个存档文件，游戏资源保留。',
+          'Deleted <b>' + r.files + '</b> save files; installed assets were kept.', 'ok');
+    } catch (e) {
+      say('清除失败：<b>' + (e && e.message ? e.message : e) + '</b>',
+          'Could not delete: ' + (e && e.message ? e.message : e), 'warn');
     }
   };
 

@@ -329,6 +329,38 @@
       return true;
     },
 
+    /** Delete the saves: every file under /data except the ones the engine
+     *  installed. Those are the same six names the installer writes, and keeping
+     *  them means "clear saves" does not cost a 17-second reinstall -- while
+     *  everything else in there (save slots, the hub save, settings) goes.
+     *
+     *  Directories are kept: the engine creates them itself and an empty package
+     *  directory is the state it starts from. Returns the file count removed. */
+    clearSaves: async function () {
+      var KEEP = /^(init\.dat|appinfo\.dat|environment\.inf|i_pack\.dat|i_tile\.dat|i_mapfeature\.dat)$/i;
+      var removed = 0;
+      (function walk(dir) {
+        var names;
+        try { names = FS.readdir(dir); } catch (e) { return; }
+        for (var i = 0; i < names.length; i++) {
+          var n = names[i];
+          if (n === '.' || n === '..') continue;
+          var path = dir + '/' + n, st;
+          try { st = FS.stat(path); } catch (e) { continue; }
+          if (FS.isDir(st.mode)) { walk(path); continue; }
+          if (!FS.isFile(st.mode) || KEEP.test(n)) continue;
+          try { FS.unlink(path); removed++; } catch (e) { /* leave it */ }
+        }
+      })('/data');
+      await new Promise(function (res) {
+        FS.syncfs(false, function (err) {
+          if (err) console.error('spike: syncfs after clear failed', err);
+          res();
+        });
+      });
+      return { files: removed };
+    },
+
     /** Everything under /data, as a zip the user can keep. */
     exportSaves: async function () {
       var entries = [];
