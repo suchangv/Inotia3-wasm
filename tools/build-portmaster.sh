@@ -32,8 +32,11 @@ mkdir -p "$OUT/libs" "$OUT/data"
 
 cp build/inotia3-aarch64 "$OUT/inotia3"
 strip "$OUT/inotia3" 2>/dev/null || true
-cp vendor/SDL2/dist-aarch64/lib/libSDL2-2.0.so.0 "$OUT/libs/"
-ln -sf libSDL2-2.0.so.0 "$OUT/libs/libSDL2-2.0.so"
+# As a *file* named with the SONAME the binary asks for, not a symlink: a zip
+# does not preserve symlinks, and the ld.so name is the only one that matters at
+# runtime.
+cp -f vendor/SDL2/dist-aarch64/lib/libSDL2-2.0.so.0.3000.9 \
+      "$OUT/libs/libSDL2-2.0.so.0"
 
 cp portmaster/port.json "$OUT/port.json"
 cp portmaster/README.txt "$OUT/README.txt"
