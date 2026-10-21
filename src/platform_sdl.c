@@ -511,6 +511,24 @@ static void probe_dlopen(const char *name, int global)
     dlclose(h);
 }
 
+/* A compositor owning the display is the normal case on these firmwares. Any
+ * driver that needs DRM master would have to take it away from that compositor
+ * even to answer "can I start?", so the probe does not ask. */
+static int compositor_running(void)
+{
+    const char *dir = getenv("XDG_RUNTIME_DIR");
+    char path[512];
+    if (dir) {
+        static const char *names[] = { "wayland-0", "wayland-1", "X11-unix" };
+        for (unsigned i = 0; i < sizeof(names) / sizeof(names[0]); i++) {
+            snprintf(path, sizeof(path), "%s/%s", dir, names[i]);
+            if (access(path, F_OK) == 0)
+                return 1;
+        }
+    }
+    return getenv("WAYLAND_DISPLAY") || getenv("DISPLAY") ? 1 : 0;
+}
+
 int host_sdl_vdprobe(void)
 {
     /* Unbuffered: when a driver's GL path takes the process down, everything
@@ -545,8 +563,15 @@ int host_sdl_vdprobe(void)
     probe_dlopen("libmali.so.1", 1);
     probe_dlopen("libGLESv2.so.2", 1);
 
+    int compositor = compositor_running();
     for (int i = 0; i < n; i++) {
         const char *name = SDL_GetVideoDriver(i);
+        if (compositor && (SDL_strcasecmp(name, "KMSDRM") == 0 ||
+                           SDL_strcasecmp(name, "directfb") == 0)) {
+            printf("%-9s skipped: a compositor owns the display, and asking "
+                   "would take DRM master from it\n", name);
+            continue;
+        }
         if (SDL_VideoInit(name) != 0) {
             printf("%-9s init FAILED: %s\n", name, SDL_GetError());
             continue;
@@ -562,17 +587,29 @@ int host_sdl_vdprobe(void)
          * a handheld: weston holding DRM master shows up here, not in init.
          * Everything is torn down between drivers so one driver's leftovers
          * cannot poison the next report. */
+        /* Attributes first: CreateWindow loads the GL library for an OPENGL
+         * window, and without the ES profile it would ask for desktop GL. */
+        SDL_GL_SetAttribute(SDL_GL_CONTEXT_PROFILE_MASK,
+                            SDL_GL_CONTEXT_PROFILE_ES);
+        SDL_GL_SetAttribute(SDL_GL_CONTEXT_MAJOR_VERSION, 3);
+        SDL_GL_SetAttribute(SDL_GL_CONTEXT_MINOR_VERSION, 0);
+        SDL_GL_SetAttribute(SDL_GL_DOUBLEBUFFER, 1);
+        SDL_GL_SetAttribute(SDL_GL_DEPTH_SIZE, 24);
+        SDL_GL_SetAttribute(SDL_GL_STENCIL_SIZE, 8);
         SDL_Window *w = SDL_CreateWindow(
             "probe", SDL_WINDOWPOS_CENTERED, SDL_WINDOWPOS_CENTERED,
             320, 240, SDL_WINDOW_OPENGL | SDL_WINDOW_HIDDEN);
         if (!w) {
             printf("%-9s   window FAILED: %s\n", name, SDL_GetError());
         } else {
-            SDL_GL_SetAttribute(SDL_GL_CONTEXT_PROFILE_MASK,
-                                SDL_GL_CONTEXT_PROFILE_ES);
             SDL_GL_SetAttribute(SDL_GL_CONTEXT_MAJOR_VERSION, 2);
             SDL_GL_SetAttribute(SDL_GL_CONTEXT_MINOR_VERSION, 0);
             SDL_GLContext ctx = SDL_GL_CreateContext(w);
+            if (!ctx) {
+                SDL_GL_SetAttribute(SDL_GL_CONTEXT_MAJOR_VERSION, 3);
+                SDL_GL_SetAttribute(SDL_GL_CONTEXT_MINOR_VERSION, 0);
+                ctx = SDL_GL_CreateContext(w);
+            }
             if (!ctx) {
                 printf("%-9s   window ok, GL FAILED: %s\n", name,
                        SDL_GetError());
