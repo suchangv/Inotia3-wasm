@@ -60,6 +60,7 @@
     // flush in platform_emscripten.c cannot be the only one. These two events
     // fire before the page goes away.
     addEventListener('pagehide', function () { flush('pagehide'); });
+    addEventListener('beforeunload', function () { flush('beforeunload'); });
     document.addEventListener('visibilitychange', function () {
       if (document.visibilityState === 'hidden') flush('hidden');
     });
@@ -68,11 +69,22 @@
     FS.syncfs(true, function (err) {
       if (err) console.error('spike: IDBFS load failed; starting with an empty /data', err);
       else {
-        var names = [];
-        try { names = FS.readdir('/data').filter(function (n) { return n !== '.' && n !== '..'; }); }
-        catch (e) { /* nothing stored yet */ }
+        // List what came back, one level down as well: "is the save there?" is
+        // the only question this log exists to answer, and a bare /data listing
+        // shows just the package directory either way.
+        var lines = [];
+        try {
+          FS.readdir('/data').forEach(function (n) {
+            if (n === '.' || n === '..') return;
+            var sub = '/data/' + n, names = null;
+            try {
+              if (FS.isDir(FS.stat(sub).mode)) names = FS.readdir(sub);
+            } catch (e) { /* not a directory */ }
+            lines.push(names && names.length ? n + '/ {' + names.join(', ') + '}' : n);
+          });
+        } catch (e) { /* nothing stored yet */ }
         console.log('spike: /data restored from IndexedDB: ' +
-                    (names.length ? names.join(', ') : '(empty, first run)'));
+                    (lines.length ? lines.join(', ') : '(empty, first run)'));
       }
       removeRunDependency('idbfs-load');
     });

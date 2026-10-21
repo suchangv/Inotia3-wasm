@@ -331,6 +331,7 @@ EM_JS(void, spike_storage_sync, (void), {
 });
 
 static int    g_storage_dirty;
+static int    g_storage_changes;    /* writes since the last sync, for the log */
 static double g_storage_since;      /* when the current dirty burst started */
 
 void host_storage_dirty(const char *path)
@@ -343,6 +344,13 @@ void host_storage_dirty(const char *path)
     if (!g_storage_dirty)
         g_storage_since = emscripten_get_now();
     g_storage_dirty = 1;
+    g_storage_changes++;
+    /* Naming the first few paths is what turns "the save is not there after a
+     * reload" into an answer: either the path never appears here (the engine
+     * wrote somewhere this layer does not watch) or it does and the sync is the
+     * thing to look at. */
+    if (g_storage_changes <= 12)
+        host_log("storage: changed %s\n", path);
 }
 
 void host_storage_flush(void)
@@ -351,6 +359,13 @@ void host_storage_flush(void)
         return;
     g_storage_dirty = 0;
     g_storage_since = emscripten_get_now();
+    /* MEMFS is only told about bytes that reached it, and libc's stdio buffer
+     * sits between the engine's write() and the filesystem. Without this a sync
+     * triggered by fsync() would copy the file as it was before the last write. */
+    fflush(NULL);
+    host_log("storage: syncfs (%d change%s)\n", g_storage_changes,
+             g_storage_changes == 1 ? "" : "s");
+    g_storage_changes = 0;
     spike_storage_sync();
 }
 

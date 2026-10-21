@@ -1577,6 +1577,12 @@ void host_import_call(guest_import *im)
             if (f) { fclose(f); f = fopen(g_path_buf, "r+b"); }
         }
         note_open(g_path_buf, f != NULL);
+        /* A creating or writing open may end up as the only filesystem change
+         * (a truncate, an empty save, a create that is closed without a write),
+         * so it counts as a change on its own. Only the browser build does
+         * anything with this -- see host_storage_dirty(). */
+        if (f && (wr || cre || tr))
+            host_storage_dirty(g_path_buf);
         /* Returns 0 on failure, not -1. That is wrong for open(2) -- 0 is a
          * valid descriptor -- but it is what this port did before there was a
          * file layer at all, and the engine's boot depends on it: with a
@@ -1587,8 +1593,15 @@ void host_import_call(guest_import *im)
         break;
     }
     case IMPL_close: {
+        /* A close is where libc's stdio buffer actually reaches the filesystem,
+         * so on the browser it is also where a buffered write becomes visible to
+         * FS.syncfs. Reporting it (not just the write) keeps a save that was
+         * still buffered from being skipped: the tick may already have synced
+         * and cleared the dirty flag between the write and this close. */
         FILE *f = file_of(a0);
         if (f) { fclose(f); g_files[a0] = NULL; }
+        if (a0 < FIOMAX)
+            host_storage_dirty(g_file_path[a0]);
         R[0] = 0;
         break;
     }
@@ -1604,8 +1617,14 @@ void host_import_call(guest_import *im)
         break;
     }
     case IMPL_write: {
+        /* write(2) is a *different import* from fwrite, and it is the one the
+         * engine saves through (open/write/fsync/close). Marking only fwrite
+         * left every save unsynced: the bytes landed in MEMFS, fsync found
+         * nothing dirty to flush, and a reload came back without the file. */
         FILE *f = file_of(a0);
         R[0] = (f && a1) ? (uint32_t)fwrite(g_mem + a1, 1, a2, f) : (uint32_t)-1;
+        if (f && R[0] && a0 < FIOMAX)
+            host_storage_dirty(g_file_path[a0]);
         break;
     }
     case IMPL_lseek: {
@@ -1733,10 +1752,13 @@ void host_import_call(guest_import *im)
          * that would not be flushed by fclose anyway. Reporting failure would
          * make the engine think the save did not happen.
          *
-         * In the browser that reasoning is wrong: the bytes are in MEMFS, and
-         * MEMFS does not survive a reload until FS.syncfs runs. This is the
-         * clearest "commit the save" point the engine offers, so it is also the
-         * point where the browser build makes it durable. */
+         * In the browser that reasoning is wrong twice over: the bytes may still
+         * sit in libc's stdio buffer, and even once they are in MEMFS, MEMFS
+         * does not survive a reload until FS.syncfs runs. So flush the stream
+         * first, then the platform's own storage. */
+        FILE *f = file_of(a0);
+        if (f)
+            fflush(f);
         host_storage_flush();
         R[0] = 0;
         break;
