@@ -175,6 +175,10 @@ static uint32_t find_symbol(const char *name)
 
 /* ---- profile report ------------------------------------------------------ */
 
+/* Called by the SDL host on the way out: without it the shipped build is the
+ * only one that cannot say where its frame time goes. */
+void spike_report_profile(int top_n);
+
 static void report_profile(int top_n)
 {
     uint64_t *counts = cpu_profile_counts();
@@ -217,6 +221,8 @@ static void report_profile(int top_n)
                  e->size, nm && *nm ? nm : "(unnamed)");
     }
 }
+
+void spike_report_profile(int n) { report_profile(n); }
 
 /* ---- running one guest entry point --------------------------------------- */
 
@@ -1642,7 +1648,14 @@ static int spike_sdl_run(int argc, char **argv)
         return 1;
     }
     g_budget = 3000u * 1000u * 1000u;
-    g_do_profile = 0;
+    cpu_profile_clear();          /* report on the frame loop, not on the boot */
+    /* Profiling costs a counter bump per guest instruction (~2-5%), so the game
+     * build leaves it off unless asked: SPIKE_DEBUG=1 in env.txt prints the
+     * hottest guest functions at exit, which is the only way to know whether a
+     * frame's 2.3M instructions are spread out or concentrated in something a
+     * host implementation could remove. */
+    g_do_profile = getenv("SPIKE_DEBUG") || getenv("SPIKE_PROFILE") ? 1 : 0;
+    cpu_set_profile(g_do_profile);
     /* Real elapsed time: the engine's own 66 ms frame period is the game's
      * speed, and a fixed step would fight it. */
     g_use_fixed_step = 0;

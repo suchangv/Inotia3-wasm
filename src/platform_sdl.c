@@ -714,6 +714,12 @@ int host_sdl_init(void)
 
 void host_sdl_finish(void)
 {
+    if (getenv("SPIKE_DEBUG")) {
+        /* Where the interpreter's time went, by guest function: the frame
+         * lines say how many instructions per frame, this says whose. */
+        extern void spike_report_profile(int n);
+        spike_report_profile(25);
+    }
     if (g_pad) {
         SDL_GameControllerClose(g_pad);
         g_pad = NULL;
@@ -1197,6 +1203,19 @@ void host_sdl_present(void)
         else {
             screenshot(g_sdl_shot, rotating());
             g_sdl_shot = NULL;
+        }
+    }
+    /* SPIKE_PROFILE_AT=N: zero the guest profile at presented frame N, so the
+     * report at exit describes gameplay instead of the asset decode that
+     * happens in the first hundred frames (414M instructions of LZMA). */
+    {
+        static int presented;
+        const char *at = getenv("SPIKE_PROFILE_AT");
+        presented++;
+        if (at && presented == atoi(at)) {
+            extern void cpu_profile_clear(void);
+            cpu_profile_clear();
+            host_log("profile: counters cleared at frame %d\n", presented);
         }
     }
     /* Frame-time statistics: "it feels slow" becomes numbers with

@@ -1539,6 +1539,15 @@ void cpu_dump_state(void)
 
 /* Exposed for the profile report. */
 uint64_t *cpu_profile_counts(void) { return g_prof.counts; }
+
+/* Zero the counters so a report can cover the frame loop instead of the asset
+ * boot: on this game the boot is 60% LZMA decode and says nothing about why a
+ * frame takes 84 ms. */
+void cpu_profile_clear(void)
+{
+    for (int i = 0; i < g_img->nsorted; i++)
+        g_prof.counts[i] = 0;
+}
 int       cpu_profile_active(void) { return g_prof.on; }
 
 /* ---- calling guest code from inside a host import ------------------------ */

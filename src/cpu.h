@@ -90,6 +90,7 @@ void cpu_dump_state(void);
 /* Per-symbol instruction counts, indexed by position in image->sorted.
  * Valid only between cpu_init() and process exit. */
 uint64_t *cpu_profile_counts(void);
+void      cpu_profile_clear(void);
 
 /* Ring buffer of the last N executed instructions, for bring-up. Safe to call
  * from a signal handler. */
