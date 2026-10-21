@@ -1,6 +1,9 @@
 # --- Copyrighted game material: never commit ---
 # Supply your own legally-obtained copy (libgame.so + assets) locally.
 game/
+# data/ is the engine's asset directory as the game writes it at install time
+# (init.dat, i_pack.dat, i_tile.dat, ...): Com2uS content, never published.
+data/
 *.so
 *.apk
 *.obb

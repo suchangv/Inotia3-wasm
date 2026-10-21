@@ -89,9 +89,49 @@ verification uses.
 
 ## Game files are not in this repository
 
-`game/` is gitignored, as are `*.so`, `*.apk` and `*.obb`. Supply your own
-legally-obtained copy. `libgame.so` is Com2uS's copyrighted work and is not
-distributed here.
+`game/`, `data/`, `*.so`, `*.apk` and `*.obb` are gitignored. Supply your own
+legally-obtained copy. `libgame.so` and everything the engine unpacks out of it
+are Com2uS's copyrighted work and are not distributed here. This holds for the
+**whole history**, not just the current tree: the commits that once carried
+`data/com.com2us.inotia3.google.global/` and the `fb*.raw` frame dumps were
+rewritten before this repository was first published, so no blob of game
+content exists in any reachable commit.
+
+## Standing on other people's work
+
+Three projects made this one possible. None of them is vendored here; each is a
+dependency you fetch or install yourself (see [docs/REUSE.md](docs/REUSE.md)).
+
+**[unicorn-engine](https://github.com/unicorn-engine/unicorn)** — it is what
+makes the CPU interpreter *verifiable*. `tools/difftest.sh` runs the same
+relocated `libgame.so` twice: once under `src/cpu.c`, once under Unicorn's ARM
+core with a per-instruction code hook, and `tools/difftrace.py` diffs the two
+traces. Both sides start from identical guest memory, so the first differing
+line is a decoder bug by construction — it names the instruction, the register
+file and the guest PC. Every Thumb-1/ARM/VFP fix this port needed was found that
+way, and `--all` sweeps the entry point of all 5962 functions in `.text`. An
+interpreter this size cannot be trusted without a second implementation to
+disagree with; this is that implementation.
+
+**[gl4es](https://github.com/ptitSeb/gl4es)** — it is what makes the GPU part
+possible at all. The game speaks only GLES1 fixed-function with the fixed-point
+entry points (`glVertexPointerx`, `glClearColorx`, `glOrthox`, ...), which no
+current driver implements; gl4es translates that pipeline to GLES2.
+`src/gl4es_bridge.c` is then a thin adapter: the guest's ARM soft-float ABI on
+one side, `gl4es_gl*` on the other, plus the `GL_FIXED` → `float` conversion
+WebGL requires. The GL work here is adapter code, not a renderer.
+
+**[Inotia3-vita](https://github.com/MetalSyntax/Inotia3-vita)** — the native
+PS Vita port of this same engine, and the reason this took weeks instead of
+months. It is where the guest lifecycle came from (`nativePreInit` →
+`nativeInit` → per-tick `nativeEvent`/`nativeRender`, and the three-step
+pause/resume), along with the JNI offsets, the touch-target coordinates, the
+finding that `UI_listControl` is the one hookable hit-test registry, and the
+binary patches the engine needs to run offline. `src/patches.c` here is that
+port's decisions re-applied through a simpler mechanism, and
+[docs/SPIKE.md](docs/SPIKE.md) records where the two ports agree and where this
+one had to differ. Reverse-engineering an unfamiliar 745 KB binary is the
+longest, least rewarding part of a port; that work was already done there.
 
 ## Status
 
