@@ -1,0 +1,16 @@
+{
+  "version": 3,
+  "name": "K_艾诺迪亚3[中]",
+  "items": [
+    {
+      "name": "Inotia 3",
+      "desc": "The Android ARPG, running its original libgame.so under an ARM interpreter.",
+      "author": "port by the Inotia 3 port project",
+      "version": "0.2",
+      "runtime": "sdl2",
+      "porter": "Inotia 3 Vita/Web port",
+      "reqs": "libgame.so + assets.apk from your own APK",
+      "files": "libgame.so assets.apk"
+    }
+  ]
+}

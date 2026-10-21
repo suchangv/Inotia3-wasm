@@ -12,40 +12,66 @@
 # the GLES1 work over the firmware's GLES2 driver, SDL2 owns the window, the pad
 # and the sound, and no Java or WebView is involved.
 #
-# This script is written so that it *always* leaves a log behind, including when
-# it dies before it can cd, and so that the reason is also printed to whatever
-# console the launcher was started from (fd 3). A port that vanishes without a
-# trace is undebuggable; that is the whole point of the first thirty lines.
+# This is a *debug* build of the launcher: it trace-logs (set -x), it writes a
+# breadcrumb before it does anything else, and when something goes wrong it
+# prints the reason to the console (and to /dev/tty0, which on this class of
+# firmware is the screen) and waits ten seconds so the message can be read.
+# Silence on a failure is what costs round trips; noise is cheap.
 
-# ---- where we are, without needing a successful cd -------------------------
+# ---- 1. prove the script ran at all ----------------------------------------
+# No variables, no functions, no cd: absolute paths only, and every statement
+# tolerated to fail. If neither of these files appears after launching the port,
+# the shell never executed this file -- which is a completely different bug
+# (execute bit, CRLF line endings, or the menu never finding it).
+printf 'inotia3 launcher ran %s\n' "$(date 2>/dev/null)" >>/roms/ports/inotia3-boot.log 2>/dev/null
+printf 'inotia3 launcher ran %s\n' "$(date 2>/dev/null)" >>/tmp/inotia3-boot.log 2>/dev/null
+
+# ---- 2. where are we, without needing a successful cd ----------------------
 case "$0" in
     */*) SELFDIR=${0%/*} ;;
     *)   SELFDIR=. ;;
 esac
 [ -d "$SELFDIR" ] || SELFDIR=.
 SELFDIR=$(cd "$SELFDIR" 2>/dev/null && pwd) || SELFDIR=.
-PORTDIR="$SELFDIR/inotia3"
 
-# ---- keep the console, then redirect everything into a log -----------------
-# fd 3 stays on the original stdout: the firmware shows that on screen (or drops
-# it, which is fine), while the log keeps the full transcript.
-# Test first in a subshell: a failed "exec 3>&1" with no command exits a
-# non-interactive shell, and a launcher killed by its own logging would be a
-# spectacular way to lose a debugging round.
+# A zip unpacked by Windows' "Extract All" lands one level down, and the menu
+# entry then sits outside the directory it needs. Look one level deep before
+# giving up -- that mistake should not look like a crash.
+find_portdir() {
+    for d in "$SELFDIR/inotia3" "$SELFDIR"/*/inotia3 "$SELFDIR/inotia3.aarch64"; do
+        [ -d "$d" ] || continue
+        [ -f "$d/inotia3" ] || [ -f "$d/inotia3.aarch64" ] || continue
+        printf '%s\n' "$d"
+        return 0
+    done
+    return 1
+}
+PORTDIR=$(find_portdir) || PORTDIR="$SELFDIR/inotia3"
+
+# ---- 3. keep the console, then send everything to a log --------------------
 HAVE3=
 if ( : >&1 ) 2>/dev/null; then
     exec 3>&1 2>/dev/null && HAVE3=1
 fi
 
-say() {
-    # to the log (fd 1) and, when there is one, to the console
-    printf '%s\n' "$*"
+# The reason, on the screen, for ten seconds. /dev/tty0 is the text console on
+# these firmwares; if it cannot be opened this is a no-op. It is written before
+# and after sleeping so a repaint cannot swallow it.
+show() {
     [ -n "$HAVE3" ] && printf '%s\n' "$*" >&3 2>/dev/null
+    if [ -w /dev/tty0 ]; then
+        printf '\033[2J\033[H  Inotia 3: %s\n\n  (this message stays for 10 s;\n   a log was written to inotia3-boot.log / inotia3.log)\n' \
+            "$*" > /dev/tty0 2>/dev/null
+    fi
     return 0
 }
+fail() {
+    show "$*"
+    printf '%s\n' "$*"
+    [ -n "$HAVE3" ] && sleep 10
+    return 1
+}
 
-# Three candidates, in the order the player is likely to look: next to the game
-# files, next to the launcher, then /tmp (for a read-only card).
 LOG=
 for candidate in "$PORTDIR/inotia3.log" "$SELFDIR/inotia3.log" "/tmp/inotia3.log"; do
     if ( : > "$candidate" ) 2>/dev/null; then
@@ -59,19 +85,20 @@ else
     exec > /dev/null 2>&1
 fi
 
-say "--- $(date) ---"
-say "launcher: $0"
-say "selfdir:  $SELFDIR"
-say "log:      ${LOG:-<none writable>}"
+printf '%s\n' "--- $(date) ---"
+printf '%s\n' "launcher: $0"
+printf '%s\n' "selfdir:  $SELFDIR"
+printf '%s\n' "portdir:  $PORTDIR"
+printf '%s\n' "log:      ${LOG:-<none writable>}"
+printf '%s\n' "args:     $*"
 
-# ---- the facts a remote debugging round always ends up asking for ----------
-# uname/glibc answer "which firmware is this and is my binary even loadable",
-# which is exactly what a silent exit usually comes down to.
-say "kernel:   $(uname -srm 2>/dev/null)"
-say "glibc:    $(ldd --version 2>&1 | head -1)"
-say "os:       $(head -3 /etc/os-release 2>/dev/null | tr '\n' ' ')"
-say "device:   ${DEVICE:-?}  panel: ${DISPLAY_WIDTH:-?}x${DISPLAY_HEIGHT:-?}"
-say "locale:   ${LC_ALL:-${LANG:-?}}  video: ${SDL_VIDEODRIVER:-auto}"
+# ---- 4. the facts a remote round trip always ends up asking for ------------
+printf '%s\n' "kernel:   $(uname -srm 2>/dev/null)"
+printf '%s\n' "glibc:    $(ldd --version 2>&1 | head -1)"
+printf '%s\n' "os:       $(head -3 /etc/os-release 2>/dev/null | tr '\n' ' ')"
+printf '%s\n' "device:   ${DEVICE:-?}  panel: ${DISPLAY_WIDTH:-?}x${DISPLAY_HEIGHT:-?}"
+printf '%s\n' "locale:   ${LC_ALL:-${LANG:-?}}  video: ${SDL_VIDEODRIVER:-auto}"
+printf '%s\n' "disk:     $(df -h . 2>/dev/null | tail -1)"
 
 # PortMaster's own preamble: the folder has moved between releases, so try the
 # known names and fall back to one next to this script. Not being able to find
@@ -90,39 +117,47 @@ fi
 # way (it would grab the controller and inject keys the game cannot use).
 get_controls 2>/dev/null || true
 
-# ---- the port directory -----------------------------------------------------
-if [ ! -f "$PORTDIR/inotia3" ]; then
-    say "Inotia 3: $PORTDIR/inotia3 is missing."
-    say "The archive must unpack to:"
-    say "    <ports>/K_艾诺迪亚3[中].sh"
-    say "    <ports>/inotia3/inotia3"
-    say "found next to the launcher:"
-    ls -la "$SELFDIR" 2>&1 | sed 's/^/    /'
-    [ -d "$PORTDIR" ] && ls -la "$PORTDIR" 2>&1 | sed 's/^/    /'
-    [ -n "$HAVE3" ] && sleep 5
+# Trace from here on: when the script dies somewhere unexpected, the last
+# traced line says where.
+set -x
+
+# ---- 5. the port directory ------------------------------------------------
+if [ ! -d "$PORTDIR" ]; then
+    fail "no port directory next to the launcher (looked for $PORTDIR)"
+    printf '%s\n' 'what is next to the launcher:'
+    ls -la "$SELFDIR" 2>&1
+    printf '%s\n' 'one level down:'
+    ls -la "$SELFDIR"/*/ 2>&1 | head -40
     exit 1
 fi
+cd "$PORTDIR" || { fail "cannot cd to $PORTDIR"; exit 1; }
+printf '%s\n' "cwd:      $(pwd)"
+printf '%s\n' 'contents:'
+ls -la 2>&1
+printf '%s\n' 'libs:'
+ls -la libs 2>&1
 
-cd "$PORTDIR" || {
-    say "Inotia 3: cannot cd to $PORTDIR"
-    exit 1
-}
-say "cwd:      $(pwd)"
+# The binary is shipped as 'inotia3' (the doc's layout says 'inotia3.aarch64');
+# accept either, so a rename while testing does not read as a crash.
+ENGINE=
+for c in ./inotia3 ./inotia3.aarch64; do
+    [ -f "$c" ] && ENGINE=$c && break
+done
+[ -n "$ENGINE" ] || { fail "no engine binary in $PORTDIR (expected ./inotia3)"; exit 1; }
 
 # A zip unpacked on Windows arrives without the execute bits; the loader also
 # needs the libraries readable. Fixing our own files is harmless when they are
 # already right.
-chmod 755 inotia3 2>/dev/null
+chmod 755 "$ENGINE" 2>/dev/null
 chmod 644 libs/*.so* 2>/dev/null
 
 missing=
 [ -f libgame.so ] || missing="$missing libgame.so"
 [ -f assets.apk ] || missing="$missing assets.apk"
 if [ -n "$missing" ]; then
-    say "Inotia 3: missing$missing in $(pwd)"
-    say "  libgame.so  from lib/armeabi/libgame.so inside the APK"
-    say "  assets.apk  the APK itself, renamed"
-    [ -n "$HAVE3" ] && sleep 5
+    fail "missing$missing in $PORTDIR"
+    printf '%s\n' '  libgame.so  from lib/armeabi/libgame.so inside the APK'
+    printf '%s\n' '  assets.apk  the APK itself, renamed'
     exit 1
 fi
 
@@ -134,23 +169,23 @@ export LD_LIBRARY_PATH
 # Resolve the binary's libraries without running it. This prints the loader's
 # own verdict -- "GLIBC_2.38 not found", "libSDL2-2.0.so.0 => not found" -- into
 # the log, which is the one thing we cannot otherwise see from the Ports menu.
-say "--- loader check ---"
-( LD_TRACE_LOADED_OBJECTS=1 ./inotia3 ) 2>&1 | sed 's/^/    /'
-say "--- files ---"
-ls -l inotia3 libs/libSDL2-2.0.so.0 2>&1 | sed 's/^/    /'
+printf '%s\n' '--- loader check ---'
+( LD_TRACE_LOADED_OBJECTS=1 "$ENGINE" ) 2>&1 | sed 's/^/    /'
+printf '%s\n' '--- files ---'
+ls -l "$ENGINE" libs/libSDL2-2.0.so.0 2>&1
 
 # XDG_RUNTIME_DIR is deliberately left alone: on this firmware a weston session
 # owns it, and overwriting it breaks the compositor (black screen, 90 degree
 # rotation).
-[ -n "$pm_platform_helper" ] && pm_platform_helper "$PORTDIR/inotia3"
+[ -n "$pm_platform_helper" ] && pm_platform_helper "$PORTDIR/$ENGINE"
 
-say "--- starting ---"
-./inotia3 "$@"
+printf '%s\n' '--- starting ---'
+"$ENGINE" "$@"
 rc=$?
-say "--- exit $rc ---"
+printf '%s\n' "--- exit $rc ---"
 case $rc in
-    126) say "126 = not executable (the card may be mounted noexec)" ;;
-    127) say "127 = the loader could not start the binary: look at the loader check above" ;;
+    126) printf '%s\n' '126 = not executable (the card may be mounted noexec)' ;;
+    127) printf '%s\n' '127 = the loader could not start the binary: see the loader check above' ;;
 esac
 [ -n "$pm_finish" ] && pm_finish
 
@@ -160,8 +195,8 @@ if [ -n "$LOG" ] && [ "$LOG" != "$SELFDIR/inotia3.log" ]; then
 fi
 
 if [ $rc -ne 0 ]; then
-    say "dmesg (tail):"
+    printf '%s\n' '--- dmesg (tail) ---'
     dmesg 2>/dev/null | tail -20 | sed 's/^/    /'
-    [ -n "$HAVE3" ] && sleep 5
+    fail "the engine exited with code $rc (details in $LOG)"
 fi
 exit $rc
