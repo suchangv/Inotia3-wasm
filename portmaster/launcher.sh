@@ -176,9 +176,64 @@ printf '%s\n' '--- loader check ---'
 printf '%s\n' "wayland:  XDG_RUNTIME_DIR=${XDG_RUNTIME_DIR:-unset} WAYLAND_DISPLAY=${WAYLAND_DISPLAY:-unset}"
 printf '%s\n' "sockets:  $(ls "${XDG_RUNTIME_DIR:-/run/user/0}" 2>/dev/null | tr '\n' ' ')"
 printf '%s\n' "dri:      $(ls /dev/dri 2>/dev/null | tr '\n' ' ')"
-printf '%s\n' "gl:       $(ls /usr/lib/libEGL* /usr/lib/libGLES* /usr/lib/libmali* /usr/lib/libwayland* 2>/dev/null | tr '\n' ' ')"
-printf '%s\n' "--- video driver probe ---"
-"$ENGINE" --vdprobe 2>&1 | sed 's/^/    /'
+# -l on purpose: a broken symlink lists fine without it, and libmali is
+# normally a chain of symlinks.
+printf '%s\n' '--- gl libraries ---'
+for l in /usr/lib/libEGL.so* /usr/lib/libGLESv2.so* /usr/lib/libmali* \
+         /usr/lib/libgbm* /usr/lib/libdrm.so* /usr/lib/libwayland-client.so* ; do
+    [ -e "$l" ] || [ -L "$l" ] || continue
+    ls -l "$l" 2>&1 | sed 's/^/    /'
+done
+
+# Which vendor GL library to preload, if the probe says we have to.
+glpre=
+for l in /usr/lib/libmali.so.1 /usr/lib/libmali.so /lib/libmali.so.1 /usr/lib/libEGL.so.1; do
+    [ -e "$l" ] && glpre=$l && break
+done
+
+# The probe is the only place where SDL's silent fallback gets explained, and
+# it is also the cheapest way to test the two known fixes for "cannot
+# initialize GL": preloading the vendor library (static TLS is sized at process
+# start -- a libmali that wants initial-exec TLS only loads from LD_PRELOAD),
+# and naming the GL library by absolute path (firmwares whose loader cache does
+# not cover /usr/lib).
+set +x
+printf '%s\n' '--- video driver probe ---'
+probe=$("$ENGINE" --vdprobe 2>&1)
+printf '%s\n' "$probe" | sed 's/^/    /'
+case "$probe" in
+*"window ok"*)
+    ;;
+*)
+    if [ -n "$glpre" ]; then
+        printf '%s\n' "--- retry: LD_PRELOAD=$glpre ---"
+        p2=$(LD_PRELOAD="$glpre" "$ENGINE" --vdprobe 2>&1)
+        printf '%s\n' "$p2" | sed 's/^/    /'
+        case "$p2" in
+        *"window ok"*)
+            export LD_PRELOAD="$glpre"
+            printf '%s\n' "--- using LD_PRELOAD=$glpre ---"
+            ;;
+        esac
+    fi
+    if [ -z "${LD_PRELOAD:-}" ]; then
+        for g in /usr/lib/libGLESv2.so.2 /usr/lib/libEGL.so.1; do
+            [ -e "$g" ] || continue
+            printf '%s\n' "--- retry: SDL_VIDEO_GL_DRIVER=$g ---"
+            p3=$(SDL_VIDEO_GL_DRIVER="$g" "$ENGINE" --vdprobe 2>&1)
+            printf '%s\n' "$p3" | sed 's/^/    /'
+            case "$p3" in
+            *"window ok"*)
+                export SDL_VIDEO_GL_DRIVER="$g"
+                printf '%s\n' "--- using SDL_VIDEO_GL_DRIVER=$g ---"
+                break
+                ;;
+            esac
+        done
+    fi
+    ;;
+esac
+set -x
 printf '%s\n' '--- files ---'
 ls -l "$ENGINE" libs/libSDL2-2.0.so.0 2>&1
 

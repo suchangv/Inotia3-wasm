@@ -396,6 +396,25 @@ static struct {
  * Harmless everywhere: it opens and closes the video subsystem once per driver
  * and never starts the engine.
  */
+/* ---- dlopen probe ---------------------------------------------------------
+ * SDL's own message ("Could not initialize OpenGL / GLES library") is set
+ * *after* it has thrown away the reason the loader gave. Ask the loader
+ * directly: the string dlerror() returns is the whole diagnosis -- a missing
+ * object, an undefined symbol, or "cannot allocate memory in static TLS
+ * block", which is not a missing file at all and has a different fix.
+ */
+static void probe_dlopen(const char *name, int global)
+{
+    void *h = dlopen(name, RTLD_NOW | (global ? RTLD_GLOBAL : RTLD_LOCAL));
+    if (!h) {
+        const char *e = dlerror();
+        printf("  dlopen %-24s FAILED: %s\n", name, e ? e : "(no error)");
+        return;
+    }
+    printf("  dlopen %-24s ok%s\n", name, global ? " (global)" : "");
+    dlclose(h);
+}
+
 int host_sdl_vdprobe(void)
 {
     /* Unbuffered: when a driver's GL path takes the process down, everything
@@ -410,6 +429,25 @@ int host_sdl_vdprobe(void)
            getenv("XDG_RUNTIME_DIR") ? getenv("XDG_RUNTIME_DIR") : "(unset)",
            getenv("WAYLAND_DISPLAY") ? getenv("WAYLAND_DISPLAY") : "(unset)",
            getenv("DISPLAY") ? getenv("DISPLAY") : "(unset)");
+
+    /* The libraries the GL path needs, loaded one at a time so their
+     * individual verdicts cannot hide behind each other. */
+    static const char *libs[] = {
+        "libGLESv2.so.2", "libGLESv2.so", "libGLESv1_CM.so.1",
+        "libEGL.so.1", "libEGL.so", "libmali.so.1", "libmali-hook.so.1",
+        "libgbm.so.1", "libdrm.so.2", "libwayland-client.so.0",
+        "libwayland-egl.so.1", "libxkbcommon.so.0",
+    };
+    printf("libraries:\n");
+    for (unsigned i = 0; i < sizeof(libs) / sizeof(libs[0]); i++)
+        probe_dlopen(libs[i], 0);
+
+    /* RTLD_GLOBAL first, i.e. what LD_PRELOAD would have done: a vendor GL
+     * library that needs initial-exec TLS can only come in before the main
+     * thread's TLS block is sized, and the launcher can do exactly this. */
+    printf("preload attempt (RTLD_GLOBAL):\n");
+    probe_dlopen("libmali.so.1", 1);
+    probe_dlopen("libGLESv2.so.2", 1);
 
     for (int i = 0; i < n; i++) {
         const char *name = SDL_GetVideoDriver(i);
