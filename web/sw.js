@@ -9,7 +9,7 @@
 // (APK, and /data through IDBFS), are large, and must never be duplicated into
 // the Cache API where a version bump would silently drop them.
 
-const VERSION = 'inotia3-wasm-v10';
+const VERSION = 'inotia3-wasm-v11';
 const SHELL = [
   './',
   './index.html',
@@ -17,7 +17,11 @@ const SHELL = [
   './inotia3.wasm',
   './vorbis.js',
   './vorbis.wasm',
-  './manifest.webmanifest'
+  './manifest.webmanifest',
+  './icons/icon-192.png',
+  './icons/icon-512.png',
+  './icons/icon-512-maskable.png',
+  './icons/apple-touch-icon.png'
 ];
 
 self.addEventListener('install', (e) => {
