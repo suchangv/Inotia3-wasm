@@ -2,7 +2,10 @@
 <html lang="zh-CN">
 <head>
 <meta charset="utf-8">
-<meta name="viewport" content="width=device-width, initial-scale=1">
+<!-- viewport-fit=cover: without it iOS standalone (home-screen) insets the page
+     away from the notch and paints the uncovered strip itself -- which in
+     landscape is a white band down each side of an otherwise black game. -->
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
 <meta name="color-scheme" content="light">
 <link rel="manifest" href="manifest.webmanifest">
 <meta name="theme-color" content="#f5f7fa">
@@ -170,21 +173,13 @@
     -webkit-backdrop-filter: blur(6px);
   }
   #fs-exit:hover { background: rgba(20, 26, 36, .78); }
-  #btn-home {
-    position: fixed; top: 10px; left: 10px; z-index: 70; display: none;
-    font: 600 13px/1 inherit; color: #fff; background: rgba(20, 26, 36, .58);
-    border: 1px solid rgba(255, 255, 255, .28); border-radius: 999px;
-    padding: 9px 14px; cursor: pointer; backdrop-filter: blur(6px);
-    -webkit-backdrop-filter: blur(6px);
-  }
-  #btn-home:hover { background: rgba(20, 26, 36, .78); }
-  body.immersive #btn-home.show { display: block; }
+
   body.immersive #fs-exit { display: block; }
   body.immersive { overflow: hidden; }
   /* Everything behind the canvas is black while playing. The page itself is
    * light, and the letterbox bands (large on a 4:3 iPad) were showing that
    * light background through -- on both iOS and Android. */
-  html.immersive, body.immersive { background: #05070a; }
+  html.immersive, body.immersive { background: #05070a; height: 100%; }
   .stage:fullscreen::backdrop, .stage:-webkit-full-screen::backdrop { background: #05070a; }
 
 
@@ -339,7 +334,6 @@
 <input id="file-apk"   type="file" hidden>
 <input id="file-saves" type="file" hidden>
 <button id="fs-exit" type="button">退出全屏 / Exit</button>
-<button id="btn-home" type="button">回到首页 / Home</button>
 
 <div id="modal" class="modal" role="dialog" aria-modal="true" aria-labelledby="modal-title">
   <div class="modal-card">
@@ -540,20 +534,17 @@ window.Module = {
     canvas.style.height = Math.max(1, Math.round(544 * s)) + 'px';
   }
 
-  /* iPhone in landscape gets no exit button -- it is in the middle of the
-   * picture, the game is the only thing on screen, and leaving is what the
-   * system gesture is for. In portrait there is a band of empty screen and no
-   * other way out, so it gets 回到首页 / Home instead. */
+  /* iPhone in landscape gets no button at all: the game is the whole screen, a
+   * button in the corner sits on the picture, and the system gesture is the way
+   * out. Portrait keeps the normal exit button -- there is empty screen to put it
+   * in and no gesture that a one-handed player would find. */
   var IS_IOS = /iPad|iPhone|iPod/.test(navigator.userAgent) ||
                (navigator.platform === 'MacIntel' && navigator.maxTouchPoints > 1);
   function updateImmersiveButtons() {
     var landscape;
     try { landscape = window.matchMedia('(orientation: landscape)').matches; }
     catch (e) { landscape = window.innerWidth > window.innerHeight; }
-    var exit = $('fs-exit'), home = $('btn-home');
-    exit.style.display = (IS_IOS && landscape) ? 'none' : '';
-    var wantHome = IS_IOS && !landscape && document.body.classList.contains('immersive');
-    home.classList.toggle('show', wantHome);
+    $('fs-exit').style.display = (IS_IOS && landscape) ? 'none' : '';
   }
 
   function immersiveOn() {
@@ -587,7 +578,6 @@ window.Module = {
     stageEl.classList.remove('pseudo');
     document.body.classList.remove('immersive');
     document.documentElement.classList.remove('immersive');
-    $('btn-home').classList.remove('show');
     layoutStage();
     updateImmersiveButtons();
   }
@@ -598,10 +588,6 @@ window.Module = {
     window.visualViewport.addEventListener('resize', onViewportChange);
 
   $('fs-exit').onclick = immersiveOff;
-  // Leaving the game is a navigation, not an exit from immersive mode: the page
-  // behind is the one that owns importing and saves, and reloading it re-reads
-  // both from IndexedDB.
-  $('btn-home').onclick = function () { location.href = './'; };
   $('fs-enter').onclick = immersiveOn;
   document.addEventListener('fullscreenchange', function () {
     // Leaving real fullscreen by any route (F11, Esc, system gesture) should
@@ -737,6 +723,14 @@ window.Module = {
   });
   window.addEventListener('unhandledrejection', function (e) {
     var r = e && e.reason;
+    // A rejected decodeAudioData is not a page error: Safari has no Vorbis
+    // decoder, every sound rejects there, and web/vorbis.js picks it up. Those
+    // are reported once by the sound layer, not once per file on the status
+    // line.
+    if (r && (r.name === 'EncodingError' || r.name === 'NotSupportedError')) {
+      console.debug('spike: audio decode rejection (handled):', r.name);
+      return;
+    }
     var msg = (r && (r.message || r)) || 'unhandled rejection';
     say('运行时错误：<b>' + msg + '</b>', 'Runtime error: ' + msg, 'warn');
   });

@@ -123,20 +123,25 @@ mergeInto(LibraryManager.library, {
             function fail(why) {
                 slot.decoding = false;
                 if ((PAudio.failures = (PAudio.failures || 0) + 1) <= 6)
-                    console.warn('[snd] decode failed: ' + slot.name + ': ' + why);
+                    console.warn('[snd] no Vorbis fallback for ' + slot.name + ': ' + why +
+                                 ' (the sound stays silent; the game keeps running)');
             }
             if (!hook) { fail(err && err.message ? err.message : err); return; }
+            if (slot.vorbis_pending) return;      // callback and promise both fired
+            slot.vorbis_pending = true;
             Promise.resolve().then(function () {
                 return hook(slot.bytes);
             }).then(function (r) {
                 var buf = ctx.createBuffer(r.channels, r.frames, r.rate);
                 for (var c = 0; c < r.channels; c++) buf.copyToChannel(r.pcm[c], c);
+                slot.vorbis_pending = false;
                 if (!PAudio.vorbis_fallback) {
                     PAudio.vorbis_fallback = true;
                     console.log('[snd] decodeAudioData has no Vorbis here; using web/vorbis.js');
                 }
                 PAudio.accept(slot, buf);
             }).catch(function (e) {
+                slot.vorbis_pending = false;
                 fail(e && e.message ? e.message : e);
             });
         },
@@ -170,9 +175,22 @@ mergeInto(LibraryManager.library, {
              * again: the second call fails on a detached buffer and the sound is
              * silent for the rest of the session. A copy is a few hundred KB,
              * once per play that follows an eviction. */
-            ctx.decodeAudioData(slot.bytes.slice().buffer,
-                function (buf) { PAudio.accept(slot, buf); },
-                function (err) { PAudio.decodeWithPage(slot, ctx, err); });
+            /* Three ways this can go wrong, and all three have to end in the
+             * fallback rather than in a console error:
+             *   - Safari rejects Vorbis (no decoder), via the error callback;
+             *   - the same browser also *rejects the returned promise*, which
+             *     surfaces as an unhandled rejection in the page -- so the
+             *     promise is caught here and nowhere else;
+             *   - older Safari throws synchronously instead of calling back. */
+            try {
+                var p = ctx.decodeAudioData(slot.bytes.slice().buffer,
+                    function (buf) { PAudio.accept(slot, buf); },
+                    function (err) { PAudio.decodeWithPage(slot, ctx, err); });
+                if (p && p.catch)
+                    p.catch(function (e) { PAudio.decodeWithPage(slot, ctx, e); });
+            } catch (e) {
+                PAudio.decodeWithPage(slot, ctx, e);
+            }
         },
 
         stopSource: function (slot) {
