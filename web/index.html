@@ -94,6 +94,12 @@
   .meta div:first-child { border-top: 0; }
   .meta .k { color: var(--ink-2); }
   .meta .v { color: var(--ink); font-weight: 500; }
+  .meta .clear {
+    margin-left: 10px; font: 500 12px/1 inherit; color: var(--ink-2);
+    background: #fff; border: 1px solid var(--line-2); border-radius: 7px;
+    padding: 4px 9px; cursor: pointer; vertical-align: 1px;
+  }
+  .meta .clear:hover { background: #fff5f5; border-color: #f0c9c9; color: #a33333; }
 
   .stage { margin-top: 20px; }
   .stage canvas {
@@ -101,24 +107,54 @@
     aspect-ratio: 960 / 544; height: auto;
     background: #0d1117; border: 1px solid var(--line); border-radius: 12px;
     box-shadow: var(--shadow); touch-action: none;
+    -webkit-user-select: none; user-select: none; -webkit-touch-callout: none;
   }
   .hint { text-align: center; color: var(--ink-2); font-size: 13px; margin: 10px 0 0; }
   .hint .en { display: block; color: #8592a6; font-size: 12px; }
 
-  /* Fullscreen: 开始游戏 asks for it on the click, because that is the only
-   * moment a browser accepts the request. The canvas is letterboxed into the
-   * screen rather than stretched -- the engine renders 960x544 and its input
-   * mapping divides by the element's rect, so any distortion would also put the
-   * touch targets in the wrong place. */
-  .stage:fullscreen, .stage:-webkit-full-screen {
+  /* Immersive mode. On desktop browsers this is the real Fullscreen API; on iOS
+   * there is no element fullscreen at all (iPhone Safari never shipped it), so
+   * the same look is produced with a fixed overlay. Both paths letterbox the
+   * canvas instead of stretching it: the engine renders 960x544 and its input
+   * mapping divides by the canvas rect, so distortion would also misplace every
+   * touch target. */
+  .stage:fullscreen, .stage:-webkit-full-screen, .stage.pseudo {
     display: flex; align-items: center; justify-content: center;
-    background: #05070a; padding: 0; margin: 0; width: 100%; height: 100%;
+    background: #05070a; padding: 0; margin: 0;
   }
-  .stage:fullscreen canvas, .stage:-webkit-full-screen canvas {
+  .stage:fullscreen, .stage:-webkit-full-screen { width: 100%; height: 100%; }
+  .stage.pseudo {
+    position: fixed; inset: 0; z-index: 60; width: 100%; height: 100%;
+    padding: env(safe-area-inset-top) env(safe-area-inset-right)
+             env(safe-area-inset-bottom) env(safe-area-inset-left);
+  }
+  .stage:fullscreen canvas, .stage:-webkit-full-screen canvas, .stage.pseudo canvas {
     width: 100vw; height: 100vh; max-width: none; aspect-ratio: auto;
     object-fit: contain; border: 0; border-radius: 0; box-shadow: none;
   }
-  .stage:fullscreen .hint, .stage:-webkit-full-screen .hint { display: none; }
+  .stage:fullscreen .hint, .stage:-webkit-full-screen .hint, .stage.pseudo .hint {
+    display: none;
+  }
+
+  /* One tap to leave pseudo-fullscreen: iOS has no Esc key. */
+  #fs-exit {
+    position: fixed; top: 10px; right: 10px; z-index: 70; display: none;
+    font: 600 13px/1 inherit; color: #fff; background: rgba(20, 26, 36, .58);
+    border: 1px solid rgba(255, 255, 255, .28); border-radius: 999px;
+    padding: 9px 14px; cursor: pointer; backdrop-filter: blur(6px);
+    -webkit-backdrop-filter: blur(6px);
+  }
+  #fs-exit:hover { background: rgba(20, 26, 36, .78); }
+  body.immersive #fs-exit { display: block; }
+  body.immersive { overflow: hidden; }
+
+  /* Once the game is running the page is a game screen, not a document: no
+   * text selection, no long-press callout, no dragging the canvas away. */
+  body.playing, body.playing * {
+    -webkit-user-select: none; user-select: none;
+    -webkit-touch-callout: none; -webkit-tap-highlight-color: transparent;
+  }
+  body.playing { overscroll-behavior: none; }
 
   footer {
     margin-top: 28px; padding-top: 18px; border-top: 1px solid var(--line);
@@ -205,8 +241,9 @@
   </footer>
 </div>
 
-<input id="file-apk"   type="file" accept=".apk,.zip,application/vnd.android.package-archive,application/zip" hidden>
-<input id="file-saves" type="file" accept=".zip,application/zip" hidden>
+<input id="file-apk"   type="file" hidden>
+<input id="file-saves" type="file" hidden>
+<button id="fs-exit" type="button">退出全屏 / Exit</button>
 
 <script>
 // The engine is loaded with Module.spikeUI = true, which gates main() on a run
@@ -244,14 +281,35 @@ window.Module = {
   }
   function renderMeta() {
     var rows = [
-      ['APK 文件 / APK', facts.apk ? kb(facts.apk) : '未导入 / not imported'],
-      ['引擎镜像 / libgame.so', facts.so ? kb(facts.so) : '—'],
-      ['存档 / Saves', facts.saves ? facts.saves + ' 个文件 / files' : '—']
+      ['APK 文件 / APK', facts.apk ? kb(facts.apk) : '未导入 / not imported',
+       facts.apk ? '<button id="btn-clear" type="button" class="clear">清除 / Clear</button>' : ''],
+      ['引擎镜像 / libgame.so', facts.so ? kb(facts.so) : '—', ''],
+      ['存档 / Saves', facts.saves ? facts.saves + ' 个文件 / files' : '—', '']
     ];
     metaEl.innerHTML = rows.map(function (r) {
-      return '<div><span class="k">' + r[0] + '：</span><span class="v">' + r[1] + '</span></div>';
+      return '<div><span class="k">' + r[0] + '：</span><span class="v">' + r[1] + '</span>' +
+             (r[2] || '') + '</div>';
     }).join('');
     metaEl.hidden = false;
+    var clr = $('btn-clear');
+    if (clr) clr.onclick = clearApk;
+  }
+
+  /* A wrong APK must be removable: the import path has no other way back, and
+   * re-importing over a broken image is exactly the case where the engine fails
+   * before the page can say why. Saves are left alone -- they do not belong to
+   * the image. */
+  async function clearApk() {
+    try {
+      await api.clearApk();
+      facts.apk = 0; facts.so = 0;
+      renderMeta();
+      say('已清除 APK，可以重新导入。<b>存档未受影响。</b>',
+          'APK cleared, ready for another import. <b>Saves untouched.</b>', 'ok');
+    } catch (e) {
+      say('清除失败：<b>' + (e && e.message ? e.message : e) + '</b>',
+          'Could not clear: ' + (e && e.message ? e.message : e), 'warn');
+    }
   }
 
   function applyState(state) {
@@ -310,30 +368,97 @@ window.Module = {
     }
   };
 
+  /* ---- immersive mode ----------------------------------------------------
+   * Desktop browsers have the Fullscreen API; iPhone Safari does not have it at
+   * all, and iPad only grants it to video. So: try the real thing, and if it is
+   * missing or refused, take over the viewport with a fixed overlay instead.
+   * Both are entered from the click, because a browser will not accept a
+   * fullscreen request any other way.
+   *
+   * The exit button exists for the overlay case -- there is no Esc key on a
+   * phone -- and for fullscreen it simply calls the API's exit. */
+  function immersiveOn() {
+    document.body.classList.add('immersive');
+    stageEl.classList.add('pseudo');          // the overlay is the fallback look
+    var stage = stageEl;
+    var req = stage.requestFullscreen || stage.webkitRequestFullscreen ||
+              stage.webkitRequestFullScreen;
+    if (!req) return;                          // iOS: overlay is all there is
+    try {
+      var p = req.call(stage, { navigationUI: 'hide' });
+      if (p && p.catch) p.catch(function () { /* refused: keep the overlay */ });
+    } catch (e) { /* older Safari throws synchronously: keep the overlay */ }
+  }
+  function immersiveOff() {
+    if (document.fullscreenElement || document.webkitFullscreenElement) {
+      var exit = document.exitFullscreen || document.webkitExitFullscreen;
+      try { if (exit) exit.call(document); } catch (e) { /* ignore */ }
+    }
+    stageEl.classList.remove('pseudo');
+    document.body.classList.remove('immersive');
+  }
+  $('fs-exit').onclick = immersiveOff;
+  document.addEventListener('fullscreenchange', function () {
+    // Leaving real fullscreen by any route (F11, Esc, system gesture) should
+    // also drop the overlay and the scroll lock.
+    if (!document.fullscreenElement && !document.webkitFullscreenElement &&
+        stageEl.classList.contains('pseudo') && api && api.state() === 'running') {
+      immersiveOff();
+    }
+  });
+
+  /* ---- playing: the page stops behaving like a document ------------------ */
+  function setPlaying(on) {
+    document.body.classList.toggle('playing', on);
+  }
+  // Long-press on iOS starts a selection and a callout menu on top of the
+  // canvas; these all get in the way of a game that only wants touches.
+  ['contextmenu', 'selectstart', 'dragstart'].forEach(function (ev) {
+    document.addEventListener(ev, function (e) {
+      if (document.body.classList.contains('playing')) e.preventDefault();
+    }, { passive: false });
+  });
+
+  /* iOS and iPadOS get their own document. There is no element fullscreen on
+   * iPhone, and the fake one still lives inside browser chrome that reappears on
+   * any scroll; a page whose body is one canvas is the closest thing to a game
+   * screen WebKit allows, and it is what the home-screen icon launches. */
+  var IS_IOS = /iPad|iPhone|iPod/.test(navigator.userAgent) ||
+               (navigator.platform === 'MacIntel' && navigator.maxTouchPoints > 1);
+
   btnStart.onclick = function () {
     if (api.state() !== 'ready') return;          // greyed out without an APK
 
-    // Ask for fullscreen from inside the click: it is the only place a browser
-    // grants it, and the first frame after it looks right because the canvas is
-    // letterboxed by CSS rather than resized.
-    var stage = stageEl;
-    var req = stage.requestFullscreen || stage.webkitRequestFullscreen;
-    try {
-      if (req) {
-        var p = req.call(stage);
-        if (p && p.catch) p.catch(function () { /* refused: stay windowed */ });
-      }
-    } catch (e) { /* older Safari throws synchronously */ }
+    if (IS_IOS) {
+      api.flush();                 // saves/APK state is already in IndexedDB
+      location.href = 'game.html';
+      return;
+    }
 
+    // Audio first, and still inside the gesture: iOS only lifts the audio
+    // session restriction for a resume/unlock that happens here.
+    api.audioUnlock();
+
+    stageEl.hidden = false;
+    setPlaying(true);
+    immersiveOn();
     try {
-      stageEl.hidden = false;
       api.start();
     } catch (e) {
       stageEl.hidden = true;
+      setPlaying(false);
+      immersiveOff();
       say('无法开始：<b>' + (e && e.message ? e.message : e) + '</b>',
           'Could not start: ' + (e && e.message ? e.message : e), 'warn');
     }
   };
+
+  // iOS suspends the audio context when the app is backgrounded or the phone
+  // rings, and the resume has to come from a gesture -- so any touch may be the
+  // one that brings the sound back. It is a null-op once the context runs.
+  document.addEventListener('pointerdown', function () {
+    if (api && api.state() === 'running') api.audioUnlock();
+  }, { passive: true });
 
   btnExport.onclick = async function () {
     try {
@@ -389,6 +514,7 @@ window.Module = {
     });
   }
 })();
+// (nothing after this point on purpose: the module script above runs the page.)
 </script>
 </body>
 </html>

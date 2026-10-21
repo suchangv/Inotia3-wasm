@@ -53,6 +53,15 @@
       q.onerror = function () { rej(q.error); };
     });
   }
+  async function idbDel(key) {
+    var db = await idbOpen();
+    return new Promise(function (res, rej) {
+      var t = db.transaction(DB_STORE, 'readwrite');
+      t.objectStore(DB_STORE).delete(key);
+      t.oncomplete = function () { res(); };
+      t.onerror = function () { rej(t.error); };
+    });
+  }
   async function idbPut(key, val) {
     var db = await idbOpen();
     return new Promise(function (res, rej) {
@@ -257,6 +266,20 @@
       return { apk: u8.length, so: so.byteLength };
     },
 
+    /** Forget the imported APK entirely: IndexedDB copy *and* the two files in
+     *  MEMFS. The importer is the only way to replace a wrong APK, and a wrong
+     *  APK that cannot be removed is a dead end -- so this exists as a button.
+     *  Saves are untouched: they live in /data and have nothing to do with the
+     *  image that runs them. */
+    clearApk: async function () {
+      await idbDel('apk');
+      await idbDel('libgame.so');
+      try { FS.unlink(GAME_FILES.apk); } catch (e) { /* not there */ }
+      try { FS.unlink(GAME_FILES.so); } catch (e) { /* not there */ }
+      setState('no-apk');
+      return true;
+    },
+
     /** Everything under /data, as a zip the user can keep. */
     exportSaves: async function () {
       var entries = [];
@@ -299,6 +322,17 @@
       if (typeof FS !== 'undefined') FS.syncfs(false, function () {});
     },
 
+    /** Create the audio context (safe outside a gesture; it comes up suspended). */
+    audioPrime: function () {
+      try { return sound_host_audio_prime(); } catch (e) { return 0; }
+    },
+
+    /** Resume + unlock audio. iOS only grants this inside a user gesture, so
+     *  the page calls it from the start click and from every pointerdown. */
+    audioUnlock: function () {
+      try { return sound_host_audio_unlock(); } catch (e) { return 0; }
+    },
+
     /** Release the boot gate. Everything above only prepared files. */
     start: function () {
       if (!gameFilesPresent())
@@ -314,6 +348,11 @@
   M['preRun'] = M['preRun'] || [];
   M['preRun'].push(function () {
     addRunDependency('ui-start');
+    // The context is created here rather than at the first sound: it belongs to
+    // this document, it starts suspended on iOS, and the page's click resumes
+    // it. Creating it later, from inside the engine's boot, is the case iOS
+    // refuses to resume.
+    try { M['spike'].audioPrime(); } catch (e) { /* no WebAudio: silent, not fatal */ }
     loadGameFromCache().then(function (ok) {
       setState(ok ? 'ready' : 'no-apk');
     }).catch(function (e) {
