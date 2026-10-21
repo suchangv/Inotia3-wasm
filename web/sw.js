@@ -9,7 +9,7 @@
 // (APK, and /data through IDBFS), are large, and must never be duplicated into
 // the Cache API where a version bump would silently drop them.
 
-const VERSION = 'inotia3-wasm-v9';
+const VERSION = 'inotia3-wasm-v10';
 const SHELL = [
   './',
   './index.html',
@@ -17,11 +17,7 @@ const SHELL = [
   './inotia3.wasm',
   './vorbis.js',
   './vorbis.wasm',
-  './manifest.webmanifest',
-  './icons/icon-192.png',
-  './icons/icon-512.png',
-  './icons/icon-512-maskable.png',
-  './icons/apple-touch-icon.png'
+  './manifest.webmanifest'
 ];
 
 self.addEventListener('install', (e) => {
@@ -45,45 +41,12 @@ self.addEventListener('activate', (e) => {
   })());
 });
 
-/* The home-screen icon can come from the player's own APK, which
- * tools/webapp.js stores under 'icon' in the same IndexedDB it uses for the APK
- * and libgame.so. Serving it here rather than pointing the manifest at a blob is
- * the only way it reaches both consumers: the manifest icons that Android/Chrome
- * fetch at install time, and the apple-touch-icon iOS picks up when the player
- * adds the page to their home screen. Nothing is published -- the artwork came
- * from the player's copy and stays in their browser. */
-async function storedIcon() {
-  try {
-    const db = await new Promise((res, rej) => {
-      const r = indexedDB.open('spike-files', 1);
-      r.onupgradeneeded = () => r.result.createObjectStore('files');
-      r.onsuccess = () => res(r.result);
-      r.onerror = () => rej(r.error);
-    });
-    return await new Promise((res) => {
-      const q = db.transaction('files', 'readonly').objectStore('files').get('icon');
-      q.onsuccess = () => res(q.result || null);
-      q.onerror = () => res(null);
-    });
-  } catch (e) {
-    return null;
-  }
-}
-
 self.addEventListener('fetch', (e) => {
   const req = e.request;
   if (req.method !== 'GET') return;
   const url = new URL(req.url);
   if (url.origin !== self.location.origin) return;      // Bing, GitHub links: leave alone
 
-  if (url.pathname.indexOf('/icons/') >= 0) {
-    e.respondWith((async () => {
-      const blob = await storedIcon();
-      if (blob) return new Response(blob, { headers: { 'Content-Type': blob.type || 'image/png' } });
-      return (await caches.match(req)) || fetch(req);
-    })());
-    return;
-  }
 
   // Navigations go to the network first: a stale page paired with a new module
   // is the one mismatch that produces confusing errors, and the shell is tiny.

@@ -251,10 +251,6 @@
       if (so) await idbPut('libgame.so', so);
     }
     if (!so) return false;
-    // Imported before the icon existed: derive it once, in the background.
-    idbGet('icon').then(function (have) {
-      if (!have) return storeLauncherIcon(apk);
-    }).catch(function () { /* the icon is cosmetic */ });
     FS.writeFile(GAME_FILES.apk, new Uint8Array(apk));
     FS.writeFile(GAME_FILES.so, new Uint8Array(so));
     loaded.apk = apk.byteLength;
@@ -278,44 +274,41 @@
                                     hits[0].data.byteOffset + hits[0].data.byteLength);
   }
 
-  /* The game's own launcher icon, straight out of the player's APK, kept in this
-   * browser's IndexedDB and served back by sw.js for /icons/*.
-   *
-   * It is deliberately *not* in the repository: the icon is Com2uS artwork just
-   * like the rest of the APK, and shipping it would make the page's own "no game
-   * data" claim false and put the repository on the wrong side of a takedown.
-   * Read from the copy the player already owns, it costs nothing and publishes
-   * nothing. */
-  function pickLauncherIcon(entries) {
-    var best = null;
-    for (var i = 0; i < entries.length; i++) {
-      var e = entries[i];
-      if (!/\.png$/i.test(e.name) || !/(^|\/)ic_launcher[^\/]*\.png$/i.test(e.name)) continue;
-      if (!best || e.data.length > best.data.length) best = e;
-    }
-    if (!best) {
-      // Repacked APKs sometimes drop the name: fall back to the largest mipmap.
-      for (var j = 0; j < entries.length; j++) {
-        var c = entries[j];
-        if (!/\.png$/i.test(c.name) || !/(^|\/)mipmap/.test(c.name)) continue;
-        if (!best || c.data.length > best.data.length) best = c;
-      }
-    }
-    return best;
-  }
-
-  async function storeLauncherIcon(apkBuf) {
-    try {
-      var icon = pickLauncherIcon(await zipRead(new Uint8Array(apkBuf)));
-      if (!icon) return false;
-      await idbPut('icon', new Blob([icon.data], { type: 'image/png' }));
-      console.log('spike: launcher icon from the APK (' + icon.name + ', ' +
-                  icon.data.length + ' B) stored for the home screen');
-      return true;
-    } catch (e) {
-      console.warn('spike: could not read the launcher icon out of the APK', e);
+  async function loadGameFromCache() {
+    var apk = await asBytes(await idbGet('apk'));
+    if (!apk || apk.byteLength < 1024 * 1024) {   // a real APK is tens of MB
+      if (apk) console.warn('spike: stored APK is only ' + apk.byteLength + ' B; ignoring it');
       return false;
     }
+    var so = await asBytes(await idbGet('libgame.so'));
+    if (!so || so.byteLength < 256 * 1024) {
+      // Stored before libgame.so was cached separately, or the copy did not
+      // survive: derive it again from the APK.
+      so = await extractLibgame(apk);
+      if (so) await idbPut('libgame.so', so);
+    }
+    if (!so) return false;
+    FS.writeFile(GAME_FILES.apk, new Uint8Array(apk));
+    FS.writeFile(GAME_FILES.so, new Uint8Array(so));
+    loaded.apk = apk.byteLength;
+    loaded.so = so.byteLength;
+    var wrote = 0;
+    try { wrote = FS.stat(GAME_FILES.apk).size; } catch (e) { wrote = 0; }
+    if (wrote !== apk.byteLength) {
+      console.error('spike: /assets.apk is ' + wrote + ' B, expected ' + apk.byteLength);
+      return false;
+    }
+    console.log('spike: game files from IndexedDB -- apk ' + apk.byteLength +
+                ' B, libgame.so ' + so.byteLength + ' B');
+    return true;
+  }
+
+  async function extractLibgame(apkBuf) {
+    var entries = await zipRead(new Uint8Array(apkBuf));
+    var hits = entries.filter(function (e) { return /^lib\/[^/]+\/libgame\.so$/.test(e.name); });
+    if (!hits.length) return null;
+    return hits[0].data.buffer.slice(hits[0].data.byteOffset,
+                                    hits[0].data.byteOffset + hits[0].data.byteLength);
   }
 
   /* ---- the public API ---------------------------------------------------- */
@@ -342,7 +335,6 @@
       var so = await extractLibgame(arrayBuffer);
       if (!so)
         throw new Error('APK 里没有 lib/armeabi/libgame.so，可能不是 Inotia 3 的包');
-      await storeLauncherIcon(arrayBuffer);
       // Blob in storage, bytes in MEMFS: a Blob is what every engine's
       // structured clone stores most predictably, and Safari's IndexedDB has
       // been the one that turned ArrayBuffers into Blobs on read.
@@ -366,7 +358,6 @@
     clearApk: async function () {
       await idbDel('apk');
       await idbDel('libgame.so');
-      await idbDel('icon');
       try { FS.unlink(GAME_FILES.apk); } catch (e) { /* not there */ }
       try { FS.unlink(GAME_FILES.so); } catch (e) { /* not there */ }
       loaded.apk = 0;
