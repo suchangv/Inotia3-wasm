@@ -27,6 +27,11 @@
   var DB_NAME = 'spike-files', DB_STORE = 'files';
   var state = 'booting';                     // booting | no-apk | ready | running
   var listeners = [];
+  /* Sizes of what is currently loaded. The page cannot see MEMFS, and without
+   * these it could not tell "imported in this session" from "loaded from
+   * IndexedDB on this visit" -- which is why the 清除 button only appeared right
+   * after an import and vanished on reload. */
+  var loaded = { apk: 0, so: 0 };
 
   function emit() {
     for (var i = 0; i < listeners.length; i++) {
@@ -248,6 +253,8 @@
     if (!so) return false;
     FS.writeFile(GAME_FILES.apk, new Uint8Array(apk));
     FS.writeFile(GAME_FILES.so, new Uint8Array(so));
+    loaded.apk = apk.byteLength;
+    loaded.so = so.byteLength;
     var wrote = 0;
     try { wrote = FS.stat(GAME_FILES.apk).size; } catch (e) { wrote = 0; }
     if (wrote !== apk.byteLength) {
@@ -275,6 +282,13 @@
     /** Called by the page for its first paint. */
     onState: function (cb) { listeners.push(cb); cb(state); },
 
+    /** What is loaded right now, in bytes (0 = nothing). The page needs this to
+     *  draw the 清除 button for an APK that came from IndexedDB rather than from
+     *  an import in this session. */
+    info: function () {
+      return { apk: loaded.apk, so: loaded.so, present: gameFilesPresent() };
+    },
+
     /** Import the user's own APK: keep it, extract the image, drop both into
      *  MEMFS so "开始游戏" can run. Returns a small summary for the UI. */
     importApk: async function (arrayBuffer) {
@@ -292,6 +306,8 @@
       await idbPut('libgame.so', new Blob([new Uint8Array(so)]));
       FS.writeFile(GAME_FILES.apk, u8);
       FS.writeFile(GAME_FILES.so, new Uint8Array(so));
+      loaded.apk = u8.length;
+      loaded.so = so.byteLength;
       // The engine's install step will rewrite /data; keep whatever is there.
       setState('ready');
       return { apk: u8.length, so: so.byteLength };
@@ -307,6 +323,8 @@
       await idbDel('libgame.so');
       try { FS.unlink(GAME_FILES.apk); } catch (e) { /* not there */ }
       try { FS.unlink(GAME_FILES.so); } catch (e) { /* not there */ }
+      loaded.apk = 0;
+      loaded.so = 0;
       setState('no-apk');
       return true;
     },

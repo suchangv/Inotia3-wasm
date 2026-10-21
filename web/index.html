@@ -360,7 +360,16 @@ window.Module = {
     } else if (state === 'running') {
       say('<b>游戏已启动。</b>', '<b>Game running.</b>', 'ok');
     }
-    if (hasApk) renderMeta();
+    if (hasApk) {
+      // Sizes come from the module, not from what this session imported: on a
+      // reload the APK is already in MEMFS and the page has never seen a file
+      // picker, which is exactly when 清除 has to still be there.
+      try {
+        var info = api.info();
+        facts.apk = info.apk; facts.so = info.so;
+      } catch (e) { /* older module: keep whatever we know */ }
+      renderMeta();
+    }
   }
 
   function boot() {
