@@ -167,6 +167,39 @@ build_browser() {
     echo "   -> build/spike.html (serve this directory and open the page)"
 }
 
+# The build that goes on a public web page: the same browser port, but with no
+# --preload-file at all. Nothing of the game ships with it -- the player imports
+# their own APK on the page (tools/webapp.js keeps it in IndexedDB) and the
+# engine is started from what they imported. Output is build/inotia3.js +
+# build/inotia3.wasm, which is what suchangv.github.io/inotia3-wasm/ serves.
+#
+#   tools/build.sh web              -> build/inotia3.js (+ .wasm)
+build_web() {
+    echo "== web (emscripten, no game data) =="
+    EMSDK=${EMSDK:-$HOME/emsdk}
+    EMCC=$EMSDK/upstream/emscripten/emcc
+    [ -x "$EMCC" ] || { echo "   no emscripten at $EMSDK"; exit 1; }
+    GL4ES=vendor/gl4es/lib/emscripten
+    [ -f "$GL4ES/libGL.a" ] || {
+        echo "   no gl4es build. Run tools/build_gl4es.sh first."
+        exit 1
+    }
+    mkdir -p build
+    $EMCC -O2 -I src --pre-js tools/trap.js --pre-js tools/page-options.js \
+        --pre-js tools/idbfs.js --pre-js tools/webapp.js \
+        --js-library tools/sound.js --js-library tools/text.js \
+        $COMMON_BROWSER src/gl4es_bridge.c src/platform_emscripten.c src/main.c \
+        "$GL4ES/libGL.a" \
+        -sFULL_ES2=1 -sALLOW_MEMORY_GROWTH=1 -sSTACK_SIZE=8388608 \
+        -sMIN_WEBGL_VERSION=2 -sMAX_WEBGL_VERSION=2 \
+        -sEXIT_RUNTIME=0 \
+        -lidbfs.js \
+        -sEXPORTED_RUNTIME_METHODS=ccall,cwrap \
+        -sEXPORTED_FUNCTIONS=_main,_spike_set_frames,_spike_set_dump_screen,_spike_set_gl_trace,_spike_set_fixed,_spike_set_frame_ms,_spike_set_trace,_spike_input_down,_spike_input_move,_spike_input_up,_spike_input_release_all \
+        -o build/inotia3.js
+    echo "   -> build/inotia3.js (+ inotia3.wasm)"
+}
+
 # The SDL build: the same engine with a window, a gamepad and (later) sound, for
 # a handheld running PortMaster and for the development machine.
 build_sdl() {
@@ -226,7 +259,8 @@ case "${1:-both}" in
     check)   build_check ;;
     wasm)    build_wasm ;;
     browser) build_browser ;;
+    web)     build_web ;;
     both)    build_native; build_wasm ;;
-    all)     build_native; build_wasm; build_browser ;;
-    *) echo "usage: $0 [native|check|wasm|browser|sdl|handheld|both|all]"; exit 2 ;;
+    all)     build_native; build_wasm; build_browser; build_web ;;
+    *) echo "usage: $0 [native|check|wasm|browser|web|sdl|handheld|both|all]"; exit 2 ;;
 esac
