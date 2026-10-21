@@ -782,22 +782,62 @@ static void cursor_hide_if_idle(void)
         cur.visible = 0;
 }
 
-/* The pointer is a crosshair of solid quads, not a sprite: the engine's own
- * frames prove that flat geometry always renders on every driver, while a
- * texture uploaded by the host (the first version was a generated arrow) came
- * out invisible on libmali with no error at all. A crosshair is also easier to
- * aim with a stick than an arrow. */
-static void fill_rect(float x, float y, float w, float h)
+/* The pointer, drawn with scissored clears.
+ *
+ * Two earlier versions -- an uploaded arrow texture, then flat quads through
+ * gl4es' fixed pipeline -- both render on Mesa and both are invisible on
+ * libmali with glGetError() == 0. What is left is the least clever thing GL
+ * can do: set the scissor rectangle and clear it to a colour. No shader, no
+ * vertex array, no texture, nothing that can be silently rejected. Four
+ * rectangles make a crosshair with a dark border; it costs four clears a
+ * frame at 15 fps.
+ */
+static struct {
+    int ok;
+    void (*Clear)(unsigned);
+    void (*ClearColor)(float, float, float, float);
+    void (*Enable)(unsigned);
+    void (*Disable)(unsigned);
+    void (*Scissor)(int, int, int, int);
+    void (*ColorMask)(unsigned char, unsigned char, unsigned char, unsigned char);
+    void (*BindFramebuffer)(unsigned, unsigned);
+    void (*Viewport)(int, int, int, int);
+} cg;
+
+static int cursor_gfx_init(void)
 {
-    float verts[8] = { x, y, x + w, y, x, y + h, x + w, y + h };
-    gl4es_glVertexPointer(2, 0x1406 /* GL_FLOAT */, 0, verts);
-    gl4es_glDrawArrays(0x0005 /* GL_TRIANGLE_STRIP */, 0, 4);
+    *(void **)(&cg.Clear) = SDL_GL_GetProcAddress("glClear");
+    *(void **)(&cg.ClearColor) = SDL_GL_GetProcAddress("glClearColor");
+    *(void **)(&cg.Enable) = SDL_GL_GetProcAddress("glEnable");
+    *(void **)(&cg.Disable) = SDL_GL_GetProcAddress("glDisable");
+    *(void **)(&cg.Scissor) = SDL_GL_GetProcAddress("glScissor");
+    *(void **)(&cg.ColorMask) = SDL_GL_GetProcAddress("glColorMask");
+    *(void **)(&cg.BindFramebuffer) = SDL_GL_GetProcAddress("glBindFramebuffer");
+    *(void **)(&cg.Viewport) = SDL_GL_GetProcAddress("glViewport");
+    cg.ok = cg.Clear && cg.ClearColor && cg.Enable && cg.Disable &&
+            cg.Scissor && cg.ColorMask && cg.BindFramebuffer && cg.Viewport;
+    if (!cg.ok)
+        host_log("cursor: the driver is missing a core entry point\n");
+    return cg.ok;
+}
+
+/* Window-space rectangle (y down) filled with a colour, through the driver. */
+static void gl_rect(int x, int y, int w, int h, float r, float g, float b)
+{
+    if (w <= 0 || h <= 0)
+        return;
+    cg.Scissor(x, g_surface_h - y - h, w, h);   /* scissor origin is bottom-left */
+    cg.ClearColor(r, g, b, 1.0f);
+    cg.Clear(0x00004000 /* GL_COLOR_BUFFER_BIT */);
 }
 
 static void cursor_draw(void)
 {
-    if (!cur.visible || !g_gl_inited)
+    if (!g_gl_inited)
         return;
+    if (!cg.ok && !cursor_gfx_init())
+        return;
+
     int sx, sy, tw, th;
     cursor_screen(&sx, &sy);
     int lx, ly, lw, lh;
@@ -805,47 +845,44 @@ static void cursor_draw(void)
     target_size(&tw, &th);
     float scale = (float)lw / CONTENT_W;
     if (scale <= 0.0f) scale = 1.0f;
-    float arm = 11.0f * scale;           /* half length */
-    float inner = 2.0f * scale;          /* half thickness of the white cross */
-    float outer = inner + 1.5f * scale;  /* half thickness of the black border */
 
-    gl4es_glViewport(0, 0, tw, th);
-    gl4es_glMatrixMode(0x1701 /* GL_PROJECTION */);
-    gl4es_glLoadIdentity();
-    gl4es_glOrthof(0.0f, (float)tw, (float)th, 0.0f, -1.0f, 1.0f);
-    gl4es_glMatrixMode(0x1700 /* GL_MODELVIEW */);
-    gl4es_glLoadIdentity();
-    /* The engine leaves depth testing, culling, alpha test, stencil and scissor
-     * in whatever state its last draw wanted; this pass is 2D on top of a
-     * finished frame, so all of them have to be off. */
-    gl4es_glDisable(0x0B71 /* GL_DEPTH_TEST */);
-    gl4es_glDisable(0x0B44 /* GL_CULL_FACE */);
-    gl4es_glDisable(0x0BC0 /* GL_ALPHA_TEST */);
-    gl4es_glDisable(0x0C11 /* GL_SCISSOR_TEST */);
-    gl4es_glDisable(0x0B90 /* GL_STENCIL_TEST */);
-    gl4es_glDisable(0x0BE2 /* GL_BLEND */);
-    gl4es_glDisable(0x0DE1 /* GL_TEXTURE_2D */);
-    gl4es_glDepthMask(1);
-    gl4es_glColorMask(1, 1, 1, 1);
-    gl4es_glEnable(0x8074 /* GL_VERTEX_ARRAY */);
-    gl4es_glDisable(0x8078 /* GL_TEXTURE_COORD_ARRAY */);
+    /* SPIKE_CURSOR_TEST=1 parks a big magenta square in the middle of the
+     * picture: if that shows and the crosshair does not, the problem is the
+     * position, not the drawing. */
+    int test = getenv("SPIKE_CURSOR_TEST") != NULL;
+    if (!test && !cur.visible)
+        return;
 
-    float cx = (float)sx, cy = (float)sy;
-    gl4es_glColor4f(0.0f, 0.0f, 0.0f, 1.0f);
-    fill_rect(cx - arm - 2 * scale, cy - outer, 2 * arm + 4 * scale, 2 * outer);
-    fill_rect(cx - outer, cy - arm - 2 * scale, 2 * outer, 2 * arm + 4 * scale);
-    gl4es_glColor4f(1.0f, 1.0f, 1.0f, 1.0f);
-    fill_rect(cx - arm, cy - inner, 2 * arm, 2 * inner);
-    fill_rect(cx - inner, cy - arm, 2 * inner, 2 * arm);
+    cg.BindFramebuffer(0x8D40 /* GL_FRAMEBUFFER */, 0);
+    cg.Viewport(0, 0, g_surface_w, g_surface_h);
+    cg.Disable(0x0C11 /* GL_SCISSOR_TEST */);
+    cg.ColorMask(1, 1, 1, 1);
+    cg.Enable(0x0C11 /* GL_SCISSOR_TEST */);
+
+    if (test) {
+        int w = (int)(96 * scale), h = w;
+        gl_rect(g_surface_w / 2 - w / 2, g_surface_h / 2 - h / 2, w, h,
+                1.0f, 0.0f, 1.0f);
+    }
+    int arm = (int)(14 * scale);          /* half length */
+    int border = (int)(3 * scale);        /* border thickness */
+    int core = (int)(2 * scale);          /* white thickness */
+    int cx = sx, cy = sy;
+    /* black border (two bars), then white core (two thinner bars) */
+    gl_rect(cx - arm - border, cy - border, 2 * (arm + border), 2 * border,
+            0.0f, 0.0f, 0.0f);
+    gl_rect(cx - border, cy - arm - border, 2 * border, 2 * (arm + border),
+            0.0f, 0.0f, 0.0f);
+    gl_rect(cx - arm, cy - core, 2 * arm, 2 * core, 1.0f, 1.0f, 1.0f);
+    gl_rect(cx - core, cy - arm, 2 * core, 2 * arm, 1.0f, 1.0f, 1.0f);
+    cg.Disable(0x0C11 /* GL_SCISSOR_TEST */);
 
     {
         static int once;
         if (!once) {
             once = 1;
-            host_log("cursor: first draw at content (%d,%d) -> (%d,%d), "
-                     "target %dx%d, scale %.3f, gl error 0x%x\n",
-                     (int)cur.x, (int)cur.y, sx, sy, tw, th, scale,
-                     glGetError());
+            host_log("cursor: first draw at (%d,%d) of %dx%d, scale %.3f\n",
+                     sx, sy, g_surface_w, g_surface_h, scale);
         }
     }
 }
