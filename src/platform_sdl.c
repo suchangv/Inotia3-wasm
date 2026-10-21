@@ -741,14 +741,19 @@ void host_sdl_finish(void)
 
 static void cursor_nudge(double dt_ms)
 {
-    if (!g_pad || !cur.visible)
+    if (!g_pad)
         return;
     Sint16 ax = SDL_GameControllerGetAxis(g_pad, SDL_CONTROLLER_AXIS_LEFTX);
     Sint16 ay = SDL_GameControllerGetAxis(g_pad, SDL_CONTROLLER_AXIS_LEFTY);
     float fx = ax / 32767.0f, fy = ay / 32767.0f;
     float mag = sqrtf(fx * fx + fy * fy);
+    /* The stick has to be able to bring the pointer *back*: returning early
+     * while hidden is what made the first version freeze on the spot three
+     * seconds after launch and never move again (and, since it was also
+     * invisible from then on, look like "the cursor does not work"). */
     if (mag < CURSOR_DEADZONE)
         return;
+    cur.visible = 1;
     /* Rescale so the first pixel past the deadzone starts slow. */
     float k = (mag - CURSOR_DEADZONE) / (1.0f - CURSOR_DEADZONE);
     if (k > 1.0f) k = 1.0f;
@@ -1003,6 +1008,8 @@ static void input_events(double dt_ms)
         case SDL_CONTROLLERBUTTONDOWN:
             if (e.cbutton.button == SDL_CONTROLLER_BUTTON_LEFTSTICK) {
                 cur.down = 1;
+                cur.visible = 1;
+                cur.last_input = host_now() * 1000.0;
                 push_tap(1, now);
             } else if (e.cbutton.button == SDL_CONTROLLER_BUTTON_BACK) {
                 hotkey |= HOTKEY_SELECT;
@@ -1017,6 +1024,7 @@ static void input_events(double dt_ms)
         case SDL_CONTROLLERBUTTONUP:
             if (e.cbutton.button == SDL_CONTROLLER_BUTTON_LEFTSTICK) {
                 cur.down = 0;
+                cur.last_input = host_now() * 1000.0;
                 push_tap(0, now);
             } else if (e.cbutton.button == SDL_CONTROLLER_BUTTON_BACK) {
                 hotkey &= ~HOTKEY_SELECT;
