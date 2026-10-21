@@ -56,7 +56,7 @@
 /* The engine's screen. main.c/jni.c answer GetRealScreenWidth/Height with the
  * same pair; everything here works in that space and scales at the last step. */
 #define CONTENT_W 960
-#define CONTENT_H 544
+#define CONTENT_H 720
 
 /* gl4es' GLES1 entry points, for the cursor sprite. The rest of the GL work is
  * the engine's, through gl4es_bridge.c. */
@@ -782,56 +782,22 @@ static void cursor_hide_if_idle(void)
         cur.visible = 0;
 }
 
-/* A generated 16x16 arrow: white with a dark outline, so it reads on any
- * background without shipping an image. */
-static unsigned g_cursor_tex;
-
-static void cursor_texture(void)
+/* The pointer is a crosshair of solid quads, not a sprite: the engine's own
+ * frames prove that flat geometry always renders on every driver, while a
+ * texture uploaded by the host (the first version was a generated arrow) came
+ * out invisible on libmali with no error at all. A crosshair is also easier to
+ * aim with a stick than an arrow. */
+static void fill_rect(float x, float y, float w, float h)
 {
-    static const char *art[16] = {
-        "X               ",
-        "XX              ",
-        "X.X             ",
-        "X..X            ",
-        "X...X           ",
-        "X....X          ",
-        "X.....X         ",
-        "X......X        ",
-        "X.......X       ",
-        "X........X      ",
-        "X.....XXXXX     ",
-        "X..X..X         ",
-        "X.X X..X        ",
-        "XX  X..X        ",
-        "X    X..X       ",
-        "     XXXX       "
-    };
-    static unsigned char px[16 * 16 * 4];
-    for (int y = 0; y < 16; y++)
-        for (int x = 0; x < 16; x++) {
-            char c = art[y][x];
-            unsigned char *p = &px[(y * 16 + x) * 4];
-            if (c == 'X') { p[0] = p[1] = p[2] = 20;  p[3] = 255; }
-            else if (c == '.') { p[0] = p[1] = p[2] = 255; p[3] = 235; }
-            else { p[0] = p[1] = p[2] = 0; p[3] = 0; }
-        }
-    gl4es_glGenTextures(1, &g_cursor_tex);
-    gl4es_glBindTexture(0x0DE1 /* GL_TEXTURE_2D */, g_cursor_tex);
-    gl4es_glTexParameteri(0x0DE1, 0x2801, 0x2600 /* LINEAR */);
-    gl4es_glTexParameteri(0x0DE1, 0x2800, 0x2600);
-    gl4es_glTexImage2D(0x0DE1, 0, 0x1908 /* RGBA */, 16, 16, 0,
-                       0x1908, 0x1401 /* UNSIGNED_BYTE */, px);
+    float verts[8] = { x, y, x + w, y, x, y + h, x + w, y + h };
+    gl4es_glVertexPointer(2, 0x1406 /* GL_FLOAT */, 0, verts);
+    gl4es_glDrawArrays(0x0005 /* GL_TRIANGLE_STRIP */, 0, 4);
 }
 
 static void cursor_draw(void)
 {
-    static int have_tex;
     if (!cur.visible || !g_gl_inited)
         return;
-    if (!have_tex) {              /* once, after gl4es is up */
-        have_tex = 1;
-        cursor_texture();
-    }
     int sx, sy, tw, th;
     cursor_screen(&sx, &sy);
     int lx, ly, lw, lh;
@@ -839,44 +805,49 @@ static void cursor_draw(void)
     target_size(&tw, &th);
     float scale = (float)lw / CONTENT_W;
     if (scale <= 0.0f) scale = 1.0f;
-    float w = 16.0f * scale, h = 16.0f * scale;
+    float arm = 11.0f * scale;           /* half length */
+    float inner = 2.0f * scale;          /* half thickness of the white cross */
+    float outer = inner + 1.5f * scale;  /* half thickness of the black border */
 
-    /* glViewport is the whole window here: this pass is raw GLES1 through
-     * gl4es, in window pixels, on top of the engine's finished frame. */
     gl4es_glViewport(0, 0, tw, th);
     gl4es_glMatrixMode(0x1701 /* GL_PROJECTION */);
     gl4es_glLoadIdentity();
     gl4es_glOrthof(0.0f, (float)tw, (float)th, 0.0f, -1.0f, 1.0f);
     gl4es_glMatrixMode(0x1700 /* GL_MODELVIEW */);
     gl4es_glLoadIdentity();
-    /* The engine leaves depth testing, culling, alpha test and scissor in
-     * whatever state its last draw wanted; this pass is 2D on top of a finished
-     * frame, so all four have to be off or the quad is silently rejected. */
+    /* The engine leaves depth testing, culling, alpha test, stencil and scissor
+     * in whatever state its last draw wanted; this pass is 2D on top of a
+     * finished frame, so all of them have to be off. */
     gl4es_glDisable(0x0B71 /* GL_DEPTH_TEST */);
     gl4es_glDisable(0x0B44 /* GL_CULL_FACE */);
     gl4es_glDisable(0x0BC0 /* GL_ALPHA_TEST */);
     gl4es_glDisable(0x0C11 /* GL_SCISSOR_TEST */);
-    gl4es_glEnable(0x0BE2 /* GL_BLEND */);
-    gl4es_glBlendFunc(0x0302 /* GL_SRC_ALPHA */, 0x0303 /* GL_ONE_MINUS_SRC_ALPHA */);
-    /* Unit 0 explicitly: the engine's last draw is a *multi-textured* one (the
-     * HUD portrait samples unit 1), and the active unit is global state -- bind
-     * this texture on the unit the fixed-function pipeline actually samples. */
-    gl4es_glActiveTexture(0x84C0 /* GL_TEXTURE0 */);
-    gl4es_glEnable(0x0DE1 /* GL_TEXTURE_2D */);
-    gl4es_glBindTexture(0x0DE1, g_cursor_tex);
-    /* REPLACE, not MODULATE: the engine leaves a texture environment behind
-     * (and a vertex colour), and the pointer must not pick either up. */
-    gl4es_glTexEnvi(0x2300 /* GL_TEXTURE_ENV */, 0x2200 /* GL_TEXTURE_ENV_MODE */,
-                    0x1E01 /* GL_REPLACE */);
+    gl4es_glDisable(0x0B90 /* GL_STENCIL_TEST */);
+    gl4es_glDisable(0x0BE2 /* GL_BLEND */);
+    gl4es_glDisable(0x0DE1 /* GL_TEXTURE_2D */);
+    gl4es_glDepthMask(1);
+    gl4es_glColorMask(1, 1, 1, 1);
     gl4es_glEnable(0x8074 /* GL_VERTEX_ARRAY */);
-    gl4es_glEnable(0x8078 /* GL_TEXTURE_COORD_ARRAY */);
+    gl4es_glDisable(0x8078 /* GL_TEXTURE_COORD_ARRAY */);
+
+    float cx = (float)sx, cy = (float)sy;
+    gl4es_glColor4f(0.0f, 0.0f, 0.0f, 1.0f);
+    fill_rect(cx - arm - 2 * scale, cy - outer, 2 * arm + 4 * scale, 2 * outer);
+    fill_rect(cx - outer, cy - arm - 2 * scale, 2 * outer, 2 * arm + 4 * scale);
     gl4es_glColor4f(1.0f, 1.0f, 1.0f, 1.0f);
-    float x0 = (float)sx, y0 = (float)sy;
-    float verts[8] = { x0, y0, x0 + w, y0, x0, y0 + h, x0 + w, y0 + h };
-    float uv[8] = { 0, 0, 1, 0, 0, 1, 1, 1 };
-    gl4es_glVertexPointer(2, 0x1406 /* GL_FLOAT */, 0, verts);
-    gl4es_glTexCoordPointer(2, 0x1406, 0, uv);
-    gl4es_glDrawArrays(0x0005 /* GL_TRIANGLE_STRIP */, 0, 4);
+    fill_rect(cx - arm, cy - inner, 2 * arm, 2 * inner);
+    fill_rect(cx - inner, cy - arm, 2 * inner, 2 * arm);
+
+    {
+        static int once;
+        if (!once) {
+            once = 1;
+            host_log("cursor: first draw at content (%d,%d) -> (%d,%d), "
+                     "target %dx%d, scale %.3f, gl error 0x%x\n",
+                     (int)cur.x, (int)cur.y, sx, sy, tw, th, scale,
+                     glGetError());
+        }
+    }
 }
 
 /* ---- input --------------------------------------------------------------- */
@@ -932,6 +903,11 @@ static void input_events(double dt_ms)
 {
     SDL_Event e;
     double now = host_now() * 1000.0;
+    /* SELECT+START quits. There is no window manager and no console, so without
+     * this the only way out of the game is the power button. */
+    static unsigned hotkey;
+#define HOTKEY_SELECT 1u
+#define HOTKEY_START  2u
     while (SDL_PollEvent(&e)) {
         switch (e.type) {
         case SDL_QUIT:
@@ -991,12 +967,24 @@ static void input_events(double dt_ms)
             if (e.cbutton.button == SDL_CONTROLLER_BUTTON_LEFTSTICK) {
                 cur.down = 1;
                 push_tap(1, now);
+            } else if (e.cbutton.button == SDL_CONTROLLER_BUTTON_BACK) {
+                hotkey |= HOTKEY_SELECT;
+            } else if (e.cbutton.button == SDL_CONTROLLER_BUTTON_START) {
+                hotkey |= HOTKEY_START;
+            }
+            if (hotkey == (HOTKEY_SELECT | HOTKEY_START)) {
+                host_log("input: SELECT+START, quitting\n");
+                g_running = 0;
             }
             break;
         case SDL_CONTROLLERBUTTONUP:
             if (e.cbutton.button == SDL_CONTROLLER_BUTTON_LEFTSTICK) {
                 cur.down = 0;
                 push_tap(0, now);
+            } else if (e.cbutton.button == SDL_CONTROLLER_BUTTON_BACK) {
+                hotkey &= ~HOTKEY_SELECT;
+            } else if (e.cbutton.button == SDL_CONTROLLER_BUTTON_START) {
+                hotkey &= ~HOTKEY_START;
             }
             break;
         default:

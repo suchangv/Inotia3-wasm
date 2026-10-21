@@ -1,0 +1,12 @@
+font.ttf in this directory is Noto Sans SC, subset (Latin-1, punctuation,
+fullwidth forms, CJK ideographs U+4E00-U+9FA5) and instanced at weight 400.
+
+Copyright 2014-2021 Adobe (http://www.adobe.com/), with Reserved Font Name
+'Source'. Noto is a trademark of Google Inc.
+
+Licensed under the SIL Open Font License, Version 1.1:
+https://scripts.sil.org/OFL
+
+The font is shipped because the Android build drew its text with the phone's
+system fonts; this firmware (Buildroot) has none, and the engine's text came
+out blank. The port's text backend looks for ./font.ttf first.

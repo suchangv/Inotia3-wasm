@@ -38,6 +38,14 @@ strip "$OUT/inotia3" 2>/dev/null || true
 cp -f vendor/SDL2/dist-aarch64/lib/libSDL2-2.0.so.0.3000.9 \
       "$OUT/libs/libSDL2-2.0.so.0"
 
+# The engine draws its text through a font; this firmware has none.
+if [ -f vendor/fonts/font.ttf ]; then
+    cp -f vendor/fonts/font.ttf "$OUT/font.ttf"
+else
+    echo "   warning: no vendor/fonts/font.ttf -- text will be blank (tools/fetch-font.sh)"
+fi
+cp -f portmaster/FONT-LICENSE.txt "$OUT/FONT-LICENSE.txt" 2>/dev/null || true
+
 cp portmaster/port.json "$OUT/port.json"
 cp portmaster/README.txt "$OUT/README.txt"
 
