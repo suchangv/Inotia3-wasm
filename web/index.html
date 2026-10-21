@@ -160,6 +160,32 @@
   .notice b { color: var(--warn); }
   .notice .en { display: block; margin-top: 4px; color: #8a7440; }
 
+  /* iOS cannot hide its chrome for a web page, and 添加到主屏幕 is the only way
+   * to get a real chrome-free screen there. That is not discoverable, so the
+   * page says it once -- on iOS only, never again once dismissed, and never
+   * once it is already running standalone. */
+  .ios-hint {
+    position: fixed; left: 12px; right: 12px;
+    bottom: calc(12px + env(safe-area-inset-bottom));
+    z-index: 55; display: none;
+    align-items: center; gap: 12px;
+    background: #fff; border: 1px solid var(--line); border-radius: 12px;
+    box-shadow: 0 12px 32px rgba(16, 24, 40, .14);
+    padding: 12px 14px; max-width: 640px; margin: 0 auto;
+  }
+  .ios-hint.show { display: flex; }
+  .ios-hint .txt { flex: 1; font-size: 13px; color: var(--ink-2); line-height: 1.5; }
+  .ios-hint .txt b { color: var(--ink); font-weight: 600; }
+  .ios-hint .txt .en { display: block; color: #8592a6; font-size: 12px; margin-top: 2px; }
+  .ios-hint button {
+    font: 600 13px/1 inherit; border-radius: 999px; padding: 8px 14px; cursor: pointer;
+    border: 1px solid var(--line-2); background: #fff; color: var(--ink); flex: none;
+  }
+  .ios-hint button:hover { background: #f2f5fa; }
+  .ios-hint .close {
+    border: 0; background: none; color: #98a3b3; padding: 6px 8px; font-size: 16px;
+  }
+
   @media (max-width: 560px) {
     body { padding: 24px 14px 48px; }
     .grid { grid-template-columns: 1fr; }
@@ -237,6 +263,16 @@
 <input id="file-apk"   type="file" hidden>
 <input id="file-saves" type="file" hidden>
 <button id="fs-exit" type="button">退出全屏 / Exit</button>
+
+<div id="ios-hint" class="ios-hint">
+  <div class="txt">
+    <b>想要真正的全屏？</b>点 Safari 的分享按钮 →「添加到主屏幕」，从主屏图标启动就没有地址栏了。
+    <span class="en">For a chrome-free screen, use Share → Add to Home Screen on iOS Safari
+    and launch it from the icon.</span>
+  </div>
+  <button id="ios-hint-ok" type="button">知道了 / Got it</button>
+  <button id="ios-hint-close" class="close" type="button" aria-label="关闭 / Close">×</button>
+</div>
 
 <script>
 // The engine is loaded with Module.spikeUI = true, which gates main() on a run
@@ -349,9 +385,9 @@ window.Module = {
       var r = await api.importApk(f.buf);
       facts.apk = r.apk; facts.so = r.so;
       renderMeta();
-      say('已导入 <b>' + f.name + '</b>（' + kb(r.apk) + '），引擎镜像 ' + kb(r.so) +
+      say('已导入（' + kb(r.apk) + '），引擎镜像 ' + kb(r.so) +
           '。下次打开直接从浏览器缓存读取。',
-          'Imported <b>' + f.name + '</b> (' + kb(r.apk) + '), image ' + kb(r.so) +
+          'Imported (' + kb(r.apk) + '), image ' + kb(r.so) +
           '. Next visit loads it from the browser cache.', 'ok');
     } catch (e) {
       say('导入失败：<b>' + (e && e.message ? e.message : e) + '</b>',
@@ -487,7 +523,31 @@ window.Module = {
     say('运行时错误：<b>' + msg + '</b>', 'Runtime error: ' + msg, 'warn');
   });
 
+  /* ---- iOS: say the one thing that makes fullscreen possible ------------
+   * iPhone Safari has no element fullscreen and always keeps its chrome, so the
+   * only real "game screen" is the installed PWA. Show the hint on iOS Safari
+   * only, once, and not at all when already running from the home screen. */
+  function maybeIosHint() {
+    var ua = navigator.userAgent;
+    var isIos = /iPad|iPhone|iPod/.test(ua) ||
+                (navigator.platform === 'MacIntel' && navigator.maxTouchPoints > 1);
+    var standalone = navigator.standalone === true ||
+                     (window.matchMedia && window.matchMedia('(display-mode: standalone)').matches);
+    if (!isIos || standalone) return;
+    var key = 'spike-ios-hint-dismissed';
+    try { if (localStorage.getItem(key) === '1') return; } catch (e) { /* private mode */ }
+    var el = $('ios-hint');
+    el.classList.add('show');
+    function dismiss() {
+      el.classList.remove('show');
+      try { localStorage.setItem(key, '1'); } catch (e) { /* private mode */ }
+    }
+    $('ios-hint-ok').onclick = dismiss;
+    $('ios-hint-close').onclick = dismiss;
+  }
+
   boot();
+  maybeIosHint();
 
   /* ---- PWA ---------------------------------------------------------------
    * sw.js is only served over HTTPS (or localhost), so a plain `python3 -m
