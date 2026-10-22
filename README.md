@@ -4,169 +4,182 @@
 
 # Inotia 3 → WebAssembly
 
-Running the Android build of Inotia 3 in a browser, by executing its original ARM
-`libgame.so` — no Android, no Dalvik, no reimplementation of the game.
+[English](README.md) · [中文](README.zh-CN.md)
 
-This is a **spike**: a measurement rig first, a port second. See
-[`docs/SPIKE.md`](docs/SPIKE.md) for what it does and does not yet prove.
+Runs the Android build of **Inotia 3** (Com2uS) in a browser and on handhelds by
+executing its original ARM `libgame.so` — no Android, no Dalvik, no
+reimplementation of the game. The binary is interpreted instruction by
+instruction; everything it asks of the system (183 imports and the whole JNI
+surface) is answered by this repository.
+
+**This repository contains no game data.** Supply your own legally obtained APK.
+
+---
+
+## Play it
+
+<https://suchangv.github.io/inotia3-wasm/> — import your APK once (it stays in
+your browser's IndexedDB and is never uploaded), then press start. Saves move in
+and out as zip files. It installs as a PWA and runs offline after the first load.
+
+## Build it
+
+```sh
+tools/build.sh native      # desktop runner, no window: measurement + oracle
+tools/build.sh check       # same, with bounds-checked guest memory
+tools/build.sh wasm        # freestanding wasm32: the throughput number
+tools/build.sh browser     # emscripten + gl4es, game files preloaded (dev)
+tools/build.sh web         # emscripten, NO game data: what the page ships
+tools/build.sh sdl         # SDL2 window, gamepad, ALSA/PipeWire audio
+tools/build.sh handheld    # aarch64 cross build for PortMaster-style devices
+tools/build_vorbis.sh      # the separate Ogg Vorbis decoder module
+```
+
+The browser targets need emscripten (`$HOME/emsdk` by default) and a gl4es built
+for the host (`tools/build_gl4es.sh`); `vendor/` is gitignored. A fresh clone is
+therefore not buildable until you supply an APK and run those two scripts — see
+[`docs/HANDOFF.md`](docs/HANDOFF.md).
 
 ## Why this shape
 
-The binary decides the approach. From the real `libgame.so` (1.36 MB):
+The binary decides the approach. From the real `libgame.so` (1,359,908 B):
 
 | Property | Value | Consequence |
 |---|---|---|
-| `Tag_CPU_arch` | **v5TE**, not v6/v7 | no ARMv7 semantics to model |
+| `Tag_CPU_arch` | **v5TE**, not v6/v7 | no ARMv7-only semantics to model |
 | `Tag_THUMB_ISA_use` | **Thumb-1** | no Thumb-2, no IT blocks; 16-bit fixed width |
-| `Tag_FP_arch` | **VFPv2** | no NEON |
-| `.text` | 745,696 B, 96.0% Thumb | one decoder covers almost everything |
+| `Tag_FP_arch` | **VFPv2**, soft-float ABI | no NEON; doubles in r0/r1 pairs |
+| `.text` | 96% Thumb | one decoder covers almost everything |
 | Dynamic flags | `BIND_NOW` + `SYMBOLIC`, no `mprotect` | no JIT, no self-modifying code |
-| Relocations | 2954 `R_ARM_RELATIVE`, 178 `R_ARM_JUMP_SLOT` | all resolvable at load time |
-| Imports | 183 (58 GLES1 fixed-function, rest libc/libm/pthread) | a small, closed host surface |
-| `.dynsym` | 5962 functions inside `.text` | every entry point is enumerable |
+| Relocations | 3,139, all resolvable at load time | the loader owns the address space |
+| Imports | 183 (58 GLES1, rest libc/libm/pthread/JNI) | a small, closed host surface |
+| `.dynsym` | 5,962 functions inside `.text` | every entry point is enumerable |
 
-That last column is why a static translation to WebAssembly is realistic later:
-the code cannot change itself, and its call graph is recoverable. The interpreter
-in `src/` is the first stage — it is the correctness oracle the translated
-version will be diffed against, and it produces the numbers that decide whether
-the translation is worth building.
+That last row is why the interpreter is verifiable: there is a finite, known set
+of functions to prove and to diff against.
+
+## How it works
+
+```
+libgame.so ──▶ ELF32/ARM loader ──▶ relocation + sorted symbol index
+                    │
+                    ▼
+              ARMv5TE/Thumb-1 interpreter ──── BKPT stubs ──▶ host imports
+                    │                                └──────▶ libgcc helpers
+                    ▼
+              FalsoJNI-style JavaVM/JNIEnv (built in guest memory)
+                    │
+                    ▼
+              GLES1 fixed-function ──▶ gl4es ──▶ GLES2 ──▶ WebGL2 / native GL
+                    │
+                    ▼
+              host layer: emscripten · SDL2 · freestanding wasm · Android
+```
+
+* **Guest memory** is one flat 144 MB arena, so guest address → host pointer is a
+  plain add. On native builds a fault handler maps a `SIGSEGV` back to guest PC,
+  address and registers.
+* **Imports** get a four-byte `BKPT` stub each; the interpreter recovers the
+  index from the address, so counting host crossings costs nothing in the inner
+  loop. Internal libgcc helpers (`__divsi3`, `__divdf3`, …) are hooked the same
+  way — those are 52% of the steady-state instruction count on ARMv5TE, which has
+  no divide instruction at all.
+* **Java** is replaced by a hand-built `JavaVM`/`JNIEnv` in guest memory with the
+  real offsets the engine indexes by; native methods call back into the engine's
+  own entry points.
+* **GL** is fixed-point GLES1 (`glVertexPointerx`, `glClearColorx`, …), which no
+  current driver implements. gl4es translates it to GLES2; the port's own code is
+  only the ABI adapter and the `GL_FIXED` → `float` conversion.
+
+## What works
+
+| | |
+|---|---|
+| Boot | asset install (12 files, LZMA), the loader's 34 stages, main menu |
+| Gameplay | menus, UI, maps, characters, combat — the interpreter is complete for Thumb-1, ARM and VFPv2 that this binary uses |
+| Text | real fonts, all shipped languages (not the engine's bitmap font) |
+| Saves | `/data` lives in IDBFS in the browser (survives reload), export/import as zip, delete with confirmation |
+| Audio | WebAudio backend for BGM and effects; Ogg Vorbis decoded by the browser, or by `vorbis.wasm` where the browser has no Vorbis decoder (Safari) |
+| Input | pointer/touch, gamepad on SDL targets, on-screen mapping of keys to engine touch coordinates |
+| Offline | service worker precaches the shell and the module |
+| Devices | desktop browsers, iPhone/iPad (PWA), RK3566 handhelds, and the native PS Vita port this one borrows its reverse engineering from |
+
+Known gaps are tracked in [`docs/REMAINING.zh-CN.md`](docs/REMAINING.zh-CN.md)
+(Chinese) and the measurement notes in [`docs/PERFORMANCE.md`](docs/PERFORMANCE.md).
+
+## Verification, not hope
+
+* **Differential oracle.** `tools/difftest.sh` runs the same relocated image
+  twice — once under this interpreter, once under Unicorn's ARM core with a
+  per-instruction hook — and diffs the traces (`tools/difftrace.py`). Both sides
+  start from identical guest memory, so a mismatch is a decoder bug by
+  construction and the first differing line names the instruction, the register
+  file and the PC. `--all` sweeps the entry point of all 5,962 functions.
+* **Pixel A/B.** The same frame index with a change on and off is byte-compared;
+  the interpreter is deterministic, so this catches behavioural regressions the
+  oracle cannot see (a wrong value that is consistently wrong).
+* **Guest-side counters.** Every import crossing, every frame's instruction count
+  and interpreter time are measured and logged, which is how the armv5 divide
+  helpers were identified as the hottest thing in the game.
+
+Current numbers, desktop Chrome, in gameplay: **2,150,383 instructions and
+12.8 ms of interpreter per engine frame, 34 draw calls, 19% of the wall clock, at
+the engine's own 15 fps** — about 5× headroom. On an RK3566 handheld the same
+frame costs ~84 ms at ~27 MIPS, which is what the libgcc host hooks and the
+`inotia3-aarch64` build exist for. See [`docs/PERFORMANCE.md`](docs/PERFORMANCE.md).
 
 ## Layout
 
 ```
-web/               the published page (index.html, sw.js, manifest, icons)
-src/
-  guest.h          fixed guest address space (144 MB, one flat buffer)
-  elf.h/.c         ELF32/ARM reader, relocation, symbol index
-  cpu.h/.c         ARMv5TE / Thumb-1 interpreter
-  imports.h/.c     the 183 imports: BKPT stubs, dispatch, crossing counters
-  host_libc.c      bionic shims + the guest heap allocator
-  platform_*.c     host services (native now, browser later)
-  main.c           the spike runner
-tools/build.sh     native, wasm32, browser (dev) and web (published) builds
+web/                 the published page: index.html, sw.js, manifest, icons
+src/  guest.h        one flat 144 MB guest address space
+      elf.h/.c       ELF32/ARM reader, relocation, symbol index
+      cpu.h/.c       ARMv5TE / Thumb-1 / VFPv2 interpreter
+      imports.h/.c   the 183 imports: BKPT stubs, dispatch, crossing counters
+      host_hooks.c   libgcc helpers answered from the host (divide, soft-float)
+      host_libc.c    bionic shims + the guest heap allocator
+      jni.c           JavaVM/JNIEnv, built in guest memory
+      gl.c, gl4es_bridge.c   GLES1 state + fixed-function → gl4es adapter
+      platform_*.c   hosts: native, SDL2, emscripten, freestanding wasm, Android
+      main.c         the runners
+tools/               build scripts, the oracle, the difftests, the page's JS side
+docs/                SPIKE, PERFORMANCE, HANDOFF, REUSE, ANDROID, PORTMASTER, 需求清单
+third_party/stb/     stb_vorbis (audio), stb_truetype (fonts)
 ```
-
-### Two design choices worth knowing
-
-**Import stubs are `BKPT` markers.** Each imported function gets 4 bytes at
-`GUEST_STUB_BASE + i*4` whose first halfword is `BKPT`; the index is recovered
-from the address. The GOT slot holds `stub|1`, because `libgame.so`'s `.plt` is
-*ARM* code that dispatches with `ldr pc, [ip]`, and bit 0 is what selects Thumb
-state. Net effect: counting host crossings costs nothing in the inner loop,
-because `BKPT` is already one more opcode in the existing decode.
-
-**Guest memory is one flat buffer with unchecked access.** The inner loop is
-plain array indexing. On native that turns a bad guest pointer into a host
-`SIGSEGV`, so `platform_native.c` installs a handler that translates the fault
-back into guest address, guest PC and registers — without it, every bring-up
-crash is a manual bisect. `-DGUEST_CHECK` swaps in bounds-checked accessors.
-
-## Building and running
-
-The core is freestanding: `clang` targets `wasm32` directly and `lld` supplies
-`wasm-ld`. No emscripten, no multi-GB SDK. (Emscripten returns when the browser
-host layer — fetch, WebGL, IDBFS — lands.)
-
-```sh
-tools/build.sh native          # -> build/spike
-tools/build.sh browser         # -> build/spike.{html,js,wasm,data}
-tools/build-android.sh         # -> build/android/inotia3.apk (see docs/ANDROID.md)
-
-mkdir -p game && cp /path/to/libgame.so game/
-./build/spike game/libgame.so --boot --frames=4200 --no-profile
-
-# drive the menus headlessly -- device (canvas) pixels, one tap per line
-./build/spike game/libgame.so --boot --frames=4200 --no-profile \
-    --tap=1500,467,240 --tap=2000,480,151 \
-    --tap=2400,136,459 --tap=2800,480,359
-```
-
-Options: `--boot` run the game's own startup (JNI, assets, frames) ·
-`--frames=N` stop after N frames · `--tap=frame,x,y` inject a tap at a frame ·
-`--init-array` run static constructors · `--jni` call `JNI_OnLoad` · `--all`
-both · `--no-profile` · `--trace` record the last 96 instructions and dump them
-on a fault · `--frame-ms=N` the frame period the engine is asked to run at. The
-engine hardcodes 66 ms (15 fps) and that is the game's speed, so this is off by
-default and is a measurement tool, not a setting -- see
-[docs/PERFORMANCE.md](docs/PERFORMANCE.md). In the browser the same knob is
-`?framems=N`, and `?fixed=1` forces the deterministic 16 ms tick that headless
-verification uses.
-
-## The web page
-
-[**suchangv.github.io/inotia3-wasm**](https://suchangv.github.io/inotia3-wasm/) is
-this port running as a static page. It ships **no game data**: the player imports
-their own APK once, the page keeps it in IndexedDB and boots the engine from it,
-and saves can be exported and imported as zip files.
-
-`web/` holds it — `index.html` (the page), `sw.js` + `manifest.webmanifest` +
-`icons/` (installable, offline-capable shell), and `vorbis.js` + `vorbis.wasm`
-(the Ogg Vorbis decoder Safari does not have, fetched only after the browser's
-own decoder refuses a sound — built by `tools/build_vorbis.sh`, kept out of
-`inotia3.wasm` on purpose: see `src/vorbis_wasm.c`). `tools/build.sh web` produces the
-two files the page loads (`inotia3.js`, `inotia3.wasm`) with no `--preload-file`,
-which is what makes a public build possible at all; `tools/build.sh browser` is
-the same host with the game preloaded, for development.
 
 ## Game files are not in this repository
 
-`game/`, `data/`, `*.so`, `*.apk` and `*.obb` are gitignored. Supply your own
-legally-obtained copy. `libgame.so` and everything the engine unpacks out of it
-are Com2uS's copyrighted work and are not distributed here. This holds for the
-**whole history**, not just the current tree: the commits that once carried
-`data/com.com2us.inotia3.google.global/` and the `fb*.raw` frame dumps were
-rewritten before this repository was first published, so no blob of game
-content exists in any reachable commit.
+`game/`, `data/`, `*.so`, `*.apk` and `*.obb` are gitignored, and this holds for
+the **whole history**: the commits that once carried installed assets or
+framebuffer dumps were rewritten before the repository was first published, so no
+blob of game content exists in any reachable commit. The deployed page ships no
+game data either — it asks for the player's own APK and keeps it in their
+browser.
 
 ## Standing on other people's work
 
-Three projects made this one possible. None of them is vendored here; each is a
-dependency you fetch or install yourself (see [docs/REUSE.md](docs/REUSE.md)).
+**[unicorn-engine](https://github.com/unicorn-engine/unicorn)** — the correctness
+oracle. Every decoder fix in this port was found by disagreeing with a second,
+independent implementation, instruction by instruction. GPLv2, used as a test
+tool only.
 
-**[unicorn-engine](https://github.com/unicorn-engine/unicorn)** — it is what
-makes the CPU interpreter *verifiable*. `tools/difftest.sh` runs the same
-relocated `libgame.so` twice: once under `src/cpu.c`, once under Unicorn's ARM
-core with a per-instruction code hook, and `tools/difftrace.py` diffs the two
-traces. Both sides start from identical guest memory, so the first differing
-line is a decoder bug by construction — it names the instruction, the register
-file and the guest PC. Every Thumb-1/ARM/VFP fix this port needed was found that
-way, and `--all` sweeps the entry point of all 5962 functions in `.text`. An
-interpreter this size cannot be trusted without a second implementation to
-disagree with; this is that implementation.
+**[gl4es](https://github.com/ptitSeb/gl4es)** — the GPU half. GLES1
+fixed-function with fixed-point entry points has no modern implementation;
+gl4es translates the pipeline to GLES2, so this port is an adapter, not a
+renderer.
 
-**[gl4es](https://github.com/ptitSeb/gl4es)** — it is what makes the GPU part
-possible at all. The game speaks only GLES1 fixed-function with the fixed-point
-entry points (`glVertexPointerx`, `glClearColorx`, `glOrthox`, ...), which no
-current driver implements; gl4es translates that pipeline to GLES2.
-`src/gl4es_bridge.c` is then a thin adapter: the guest's ARM soft-float ABI on
-one side, `gl4es_gl*` on the other, plus the `GL_FIXED` → `float` conversion
-WebGL requires. The GL work here is adapter code, not a renderer.
+**[Inotia3-vita](https://github.com/MetalSyntax/Inotia3-vita)** — the native PS
+Vita port of the same engine, and the reason this took weeks instead of months:
+the guest lifecycle, the JNI offsets, the binary patches a port needs, the touch
+coordinates and the `UI_listControl` discovery all came from there.
 
-**[Inotia3-vita](https://github.com/MetalSyntax/Inotia3-vita)** — the native
-PS Vita port of this same engine, and the reason this took weeks instead of
-months. It is where the guest lifecycle came from (`nativePreInit` →
-`nativeInit` → per-tick `nativeEvent`/`nativeRender`, and the three-step
-pause/resume), along with the JNI offsets, the touch-target coordinates, the
-finding that `UI_listControl` is the one hookable hit-test registry, and the
-binary patches the engine needs to run offline. `src/patches.c` here is that
-port's decisions re-applied through a simpler mechanism, and
-[docs/SPIKE.md](docs/SPIKE.md) records where the two ports agree and where this
-one had to differ. Reverse-engineering an unfamiliar 745 KB binary is the
-longest, least rewarding part of a port; that work was already done there.
+## Docs
 
-## Status
-
-The game boots to its main menu and, with a tap, into gameplay — asset install,
-the game loader's 34 stages, LZMA unpacking, PNG decode, fonts, UI rendering and
-the renderer all run. The interpreter covers Thumb-1 and ARM; the import table,
-the JNI environment, the guest heap and the GLES1 state layer are in place.
-Audio is not wired up: `SOUNDSYSTEM_Process` is called every frame and there is
-no host backend behind it. In the browser, gameplay now holds the engine's own
-rate — 15.0 engine frames per second, on a page running at 60 ticks/s, with the
-interpreter using 19% of the wall clock — where it was 11.9 before, and text
-still does not render (the opening event's dialogue box comes up empty). See
-[`docs/PERFORMANCE.md`](docs/PERFORMANCE.md) for the measurements and for what is
-left.
-
-Details — the interpreter bugs found and how, plus the current state — are in
-[`docs/HANDOFF.md`](docs/HANDOFF.md) and [`docs/SPIKE.md`](docs/SPIKE.md).
+| | |
+|---|---|
+| [`docs/SPIKE.md`](docs/SPIKE.md) | what was measured, and what the numbers decided |
+| [`docs/PERFORMANCE.md`](docs/PERFORMANCE.md) | the frame budget, the clock bugs, where the time goes |
+| [`docs/HANDOFF.md`](docs/HANDOFF.md) | the long version: every bug found and how |
+| [`docs/REUSE.md`](docs/REUSE.md) | the dependencies, their licences and their gotchas |
+| [`docs/ANDROID.md`](docs/ANDROID.md) / [`docs/PORTMASTER.md`](docs/PORTMASTER.md) | the two packaged targets |
+| [`docs/REMAINING.zh-CN.md`](docs/REMAINING.zh-CN.md) | 剩余工作清单(中文) |
