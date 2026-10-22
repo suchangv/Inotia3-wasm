@@ -66,7 +66,7 @@ fi
 
 CC_FLAGS="-std=c11 -O2 -fPIC -Wall -Wextra -Wno-unused-parameter \
 -Wno-unused-function -Isrc -Ithird_party/stb -Iandroid -I$GLUE"
-SOURCES="src/util.c src/elf_loader.c src/cpu.c src/imports.c src/host_libc.c \
+SOURCES="src/util.c src/elf_loader.c src/cpu.c src/host_hooks.c src/imports.c src/host_libc.c \
 src/jni.c src/gl.c src/gl4es_bridge.c src/patches.c src/timers.c \
 src/asset_zip.c src/input.c src/text.c src/text_ttf.c src/sound.c \
 src/sound_android.c src/platform_android.c src/main.c \
@@ -91,8 +91,11 @@ for abi in $ABIS; do
     mkdir -p "$OUT/$abi"
     # 16 KB page alignment: Android 15+ requires it for the native library, and
     # it costs nothing on older releases.
+    # --no-undefined: a missing source used to surface as an instant crash on the
+    # device ("cannot locate symbol" at dlopen) with nothing to go on. The link
+    # knows, so make it the thing that fails.
     $CC $CC_FLAGS -shared -o "$OUT/$abi/lib$PKG.so" $SOURCES "$GL4ES" \
-        -Wl,-z,max-page-size=16384 \
+        -Wl,--no-undefined -Wl,-z,max-page-size=16384 \
         -lEGL -lGLESv2 -lOpenSLES -llog -landroid -ldl -lm
     echo "   -> $OUT/$abi/lib$PKG.so ($(du -h "$OUT/$abi/lib$PKG.so" | cut -f1))"
 done

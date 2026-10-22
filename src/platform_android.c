@@ -39,6 +39,7 @@
 #include <stdarg.h>
 #include <string.h>
 #include <unistd.h>
+#include <dlfcn.h>
 #include <time.h>
 #include <signal.h>
 #include <errno.h>
@@ -69,6 +70,29 @@ static int g_have_window;             /* surface exists and is current */
 static int g_quit;
 static int g_surface_w, g_surface_h;
 static int g_gl_inited;               /* gl4es initialised once, after a context */
+
+/* One GL entry point from the driver.
+ *
+ * gl4es is linked statically with NOEGL, so the unprefixed gl* symbols in this
+ * binary are gl4es' own, not the driver's -- the loader has to be asked instead,
+ * or an entry point like glShaderSource resolves to gl4es' thunk and
+ * dereferences a glstate that does not exist yet during initialize_gl4es()
+ * (a SIGSEGV at 0x2660 that names no guest code at all).
+ *
+ * eglGetProcAddress covers the ES2/ES3 core names; dlsym on the driver's own
+ * handle is the fallback for the few entry points some drivers only export from
+ * the library (glShaderSource is the one that matters here). */
+void *host_gl_proc(const char *name)
+{
+    void *p = (void *)(uintptr_t)eglGetProcAddress(name);
+    if (!p) {
+        static void *gles;
+        if (!gles) gles = dlopen("libGLESv2.so", RTLD_NOW | RTLD_LOCAL);
+        if (!gles) gles = dlopen("libGLESv2.so.2", RTLD_NOW | RTLD_LOCAL);
+        if (gles) p = dlsym(gles, name);
+    }
+    return p;
+}
 
 static EGLDisplay g_dpy = EGL_NO_DISPLAY;
 static EGLSurface g_surf = EGL_NO_SURFACE;
