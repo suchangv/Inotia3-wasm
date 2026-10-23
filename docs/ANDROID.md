@@ -49,10 +49,10 @@ and the app unpacks them into its private files directory on first launch:
 | | |
 |---|---|
 | window | `src/platform_android.c`: EGL + a GLES3 context on the `ANativeWindow`, `eglSwapBuffers` once per tick |
-| GL | gl4es, built with `NOEGL`, `DEFAULT_ES=2`, `NO_INIT_CONSTRUCTOR` — see the two traps below |
+| GL | gl4es, built with `ANDROID=ON NOX11=ON NOEGL=ON STATICLIB=ON DEFAULT_ES=2 NO_INIT_CONSTRUCTOR=ON USE_ANDROID_LOG=ON` — see the two traps below. `host_gl_proc()` in `src/platform_android.c` is how gl4es' ShaderSource hook reaches the driver rather than gl4es' own thunk |
 | input | the `AInputQueue` from `native_app_glue`, mapped from window pixels to the engine's 960×544 |
 | storage | `chdir` into the app's files dir; relative paths then behave exactly as on the desktop |
-| text | `src/text_android.c`: stb_truetype over the phone's own fonts (`/system/fonts/NotoSansCJK-Regular.ttc`, DroidSansFallback, Roboto), so CJK works without bundling a font |
+| text | `src/text.c` + `src/text_ttf.c`: stb_truetype over the phone's own fonts — `/system/fonts/NotoSansCJK-Regular.ttc`, `NotoSansSC-*`, `DroidSansFallback.ttf`, and a fallback scan of the directory. CJK works without bundling a font |
 | audio | `src/sound_android.c`: stb_vorbis (everything shipped is Ogg Vorbis) + OpenSL ES, with a 48 MB LRU on decoded PCM |
 | loop | `android_main()` in `src/main.c`: `host_android_pump()` (looper, lifecycle, input) → `spike_tick()` → `host_android_present()` |
 
@@ -193,12 +193,28 @@ Not verified yet:
   launching, not by backgrounding mid-game.
 - **Performance** on a real phone. The emulator is not a benchmark.
 
+## Two ways this build fails before it starts
+
+Both produced an APK that installed and closed immediately, so both are worth
+knowing rather than rediscovering:
+
+* **An unresolved symbol.** `-shared` links happily with undefined symbols, and
+  bionic refuses the library at `dlopen`; the crash names neither symbol. Two
+  happened here at once — `host_hook_dispatch` (`src/host_hooks.c` was missing
+  from this script's own `SOURCES`, which is a different list from
+  `tools/build.sh`'s `COMMON`) and `host_gl_proc` (it existed only in
+  `platform_sdl.c`). The link now passes `-Wl,--no-undefined`, so a missing
+  source fails the build instead of the launch.
+* **A signature mismatch.** A rebuild with a fresh `OUT` makes a new debug
+  keystore, and installing over a build signed with the old one fails with
+  `INSTALL_FAILED_UPDATE_INCOMPATIBLE`: uninstall first.
+
 ## Where the pieces live
 
 ```
 android/AndroidManifest.xml    NativeActivity, landscape, GLES3, no code
 src/platform_android.c         EGL, input, assets, storage, letterbox, lifecycle
-src/text_android.c             stb_truetype + the system fonts
+src/text.c, src/text_ttf.c     glyphs + stb_truetype over the system fonts
 src/sound_android.c            stb_vorbis + OpenSL ES
 src/main.c                     android_main(): pump -> tick -> present
 third_party/stb/               stb_truetype.h, stb_vorbis.c (public domain)
