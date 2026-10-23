@@ -31,11 +31,22 @@ tools/build.sh web         # emscripten，不预加载任何游戏数据（线�
 tools/build.sh sdl         # SDL2 窗口、手柄、ALSA/PipeWire 音频
 tools/build.sh handheld    # aarch64 交叉编译，给 PortMaster 类掌机
 tools/build_vorbis.sh      # 单独构建 Ogg Vorbis 解码模块
+
+tools/build-android.sh     # 打 APK：arm64-v8a + x86_64，debug 签名
+tools/build-android.sh --install
+ABI=arm64-v8a tools/build-android.sh
 ```
 
 浏览器目标需要 emscripten（默认 `$HOME/emsdk`）和为宿主编译的 gl4es
 （`tools/build_gl4es.sh`）；`vendor/` 不进仓库。所以刚 clone 下来是不能直接编的 ——
 自备 APK、跑完这两个脚本之后才行，细节见 [`docs/HANDOFF.md`](docs/HANDOFF.md)。
+
+Android 目标需要 SDK 的 build-tools 与 platform、NDK、以及一个 JDK
+（`ANDROID_SDK_ROOT` / `ANDROID_NDK_HOME` / `JAVA_HOME`，默认 `~/android/sdk` 和
+`~/android/jdk`），外加 `ABIS="arm64-v8a x86_64" tools/build_gl4es.sh android` 产出的
+静态 gl4es。**不需要 Gradle**：`android/AndroidManifest.xml`（NativeActivity，
+`hasCode="false"`）+ `tools/build-android.sh` 就是全部构建系统，游戏文件由脚本拷进
+`android/assets/`。细节见 [`docs/ANDROID.md`](docs/ANDROID.md)。
 
 ## 为什么是这个形态
 
@@ -117,6 +128,7 @@ libgame.so ──▶ ELF32/ARM 加载器 ──▶ 重定位 + 按地址排序�
 
 ```
 web/                 线上页面：index.html、sw.js、manifest、图标
+android/             AndroidManifest.xml —— APK 是 NativeActivity，没有 Java
 src/  guest.h        一整块 144 MB 的 guest 地址空间
       elf.h/.c       ELF32/ARM 读取、重定位、符号索引
       cpu.h/.c       ARMv5TE / Thumb-1 / VFPv2 解释器

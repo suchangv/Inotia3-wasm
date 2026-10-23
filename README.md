@@ -33,12 +33,24 @@ tools/build.sh web         # emscripten, NO game data: what the page ships
 tools/build.sh sdl         # SDL2 window, gamepad, ALSA/PipeWire audio
 tools/build.sh handheld    # aarch64 cross build for PortMaster-style devices
 tools/build_vorbis.sh      # the separate Ogg Vorbis decoder module
+
+tools/build-android.sh     # the APK: arm64-v8a + x86_64, debug-signed
+tools/build-android.sh --install
+ABI=arm64-v8a tools/build-android.sh
 ```
 
 The browser targets need emscripten (`$HOME/emsdk` by default) and a gl4es built
 for the host (`tools/build_gl4es.sh`); `vendor/` is gitignored. A fresh clone is
 therefore not buildable until you supply an APK and run those two scripts — see
 [`docs/HANDOFF.md`](docs/HANDOFF.md).
+
+The Android target needs the SDK's build-tools and platform, the NDK and a JDK
+(`ANDROID_SDK_ROOT`, `ANDROID_NDK_HOME`, `JAVA_HOME`; defaults are `~/android/sdk`
+and `~/android/jdk`), plus `ABIS="arm64-v8a x86_64" tools/build_gl4es.sh android`
+for the static gl4es. No Gradle. It packages `android/AndroidManifest.xml`
+(a `NativeActivity` with `hasCode="false"`) and copies the guest files into
+`android/assets/` — `tools/build-android.sh` is the whole build system, and
+[`docs/ANDROID.md`](docs/ANDROID.md) is the long version.
 
 ## Why this shape
 
@@ -132,6 +144,7 @@ frame costs ~84 ms at ~27 MIPS, which is what the libgcc host hooks and the
 
 ```
 web/                 the published page: index.html, sw.js, manifest, icons
+android/             AndroidManifest.xml — the APK is a NativeActivity, no Java
 src/  guest.h        one flat 144 MB guest address space
       elf.h/.c       ELF32/ARM reader, relocation, symbol index
       cpu.h/.c       ARMv5TE / Thumb-1 / VFPv2 interpreter
