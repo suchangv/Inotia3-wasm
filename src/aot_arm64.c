@@ -100,6 +100,7 @@ uint32_t g_aot_why_count[4];
 static uint32_t g_fb_pc[AOT_FB_MAX];
 static uint32_t g_fb_hits[AOT_FB_MAX];
 static uint32_t g_fb_n;
+static int g_fbheat;
 
 void aot_fallback_hit(uint32_t pc)
 {
@@ -1863,9 +1864,13 @@ static uint32_t *emit_fallback_block(uint32_t pcraw)
 {
     uint32_t *start = g_emit;
     emit_budget_check();
-    /* Heat, so the worklist is "what runs often" rather than "what exists". */
-    emit_mov_const(0, pcraw & ~1u);
-    emit_call((void *)aot_fallback_hit);
+    /* Heat, so the worklist is "what runs often" rather than "what exists".
+     * AOT_FBHEAT=1: it is a host call per interpreted instruction, which the
+     * default build should not pay now that the answer is known. */
+    if (g_fbheat) {
+        emit_mov_const(0, pcraw & ~1u);
+        emit_call((void *)aot_fallback_hit);
+    }
     emit(enc_ldst_imm(3, 0, 25, 26, 0));            /* str x25, [x26] */
     if (g_seq) {
         /* A fallback instruction runs on the interpreter, so without this the
@@ -3086,6 +3091,7 @@ static int aot_init(void)
     { const char *v = getenv("AOT_CHECK");  g_check  = v && *v && *v != '0'; }
     { const char *v = getenv("AOT_SEQ");    g_seq    = v && *v && *v != '0'; }
     { const char *v = getenv("AOT_BLKCHECK"); g_blkchk = v && *v && *v != '0'; }
+    { const char *v = getenv("AOT_FBHEAT"); g_fbheat = v && *v && *v != '0'; }
     host_log("aot: verify=%d trace=%d &g_halt %p\n",
              g_verify, g_trace_blocks, (void *)&g_halt);
     host_log("aot: arena %p, abort %p, budget %p, verify %p\n",
@@ -3303,6 +3309,14 @@ static void aot_cache_save(void)
              nblocks, g_cache_path, words);
 }
 
+/* Called by the runner once the boot has finished translating: everything the
+ * game will use has been translated by then, and waiting for process exit means
+ * a kill or a power-off loses the whole cache for that launch. */
+void aot_arm64_save_cache(void)
+{
+    if (g_ready) aot_cache_save();
+}
+
 void aot_arm64_stats(void)
 {
     aot_cache_save();
@@ -3329,7 +3343,7 @@ void aot_arm64_stats(void)
         if (g_aot_why_count[why])
             host_log("aot: %u instruction(s) fell back because %s\n",
                      g_aot_why_count[why], g_why[why]);
-    if (g_fb_n) {
+    if (g_fbheat && g_fb_n) {
         /* insertion sort, largest first; the table is tiny */
         for (uint32_t i = 1; i < g_fb_n; i++) {
             uint32_t pc = g_fb_pc[i], h = g_fb_hits[i];

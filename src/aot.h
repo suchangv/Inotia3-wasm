@@ -51,6 +51,7 @@ int aot_predec_run(uint64_t budget);
  * instructions. Defined in src/aot_arm64.c, compiled only for aarch64 hosts. */
 int aot_arm64_run(uint32_t entry, uint32_t sp, uint64_t budget);
 void aot_arm64_stats(void);
+void aot_arm64_save_cache(void);
 int  aot_arm64_available(void);
 
 #endif /* AOT_H */

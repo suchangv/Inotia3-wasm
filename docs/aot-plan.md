@@ -1914,3 +1914,39 @@ compared against the interpreter, and a cold/warm pair whose answers must match.
 
 Cumulative: bench 1480 MIPS (interpreter 43), `--frames=1200` warm **1093 ms**
 (interpreter 16.6 s).
+
+### 15.19 What the space headroom is *not* good for
+
+The stats said the arena uses 2% of its 56 MB, so a bigger block budget looked
+free. It is free and it is worthless: blocks average **8.05 guest instructions**
+(23,363 / 2,904) because they are terminated by branches, not by the limit, and
+raising `AOT_MAX_BLOCK` from 96 to 192 to 384 changes the block count by six.
+Measured, not assumed.
+
+The density is **7.84 words per guest instruction**, of which the fixed per-block
+cost is about 7 words — `emit_guest_pc` (3), the budget check (3) and the exit
+(1-2) — i.e. ~10% of the code, amortised over eight instructions.
+
+So the remaining win is the per-instruction 7.84, and it has one source: every
+operand and destination goes through `g_cpu` in memory. `adds r0, r1` is a load,
+a load, the add, the move into the slot and the `tst` for the flags. A register
+allocator that keeps the block's live guest registers in host registers would
+make it an add and a `tst` — a factor of two on the dominant term.
+
+That is a project, not an increment, for two reasons the code already ran into:
+
+* the flags live in PSTATE, so any instruction that sets them constrains where
+  operands may be; the honest fix is the flags-in-a-general-register model
+  sketched in 8.4, which changes every `b.cond` and every consumer;
+* a block's registers must be published before every exit, host call, branch and
+  conditional body, which is the same protocol the deferred store already
+  implements — the difference is that a mistake now loses a register rather than
+  costing a reload.
+
+Both are tractable; neither is something to start without a gate that reports the
+per-block register traffic, which is what `--aot-stats` should grow next.
+
+Also settled here, so it is not retried: the arena does not need to be bigger,
+the block budget does not need to be bigger, and the exit-only budget check is
+~2% faster than checking at every block entry (measured A/B: 1475 vs 1447), so
+the latter stays as it is and backward conditional branches keep their stubs.

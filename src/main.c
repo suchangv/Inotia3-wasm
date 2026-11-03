@@ -2009,6 +2009,7 @@ int main(int argc, char **argv)
     if (do_boot) {
         if (spike_boot() != 0)
             return 1;
+        aot_arm64_save_cache();   /* the boot translated everything; keep it */
         input_init(spike_dispatch_event);
 #ifdef __EMSCRIPTEN__
         /* The browser drives the engine one tick per requestAnimationFrame.
