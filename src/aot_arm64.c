@@ -1660,7 +1660,10 @@ static int emit_arm_insn(const air *i)
         case DP_BIC: emit(enc_logic_reg(0, 0, 1, 9, 9, 10, 0, 0)); break;
         case DP_MOV: case DP_MVN: break;
         case DP_TST: emit(enc_logic_reg(0, 3, 0, R_WZR, 9, 10, 0, 0)); break;
-        case DP_TEQ: emit(enc_logic_reg(0, 2, 0, R_WZR, 9, 10, 0, 0)); break;
+        case DP_TEQ: /* AArch64 has no EORS: eor then ands to get N,Z */
+                     emit(enc_logic_reg(0, 2, 0, 13, 9, 10, 0, 0));
+                     emit(enc_logic_reg(0, 3, 0, R_WZR, 13, 13, 0, 0));
+                     break;
         case DP_ADD: emit(enc_addsub_reg(0, 0, sets, 9, 9, 10, 0, 0)); break;
         case DP_SUB: emit(enc_addsub_reg(0, 1, sets, 9, 9, 10, 0, 0)); break;
         case DP_RSB: emit(enc_addsub_reg(0, 1, sets, 9, 10, 9, 0, 0)); break;

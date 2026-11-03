@@ -2023,6 +2023,14 @@ int main(int argc, char **argv)
         if (g_args_given)
             host_log("  result: r0=%08x r1=%08x r2=%08x r3=%08x cpsr=%08x\n",
                      g_cpu.r[0], g_cpu.r[1], g_cpu.r[2], g_cpu.r[3], g_cpu.cpsr);
+            /* The callee-saved registers matter as much as the result: a
+             * translated function that fails to restore one corrupts its caller
+             * silently and the symptom surfaces far away. */
+            host_log("  saved : r4=%08x r5=%08x r6=%08x r7=%08x r8=%08x r9=%08x"
+                     " r10=%08x r11=%08x r12=%08x r13=%08x r14=%08x\n",
+                     g_cpu.r[4], g_cpu.r[5], g_cpu.r[6], g_cpu.r[7], g_cpu.r[8],
+                     g_cpu.r[9], g_cpu.r[10], g_cpu.r[11], g_cpu.r[12],
+                     g_cpu.r[13], g_cpu.r[14]);
     } else if (do_init_array) {
         if (!g_img.init_array) {
             host_log("no DT_INIT_ARRAY in the image\n");

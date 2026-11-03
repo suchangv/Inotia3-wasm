@@ -1409,3 +1409,30 @@ registers arrive corrupted (`r3`, `r7`, `r12` hold what look like arena offsets)
 so the double-divide result is written through a bad pointer. Next step is the
 sweep over `0xd2300..0xd2440` with the fixed build to find the first differing
 instruction on the real call path.
+
+### 15.6 `teq` produced no flags at all
+
+`__aeabi_i2d` returned a constant `0x41d00000` for every input. The prologue is
+
+```
+d1fcc: teq  r0, #0
+d1fd0: moveq r1, #0
+d1fd4: bxeq lr
+```
+
+and the translator emitted ARM `teq` as `eor wzr, w9, w10`: the result is
+discarded, so *no* flags are written, yet `cc_kind` was set to `CC_NZ` and the
+`bxeq` was allowed to branch on them. AArch64 has no `EORS` (bit 29 is the S bit
+of `ANDS` only), so the fix is two instructions: `eor w13, w9, w10` then
+`ands wzr, w13, w13`. After it, `__aeabi_i2d` matches the interpreter for
+`0, 1, 2, 100, 1000, -1, 0x7fffffff`.
+
+`tst` was already correct (`ands wzr, ...` sets N and Z).
+
+Boot progress: 168,874 -> **170,184** instructions before the next fault, still
+pc `0x010dc742` (`str r0, [r7]` with `r7 = 0x40000000`, i.e. a double's high word
+arrived where a pointer belongs). The state at the call site `0x010dc73e`
+(r0-r14 and all of memory) is identical in both modes, so the bad value is
+produced on a *later* visit to that call site; the first-arrival dump cannot see
+it. Next: add a small ring buffer of recently entered block addresses, printed
+by the SIGSEGV handler, so the faulting arrival can be backtracked.
