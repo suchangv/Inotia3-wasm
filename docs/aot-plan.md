@@ -1841,3 +1841,76 @@ block the emit-time path would have refused.
 
 Not in the tree. Cost so far: three build-and-gate cycles, and the gate names the
 failure in one run each time (`--frames=1200`, 19 s).
+
+### 15.17 --aot-stats, and what it said
+
+`aot_arm64_stats()` now reports arena utilisation, how many exit links were
+recorded and how many never got patched, why instructions fell back, and the
+hottest interpreted blocks -- counted in the emitted code, so the ranking is the
+one that matters rather than an estimate:
+
+```
+aot: 4997 block(s), 37809 guest insn(s) translated, 93 fallback block(s),
+     294905 word(s) of code (2.0% of the 14680064-word arena)
+aot: 2 instruction(s) fell back because no encoder for this encoding
+aot: 8 instruction(s) fell back because flags live across a call or a partial setter
+aot: hottest interpreted blocks:
+aot:   010d1b34  14249 hit(s)
+aot:   010d1bac  1739 hit(s)   ...
+```
+
+Two conclusions, both of which change the plan:
+
+* The arena uses **2% of the 56 MB**. Almost all of the 14 M words are slack, so
+  a bigger block budget, dual-path inlining or a translator that emits more per
+  instruction are free in space terms.
+* The fallbacks are **not hot**. The hottest interpreted block runs 67 times per
+  engine frame, i.e. ~0.04% of a frame's 1.6 M instructions even at ten times the
+  cost of a translated one. Closing the flags-live-in hole -- the one that would
+  need the flags in a general register rather than PSTATE -- is therefore worth
+  almost nothing on this workload, and the list is now short enough to say so
+  rather than guess.
+
+### 15.18 The translation cache
+
+Translating libgame.so's ~5,000 blocks happens on every launch for code that
+never changes: 294,905 words of aarch64. `AOT_CACHE=<path>` stores the arena and
+the list of blocks in it; the default path is `<app data>/aot-code.cache`, and an
+empty value disables it.
+
+Cold vs warm, interleaved over three rounds, `--frames=1200` with a tap:
+**1364 -> 1093 ms, 22/18/19%**. On an RK3566 the translation is 5-10x more
+expensive, so this is the item that matters most there.
+
+Reuse is safe because the generated code contains no run-dependent address: the
+guest registers, the guest memory and the instruction counter arrive in pinned
+registers from `aot_exec`, host entry points are absolute in the (static) host
+binary, and the dispatch table is rebuilt from the block list. What it does
+require is that the arena lands at the same address, so it is mapped at a fixed
+base (`MAP_FIXED_NOREPLACE` at 0x600000000000, far from the host binary); if that
+fails the cache is not used at all.
+
+The header is checked before anything is applied: magic, version, the address of
+`aot_enter` (a rebuilt host binary invalidates it), the arena base, the guest
+text bounds, and a checksum of the guest `.text` (a different libgame.so
+invalidates it). The body is then read into scratch and every block entry
+validated before a single byte reaches the arena -- a partially applied cache
+leaves the dispatch table pointing into an arena that is half cached and half
+newly emitted, which is worse than no cache, and that is exactly how the first
+version failed.
+
+Three bugs, all found by the gate:
+
+1. block extents were inferred from the next guest address in the dispatch
+   table, which has nothing to do with layout in the arena; they now come from
+   the block map, which records the real start and end;
+2. the header's block count included entries that were dropped as
+   inexpressible, so the reader consumed garbage for the tail;
+3. the loader applied entries as it validated them, so a failure part-way
+   through corrupted the arena.
+
+The gate now runs three ways: translation with the cache disabled, the boot
+compared against the interpreter, and a cold/warm pair whose answers must match.
+
+Cumulative: bench 1480 MIPS (interpreter 43), `--frames=1200` warm **1093 ms**
+(interpreter 16.6 s).

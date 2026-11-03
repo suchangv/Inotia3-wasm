@@ -93,6 +93,25 @@ static void seq_log(uint32_t pc)
 uint64_t g_aot_blocks, g_aot_insns, g_aot_fallback_blocks;
 uint32_t g_aot_why_count[4];
 
+/* Which interpreted blocks are actually hot. A fallback block costs ~10x a
+ * translated one, so the useful worklist is "the blocks that run often", not
+ * "the blocks that exist". Counted in the emitted code, so this is exact. */
+#define AOT_FB_MAX 256
+static uint32_t g_fb_pc[AOT_FB_MAX];
+static uint32_t g_fb_hits[AOT_FB_MAX];
+static uint32_t g_fb_n;
+
+void aot_fallback_hit(uint32_t pc)
+{
+    for (uint32_t i = 0; i < g_fb_n; i++)
+        if (g_fb_pc[i] == pc) { g_fb_hits[i]++; return; }
+    if (g_fb_n < AOT_FB_MAX) {
+        g_fb_pc[g_fb_n] = pc;
+        g_fb_hits[g_fb_n] = 1;
+        g_fb_n++;
+    }
+}
+
 /* ------------------------------------------------------------------------- */
 /* aarch64 encoder                                                           */
 /* ------------------------------------------------------------------------- */
@@ -330,6 +349,7 @@ static struct pend_link g_link[AOT_MAX_LINKS];
 static uint32_t g_nlink;
 
 static void disp_set(uint32_t pc, uint32_t *code);
+static void blkmap_add(uint32_t *start, uint32_t *end, uint32_t pc);
 
 /* Guest PC -> host code, or 0. Indexed by (pc - text_lo) / 2 for Thumb. */
 static inline uint32_t *disp_get(uint32_t pc)
@@ -1843,6 +1863,9 @@ static uint32_t *emit_fallback_block(uint32_t pcraw)
 {
     uint32_t *start = g_emit;
     emit_budget_check();
+    /* Heat, so the worklist is "what runs often" rather than "what exists". */
+    emit_mov_const(0, pcraw & ~1u);
+    emit_call((void *)aot_fallback_hit);
     emit(enc_ldst_imm(3, 0, 25, 26, 0));            /* str x25, [x26] */
     if (g_seq) {
         /* A fallback instruction runs on the interpreter, so without this the
@@ -2323,6 +2346,16 @@ uint32_t aot_block_guest_pc(uint32_t *start)
     return 0;
 }
 
+static void blkmap_add(uint32_t *start, uint32_t *end, uint32_t pc)
+{
+    if (g_nblkmap < (int)(sizeof(g_blkmap) / sizeof(g_blkmap[0]))) {
+        g_blkmap[g_nblkmap].start = start;
+        g_blkmap[g_nblkmap].end   = end;
+        g_blkmap[g_nblkmap].pc    = pc;
+        g_nblkmap++;
+    }
+}
+
 static uint32_t *translate(uint32_t pc, int thumb)
 {
     g_block_thumb = thumb;
@@ -2357,6 +2390,7 @@ static uint32_t *translate(uint32_t pc, int thumb)
                  pc, thumb, a0.op, LD32(pc & ~3u), g_last_block_pc);
         g_aot_fallback_blocks++;
         uint32_t *c = emit_fallback_block(pc | (uint32_t)thumb);
+        blkmap_add(c, g_emit, pc);
         disp_set(pc, c);
         return c;
     }
@@ -2456,6 +2490,7 @@ static uint32_t *translate(uint32_t pc, int thumb)
             g_aot_why_count[g_fail_why]++;
         }
         uint32_t *c = emit_fallback_block(pc | (uint32_t)thumb);
+        blkmap_add(c, g_emit, pc);
         disp_set(pc, c);
         return c;
     }
@@ -2534,12 +2569,7 @@ static uint32_t *translate(uint32_t pc, int thumb)
                          (void *)t, (void *)g_code, (void *)g_emit);
         }
     }
-    if (g_nblkmap < (int)(sizeof(g_blkmap)/sizeof(g_blkmap[0]))) {
-        g_blkmap[g_nblkmap].start = start;
-        g_blkmap[g_nblkmap].end = g_emit;
-        g_blkmap[g_nblkmap].pc = pc;
-        g_nblkmap++;
-    }
+    blkmap_add(start, g_emit, pc);
     aot_dump_block(start, g_emit, pc);
     __builtin___clear_cache((char *)start, (char *)g_emit);
     g_aot_blocks++;
@@ -2847,11 +2877,136 @@ int aot_exec(uint32_t *code, uint64_t budget, struct aot_ctx *ctx)
 
 static int aot_halt_reason(void) { return g_halt; }
 
+/* ---- the on-disk cache ---------------------------------------------------
+ *
+ * Translating libgame.so's 5,000 blocks costs tens of milliseconds here and
+ * several hundred on a handheld, once per launch, for code that never changes.
+ * The cache stores the arena image and the list of blocks in it, so a second
+ * launch maps them instead of emitting them.
+ *
+ * It is safe to reuse because the generated code has no run-dependent addresses
+ * in it: the guest register file, the guest memory and the instruction counter
+ * all arrive in pinned registers from aot_exec, host entry points are absolute
+ * addresses in the (static) host binary, and the dispatch table is rebuilt from
+ * the block list. What *is* required is that the arena lands at the same address
+ * as last time, so it is mapped at a fixed base; if that fails, or anything in
+ * the header disagrees, the cache is ignored and translation runs as usual.
+ *
+ * Nothing pre-translated is shipped: the file is produced at run time from the
+ * player's own libgame.so and keyed on that image.
+ */
+#define AOT_CACHE_MAGIC   0x464f4154u     /* "TAOF" */
+#define AOT_CACHE_VERSION 3u
+/* Far from the host binary (0x5500... on aarch64 Linux) and inside the 48-bit
+ * user range. Any address would do as long as it is the same every run. */
+#define AOT_CACHE_BASE    0x600000000000ull
+
+struct aot_cache_hdr {
+    uint32_t magic, version;
+    uint64_t host_anchor;        /* &aot_enter: catches a rebuilt host binary */
+    uint64_t arena;              /* where it was mapped when written          */
+    uint32_t code_words;
+    uint32_t nblocks;
+    uint32_t text_lo, text_hi;
+    uint32_t off_abort, off_budget, off_stop, off_verify;
+    uint64_t text_sum;           /* checksum of the guest .text               */
+};
+
+struct aot_cache_blk { uint32_t pc, off, words; };
+
+static uint64_t aot_text_sum(void)
+{
+    uint64_t h = 0xcbf29ce484222325ull;
+    for (uint32_t p = g_text_lo; p < g_text_hi; p += 4) {
+        h ^= LD32(p);
+        h *= 0x100000001b3ull;
+    }
+    return h;
+}
+
+static uint32_t *aot_map_arena(uint64_t want)
+{
+    size_t code_bytes = (size_t)AOT_CODE_WORDS * 4u;
+    if (want) {
+        void *p = mmap((void *)(uintptr_t)want, code_bytes,
+                       PROT_READ | PROT_WRITE | PROT_EXEC,
+                       MAP_PRIVATE | MAP_ANONYMOUS | MAP_FIXED_NOREPLACE, -1, 0);
+        if (p != MAP_FAILED && (uintptr_t)p == (uintptr_t)want)
+            return (uint32_t *)p;
+        if (p != MAP_FAILED) munmap(p, code_bytes);
+    }
+    return NULL;
+}
+
+static int g_cache_why;     /* index into g_cache_reason, for the log */
+
+/* Load the arena and the block list. Everything is validated into a scratch
+ * buffer first: a partially applied cache would leave the dispatch table
+ * pointing into an arena whose code is half the cached one and half freshly
+ * emitted, which is worse than no cache at all. */
+static int aot_cache_load(const char *path, uint32_t *code, struct aot_cache_hdr *h)
+{
+    FILE *f = fopen(path, "rb");
+    if (!f) { g_cache_why = 0; return -1; }
+    if (fread(h, sizeof *h, 1, f) != 1) { g_cache_why = 1; goto bad; }
+    if (h->magic != AOT_CACHE_MAGIC || h->version != AOT_CACHE_VERSION) {
+        g_cache_why = 2; goto bad;
+    }
+    if (h->host_anchor != (uint64_t)(uintptr_t)&aot_enter) {
+        g_cache_why = 3; goto bad;      /* the host binary was rebuilt */
+    }
+    if (h->arena != (uint64_t)(uintptr_t)code) { g_cache_why = 4; goto bad; }
+    if (h->text_lo != g_text_lo || h->text_hi != g_text_hi) {
+        g_cache_why = 5; goto bad;
+    }
+    if (h->text_sum != aot_text_sum()) { g_cache_why = 6; goto bad; }
+    if (!h->code_words || h->code_words > AOT_CODE_WORDS ||
+        h->nblocks > (uint32_t)(sizeof(g_blkmap)/sizeof(g_blkmap[0])) ||
+        h->off_abort >= h->code_words || h->off_verify >= h->code_words) {
+        g_cache_why = 7; goto bad;
+    }
+    size_t img_bytes = (size_t)h->code_words * 4u;
+    size_t bl_bytes  = (size_t)h->nblocks * sizeof(struct aot_cache_blk);
+    uint32_t *img = mmap(NULL, img_bytes, PROT_READ | PROT_WRITE,
+                         MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+    struct aot_cache_blk *bl = mmap(NULL, bl_bytes, PROT_READ | PROT_WRITE,
+                                    MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+    if (img == MAP_FAILED || bl == MAP_FAILED) { g_cache_why = 11; goto bad; }
+    if (fread(img, 4, h->code_words, f) != h->code_words) {
+        g_cache_why = 8; goto bad;
+    }
+    if (fread(bl, sizeof *bl, h->nblocks, f) != h->nblocks) {
+        g_cache_why = 9; goto bad;
+    }
+    for (uint32_t i = 0; i < h->nblocks; i++) {
+        if (bl[i].pc < g_text_lo || bl[i].pc >= g_text_hi ||
+            bl[i].off >= h->code_words ||
+            bl[i].words > h->code_words - bl[i].off) {
+            g_cache_why = 10; goto bad;
+        }
+    }
+    memcpy(code, img, (size_t)h->code_words * 4u);
+    for (uint32_t i = 0; i < h->nblocks; i++) {
+        disp_set(bl[i].pc, code + bl[i].off);
+        blkmap_add(code + bl[i].off, code + bl[i].off + bl[i].words, bl[i].pc);
+    }
+    munmap(img, img_bytes);
+    munmap(bl, bl_bytes);
+    fclose(f);
+    __builtin___clear_cache((char *)code, (char *)(code + h->code_words));
+    return 0;
+bad:
+    fclose(f);
+    return -1;
+}
+
 /* ------------------------------------------------------------------------- */
 /* init, run, stats                                                          */
 /* ------------------------------------------------------------------------- */
 
 static int g_ready;
+static const char *g_cache_path;
+static int g_cache_loaded;
 
 static int aot_init(void)
 {
@@ -2862,8 +3017,19 @@ static int aot_init(void)
     size_t code_bytes = (size_t)AOT_CODE_WORDS * 4u;
     size_t disp_bytes = (size_t)AOT_TABLE_ENTRIES * sizeof(uint64_t);
 
-    void *code = mmap(NULL, code_bytes, PROT_READ | PROT_WRITE | PROT_EXEC,
-                      MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+    g_cache_path = getenv("AOT_CACHE");
+    void *code = NULL;
+    if (g_cache_path && *g_cache_path) {
+        /* A cache is only reusable if the arena lands where it did last time. */
+        code = aot_map_arena(AOT_CACHE_BASE);
+        if (!code)
+            host_log("aot: cannot map the arena at the fixed base %p -- "
+                     "translating, and not using a cache\n",
+                     (void *)(uintptr_t)AOT_CACHE_BASE);
+    }
+    if (!code)
+        code = mmap(NULL, code_bytes, PROT_READ | PROT_WRITE | PROT_EXEC,
+                    MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
     if (code == MAP_FAILED) {
         host_log("aot: cannot map executable code (%u bytes) -- the kernel "
                  "refused RWX; staying on the interpreter\n", (unsigned)code_bytes);
@@ -2895,6 +3061,24 @@ static int aot_init(void)
     emit(enc_br(22));
 
     __builtin___clear_cache((char *)g_code, (char *)g_emit);
+
+    if (g_cache_path && *g_cache_path &&
+        (uintptr_t)g_code == (uintptr_t)AOT_CACHE_BASE && !g_check && !g_verify) {
+        struct aot_cache_hdr h;
+        if (aot_cache_load(g_cache_path, g_code, &h) == 0) {
+            g_emit = g_code + h.code_words;
+            g_abort_stub       = g_code + h.off_abort;
+            g_halt_budget_stub = g_code + h.off_budget;
+            g_halt_stop_stub   = g_code + h.off_stop;
+            g_verify_stop_stub = g_code + h.off_verify;
+            g_cache_loaded = 1;
+            host_log("aot: %u block(s) loaded from %s\n", h.nblocks, g_cache_path);
+        } else {
+            if (g_cache_why)      /* absent is the normal first run */
+                host_log("aot: cache %s not usable (reason %d) -- translating\n",
+                         g_cache_path, g_cache_why);
+        }
+    }
 
     { const char *t = getenv("AOT_TRACE"); g_trace_blocks = t && *t && *t != '0'; }
     g_dump_code = getenv("AOT_DUMP_CODE");
@@ -3059,18 +3243,108 @@ int aot_arm64_run(uint32_t entry, uint32_t sp, uint64_t budget)
 
 int aot_arm64_available(void) { return g_ready; }
 
+/* Write the arena and the block list. Only translated blocks are in g_disp, so
+ * the list is built by walking it. */
+static void aot_cache_save(void)
+{
+    if (!g_cache_path || !*g_cache_path || g_cache_loaded || g_check || g_verify)
+        return;
+    if ((uintptr_t)g_code != (uintptr_t)AOT_CACHE_BASE) return;
+    uint32_t words = (uint32_t)(g_emit - g_code);
+    /* Collect first: entries that cannot be expressed are dropped, and the
+     * header's count must agree with what is actually written. */
+    struct aot_cache_blk *list =
+        mmap(NULL, (size_t)g_nblkmap * sizeof *list, PROT_READ | PROT_WRITE,
+             MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+    if (list == MAP_FAILED) return;
+    uint32_t nblocks = 0;
+    for (int i = 0; i < g_nblkmap; i++) {
+        struct aot_cache_blk b;
+        b.pc    = g_blkmap[i].pc;
+        b.off   = (uint32_t)(g_blkmap[i].start - g_code);
+        b.words = (uint32_t)(g_blkmap[i].end - g_blkmap[i].start);
+        if (!b.pc || b.pc < g_text_lo || b.pc >= g_text_hi) continue;
+        if (!b.words || b.off >= words || b.words > words - b.off) continue;
+        list[nblocks++] = b;
+    }
+
+    char tmp[512];
+    snprintf(tmp, sizeof tmp, "%s.tmp", g_cache_path);
+    FILE *f = fopen(tmp, "wb");
+    if (!f) { host_log("aot: cannot write %s\n", tmp); return; }
+    struct aot_cache_hdr h;
+    memset(&h, 0, sizeof h);
+    h.magic = AOT_CACHE_MAGIC;
+    h.version = AOT_CACHE_VERSION;
+    h.host_anchor = (uint64_t)(uintptr_t)&aot_enter;
+    h.arena = (uint64_t)(uintptr_t)g_code;
+    h.code_words = words;
+    h.nblocks = nblocks;
+    h.text_lo = g_text_lo;
+    h.text_hi = g_text_hi;
+    h.off_abort  = (uint32_t)(g_abort_stub - g_code);
+    h.off_budget = (uint32_t)(g_halt_budget_stub - g_code);
+    h.off_stop   = (uint32_t)(g_halt_stop_stub - g_code);
+    h.off_verify = (uint32_t)(g_verify_stop_stub - g_code);
+    h.text_sum = aot_text_sum();
+    int ok = fwrite(&h, sizeof h, 1, f) == 1 &&
+             fwrite(g_code, 4, words, f) == words;
+    if (ok && nblocks)
+        ok = fwrite(list, sizeof *list, nblocks, f) == nblocks;
+    munmap(list, (size_t)g_nblkmap * sizeof *list);
+    fclose(f);
+    if (!ok) { host_log("aot: failed writing %s\n", tmp); remove(tmp); return; }
+    if (rename(tmp, g_cache_path) != 0) {
+        host_log("aot: cannot rename %s into place\n", tmp);
+        remove(tmp);
+        return;
+    }
+    host_log("aot: %u block(s) cached in %s (%u words)\n",
+             nblocks, g_cache_path, words);
+}
+
 void aot_arm64_stats(void)
 {
+    aot_cache_save();
     if (!g_ready)
         return;
     if (g_checks)
         host_log("aot: %llu instruction(s) checked against the interpreter\n",
                  (unsigned long long)g_checks);
     host_log("aot: %llu block(s), %llu guest insn(s) translated, %llu fallback "
-             "block(s), %u word(s) of code\n",
+             "block(s), %u word(s) of code (%.1f%% of the %u-word arena)\n",
              (unsigned long long)g_aot_blocks, (unsigned long long)g_aot_insns,
              (unsigned long long)g_aot_fallback_blocks,
-             (unsigned)(g_emit - g_code));
+             (unsigned)(g_emit - g_code),
+             100.0 * (double)(g_emit - g_code) / (double)AOT_CODE_WORDS,
+             (unsigned)AOT_CODE_WORDS);
+    if (g_nlink) {
+        uint32_t open = 0;
+        for (uint32_t k = 0; k < g_nlink; k++) if (g_link[k].target) open++;
+        host_log("aot: %u exit link(s) recorded, %u never patched\n",
+                 g_nlink, open);
+    }
+    /* What could not be translated, and how hot it is: this is the worklist. */
+    for (int why = 1; why <= 3; why++)
+        if (g_aot_why_count[why])
+            host_log("aot: %u instruction(s) fell back because %s\n",
+                     g_aot_why_count[why], g_why[why]);
+    if (g_fb_n) {
+        /* insertion sort, largest first; the table is tiny */
+        for (uint32_t i = 1; i < g_fb_n; i++) {
+            uint32_t pc = g_fb_pc[i], h = g_fb_hits[i];
+            uint32_t j = i;
+            while (j > 0 && g_fb_hits[j - 1] < h) {
+                g_fb_pc[j] = g_fb_pc[j - 1]; g_fb_hits[j] = g_fb_hits[j - 1]; j--;
+            }
+            g_fb_pc[j] = pc; g_fb_hits[j] = h;
+        }
+        uint32_t top = g_fb_n < 8 ? g_fb_n : 8;
+        host_log("aot: hottest interpreted blocks:\n");
+        for (uint32_t i = 0; i < top; i++)
+            host_log("aot:   %08x  %llu hit(s)\n", g_fb_pc[i],
+                     (unsigned long long)g_fb_hits[i]);
+    }
 }
 
 /* Is a host PC inside the emitted code, and if so which block? Used by the

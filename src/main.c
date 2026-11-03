@@ -1986,6 +1986,25 @@ int main(int argc, char **argv)
 
 
     /* ---- run it ---- */
+#ifndef __EMSCRIPTEN__
+    /* Translations of libgame.so are reused across launches: the same ~5,000
+     * blocks are emitted every time, which is tens of milliseconds here and
+     * several hundred on a handheld. The cache is written from the player's own
+     * image and keyed on it (see aot_arm64.c), so nothing is shipped; putting it
+     * next to the game data rather than in the working directory means a
+     * read-only install still gets one. AOT_CACHE overrides it, and an empty
+     * value disables it. */
+    if (!getenv("AOT_CACHE") && path) {
+        static char cache[512];
+        const char *dir = host_app_data_dir("com.com2us.inotia3");
+        if (dir && *dir) {
+            size_t n = strlen(dir);
+            snprintf(cache, sizeof cache, "%s%saot-code.cache", dir,
+                     (n && dir[n - 1] == (char)47) ? "" : "/");
+            setenv("AOT_CACHE", cache, 1);
+        }
+    }
+#endif
     host_log("\n");
     if (do_boot) {
         if (spike_boot() != 0)
