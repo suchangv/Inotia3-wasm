@@ -1950,3 +1950,54 @@ Also settled here, so it is not retried: the arena does not need to be bigger,
 the block budget does not need to be bigger, and the exit-only budget check is
 ~2% faster than checking at every block entry (measured A/B: 1475 vs 1447), so
 the latter stays as it is and backward conditional branches keep their stubs.
+
+### 15.20 Operands in place: +22%
+
+The measured composition of the generated code said where the remaining cost was:
+
+| category | share of all words |
+|---|---|
+| `mov` between a cache slot and a scratch register | **21.3%** |
+| of which: reading a cached operand into w9/w10 | 6.3% |
+| of which: moving a result into its slot | **10.4%** |
+| guest memory and g_cpu loads/stores | 17.0% |
+| branches | 9.5% |
+| `tst` (materialising N,Z) | 2.0% |
+
+The moves existed only because the emitters fetched operands into fixed scratch
+registers while the cache slots are w5..w8. `gl(g, scratch)` now returns *the
+slot's own register* when the guest register is already cached, and `gs(g)`
+returns the register to compute into — so a cached operand costs nothing and the
+result never round-trips through a scratch.
+
+Applied to `AOP_ADDSUB`, `AOP_IMM8` (mov/add/sub) and `AOP_ALU` (the Thumb
+logic, shift, multiply and negate forms), which are the bulk of the arithmetic.
+
+| | bench MIPS | words/guest insn |
+|---|---|---|
+| before | 1456 | 7.84 |
+| after | **1778** | **7.50** |
+
+Interleaved A/B over three rounds: 1455/1454/1458 vs 1780/1781/1778. Only 4% less
+code but 22% faster: the moves were on the dependency chain, so removing them
+removed a stall rather than an instruction.
+
+One bug, found by the gate in one run: the converted cases `goto done`ed, which
+skipped the `emit_flags_nz` that the old fall-through emitted, so the flags after
+a logical or shift operation were stale.
+
+`AOP_LDST` was converted too (the store value and the address base in place) and
+measured **no further gain** -- 1780 vs 1778 -- so it was dropped again: same
+performance, more code to get wrong. A `gl`/`gs` for loads means the destination
+slot can be the same register the address is in, which costs a move anyway.
+
+Register traffic, now reported by `--aot-stats`:
+
+```
+aot: register cache: 4918 read(s), 2489 from a slot (51%), 5555 write(s)
+```
+
+Half of all operands are already in a slot. The other half is a load, and that is
+what a real allocator would fix: it would make an operand that is *written* by
+the block available to the next instruction without a slot round-trip at all,
+which is the remaining 17% of loads and stores.

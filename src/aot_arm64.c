@@ -445,6 +445,11 @@ static void rc_sync(void)
     for (int i = 0; i < 16; i++) rc_slot[i] = -1;
 }
 
+/* Translation-time counters: how often an operand was already in a slot (so the
+ * read is free), how often it had to be loaded, and how often a result was
+ * computed straight into a slot. Reported by --aot-stats. */
+static uint32_t g_rc_reads, g_rc_hits, g_rc_writes, g_rc_moves;
+
 static int rc_alloc(int g)
 {
     for (int i = 0; i < RC_N; i++)
@@ -463,6 +468,35 @@ static int rc_alloc(int g)
     rc_of[i] = (int8_t)g;
     rc_slot[g] = (int8_t)i;
     return i;
+}
+
+/* A host register holding guest register g: the slot itself when g is cached,
+ * otherwise `scratch` after a load. Returns a register number, so the emitter
+ * can use it as an operand directly instead of copying it into a fixed one. */
+static int gl(int g, int scratch)
+{
+    g_rc_reads++;
+    int s = rc_slot[g];
+    if (s >= 0) { g_rc_hits++; return rc_host[s]; }
+    emit(enc_ldst_imm(2, 1, scratch, 28, (uint32_t)g));
+    return scratch;
+}
+
+/* The host register to compute guest register g's new value into. Call this
+ * *after* every gl() for the same instruction: taking a slot can evict another,
+ * and an evicted slot is published and then reused. */
+static int gs(int g)
+{
+    g_rc_writes++;
+    int s = rc_alloc(g);
+    if (g_rc_cond) {
+        /* A conditionally executed body must reach memory immediately; the
+         * caller stores it. */
+        rc_dirty[s] = 0;
+    } else {
+        rc_dirty[s] = 1;
+    }
+    return rc_host[s];
 }
 
 #define G_LD(w, g) \
@@ -1484,56 +1518,71 @@ static int emit_one(const air *i)
     }
 
     case AOP_ADDSUB: {
-        G_LD(9, i->rn);
-        if (i->a) emit_mov_const(10, i->imm);
-        else G_LD(10, i->rm);
-        emit(enc_addsub_reg(0, i->b, 1, 9, 9, 10, 0, 0));
-        G_ST(i->rd, 9);
+        /* Operands in place: an operand already in a slot is used there, and
+         * the result is computed straight into the destination's slot, so the
+         * whole instruction is often one add. gl() before gs(), because taking
+         * a slot can evict another. */
+        int a = gl(i->rn, 9);
+        int b;
+        if (i->a) { emit_mov_const(10, i->imm); b = 10; }
+        else b = gl(i->rm, 10);
+        int d = gs(i->rd);
+        emit(enc_addsub_reg(0, i->b, 1, d, a, b, 0, 0));
+        if (g_rc_cond) emit(enc_ldst_imm(2, 0, d, 28, (uint32_t)i->rd));
         cc_kind = CC_EXACT;
         break;
     }
 
     case AOP_IMM8:
         switch (i->a) {
-        case 0:                                     /* mov */
-            emit_mov_const(9, i->imm);
-            G_ST(i->rd, 9);
-            emit_flags_nz(9);
-            break;
+        case 0: {                                   /* mov */
+            int d = gs(i->rd);
+            emit_mov_const(d, i->imm);
+            if (g_rc_cond) emit(enc_ldst_imm(2, 0, d, 28, (uint32_t)i->rd));
+            emit_flags_nz(d);
+            break; }
         case 1:                                     /* cmp */
             G_LD(9, i->rd);
             emit_mov_const(10, i->imm);
             emit(enc_addsub_reg(0, 1, 1, R_WZR, 9, 10, 0, 0));
             cc_kind = CC_EXACT;
             break;
-        case 2:                                     /* add */
-            G_LD(9, i->rd);
-            emit(enc_addsub_imm(0, 0, 1, 9, 9, i->imm));
-            G_ST(i->rd, 9);
+        case 2:                                     /* add */ {
+            int a = gl(i->rd, 9);
+            int d = gs(i->rd);
+            emit(enc_addsub_imm(0, 0, 1, d, a, i->imm));
+            if (g_rc_cond) emit(enc_ldst_imm(2, 0, d, 28, (uint32_t)i->rd));
             cc_kind = CC_EXACT;
-            break;
-        default:                                    /* sub */
-            G_LD(9, i->rd);
-            emit(enc_addsub_imm(0, 1, 1, 9, 9, i->imm));
-            G_ST(i->rd, 9);
+            break; }
+        default:                                    /* sub */ {
+            int a = gl(i->rd, 9);
+            int d = gs(i->rd);
+            emit(enc_addsub_imm(0, 1, 1, d, a, i->imm));
+            if (g_rc_cond) emit(enc_ldst_imm(2, 0, d, 28, (uint32_t)i->rd));
             cc_kind = CC_EXACT;
-            break;
+            break; }
         }
         break;
 
     case AOP_ALU: {
         int rd = i->rd, rm = i->rm;
         switch (i->a) {
-        case 0x0: G_LD(9, rd); G_LD(10, rm);
-                  emit(enc_logic_reg(0, 0, 0, 9, 9, 10, 0, 0)); break;
-        case 0x1: G_LD(9, rd); G_LD(10, rm);
-                  emit(enc_logic_reg(0, 2, 0, 9, 9, 10, 0, 0)); break;
-        case 0x2: G_LD(9, rd); G_LD(10, rm);
-                  emit(enc_dp2(0, 10, DP2_LSLV, 9, 9)); break;
-        case 0x3: G_LD(9, rd); G_LD(10, rm);
-                  emit(enc_dp2(0, 10, DP2_LSRV, 9, 9)); break;
-        case 0x4: G_LD(9, rd); G_LD(10, rm);
-                  emit(enc_dp2(0, 10, DP2_ASRV, 9, 9)); break;
+        /* Operands in place: see AOP_ADDSUB. The result goes straight into the
+         * destination's slot, so an instruction whose operands are already
+         * cached costs one ALU operation. */
+        case 0x0: case 0x1: case 0x2: case 0x3: case 0x4: {
+            int a = gl(rd, 9), b2 = gl(rm, 10), d = gs(rd);
+            switch (i->a) {
+            case 0x0: emit(enc_logic_reg(0, 0, 0, d, a, b2, 0, 0)); break;
+            case 0x1: emit(enc_logic_reg(0, 2, 0, d, a, b2, 0, 0)); break;
+            case 0x2: emit(enc_dp2(0, b2, DP2_LSLV, a, d)); break;
+            case 0x3: emit(enc_dp2(0, b2, DP2_LSRV, a, d)); break;
+            default:  emit(enc_dp2(0, b2, DP2_ASRV, a, d)); break;
+            }
+            if (g_rc_cond) emit(enc_ldst_imm(2, 0, d, 28, (uint32_t)rd));
+            emit_flags_nz(d);
+            goto done;
+        }
         case 0x5:                                   /* ADC: Rd+Rm+C  */
         case 0x6: {                                 /* SBC: Rd-Rm-!C */
             /* Both read C, so they need flags from an exact setter. aarch64
@@ -1548,8 +1597,13 @@ static int emit_one(const air *i)
             G_ST(rd, 9);
             goto done;
         }
-        case 0x7: G_LD(9, rd); G_LD(10, rm);
-                  emit(enc_dp2(0, 10, DP2_RORV, 9, 9)); break;
+        case 0x7: {
+            int a = gl(rd, 9), b2 = gl(rm, 10), dd = gs(rd);
+            emit(enc_dp2(0, b2, DP2_RORV, a, dd));
+            if (g_rc_cond) emit(enc_ldst_imm(2, 0, dd, 28, (uint32_t)rd));
+            emit_flags_nz(dd);
+            goto done;
+        }
         case 0x8: G_LD(9, rd); G_LD(10, rm);        /* TST */
                   emit(enc_logic_reg(0, 3, 0, R_WZR, 9, 10, 0, 0));
                   cc_kind = CC_NZ; goto done;
@@ -1562,14 +1616,18 @@ static int emit_one(const air *i)
         case 0xb: G_LD(9, rd); G_LD(10, rm);        /* CMN */
                   emit(enc_addsub_reg(0, 0, 1, R_WZR, 9, 10, 0, 0));
                   cc_kind = CC_EXACT; goto done;
-        case 0xc: G_LD(9, rd); G_LD(10, rm);        /* ORR */
-                  emit(enc_logic_reg(0, 1, 0, 9, 9, 10, 0, 0)); break;
-        case 0xd: G_LD(9, rd); G_LD(10, rm);        /* MUL */
-                  emit(enc_madd(0, 9, 9, 10, R_WZR)); break;
-        case 0xe: G_LD(9, rd); G_LD(10, rm);        /* BIC */
-                  emit(enc_logic_reg(0, 0, 1, 9, 9, 10, 0, 0)); break;
-        default:  G_LD(10, rm);                     /* MVN */
-                  emit(enc_logic_reg(0, 1, 1, 9, R_WZR, 10, 0, 0)); break;
+        case 0xc: case 0xd: case 0xe: case 0xf: {
+            int a = gl(rd, 9), b2 = gl(rm, 10), dd = gs(rd);
+            switch (i->a) {
+            case 0xc: emit(enc_logic_reg(0, 1, 0, dd, a, b2, 0, 0)); break;
+            case 0xd: emit(enc_madd(0, dd, a, b2, R_WZR)); break;
+            case 0xe: emit(enc_logic_reg(0, 0, 1, dd, a, b2, 0, 0)); break;
+            default:  emit(enc_logic_reg(0, 1, 1, dd, R_WZR, b2, 0, 0)); break;
+            }
+            if (g_rc_cond) emit(enc_ldst_imm(2, 0, dd, 28, (uint32_t)rd));
+            emit_flags_nz(dd);
+            goto done;
+        }
         }
         G_ST(rd, 9);
         emit_flags_nz(9);
@@ -3332,6 +3390,10 @@ void aot_arm64_stats(void)
              (unsigned)(g_emit - g_code),
              100.0 * (double)(g_emit - g_code) / (double)AOT_CODE_WORDS,
              (unsigned)AOT_CODE_WORDS);
+    if (g_rc_reads)
+        host_log("aot: register cache: %u read(s), %u from a slot (%.0f%%), "
+                 "%u write(s)\n", g_rc_reads, g_rc_hits,
+                 100.0 * (double)g_rc_hits / (double)g_rc_reads, g_rc_writes);
     if (g_nlink) {
         uint32_t open = 0;
         for (uint32_t k = 0; k < g_nlink; k++) if (g_link[k].target) open++;
