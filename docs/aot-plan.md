@@ -1547,3 +1547,50 @@ Next steps, in the order the measurements argue for:
    a number instead of an impression;
 4. the disk cache (M4 in section 12): 5,000 blocks is real startup time on an
    RK3566.
+
+### 15.10 A guest-register cache, write-through
+
+The remaining cost is that g_cpu is memory: most instructions write a guest
+register and the next one reads it straight back, and a store immediately
+followed by a load of the same address is a store-to-load-forwarding stall. Four
+host registers (w5..w8, verified unused by every encoder call) now mirror guest
+registers, so that pair becomes two `mov`s.
+
+**Write-through, deliberately.** `G_ST` stores to g_cpu *and* records the value
+in a slot, so g_cpu is correct after every instruction and a slot is only a hint.
+Dropping the mapping can then never lose a value: a wrong guess costs one
+reload, never a wrong answer. The mapping is forgotten (not published -- there is
+nothing to publish) at every point that can write g_cpu behind its back:
+
+* a host call (`emit_call`),
+* the block's own PC write (`emit_guest_pc`),
+* a block boundary,
+* and a **translation rollback** (`g_emit = start` when a block cannot be
+  translated). That last one is the bug that made the first 4-slot attempt loop
+  forever: the rollback discards the emitted code, so the slots described
+  instructions that no longer existed and the fallback read a register that was
+  never written. `AOT_VERIFY` named it ("block at 01000110 diverges") in one run;
+  the bench then looped to its budget (200000003 instructions instead of
+  54,449,405).
+
+Measured: bench **914 MIPS** (from 884), the deterministic `--frames=1200` boot
+1522 ms (from 1537). Gate green: bench count 54,449,405 and the boot's 211
+engine frames / 2,354,080 instructions per frame / final pc all identical.
+
+**The deferred variant is the real prize and is not in.** A stub experiment that
+replaced the store side alone measured **1442 MIPS** (+63% over 884), so the
+store, not the load, is the expensive half. Deferring it needs a publish point at
+every exit, branch, conditional body, host call *and* rollback. Two attempts left
+a path unpublished and the guest looped; the second attempt had the rollback
+fixed and still diverged at the first bench block, so at least one more publish
+point is missing. The diagnosis to start from: with write-through the same
+mapping is correct, so the difference is entirely in `rc_flush`/`rc_sync` call
+sites -- and `AOT_VERIFY` localises it to block 0x01000110 immediately.
+
+Remaining, in the order the measurements argue for:
+
+1. finish the deferred store (+63% measured, not estimated);
+2. block linking across conditionals and dual-path inlining of `cmp; b.cond`,
+   which multiplies the benefit of 15.8's chaining;
+3. `--aot-stats`: misses, fallbacks per block, code size;
+4. the disk cache (M4 in section 12).

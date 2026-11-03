@@ -359,8 +359,80 @@ static inline void disp_set(uint32_t pc, uint32_t *code)
 /* guest registers: kept in g_cpu (x28), one ldr/str per access              */
 /* ------------------------------------------------------------------------- */
 
-#define G_LD(w, g)  emit(enc_ldst_imm(2, 1, (w), 28, (uint32_t)(g)))
-#define G_ST(g, w)  emit(enc_ldst_imm(2, 0, (w), 28, (uint32_t)(g)))
+/* ---- guest register cache ------------------------------------------------
+ *
+ * Most instructions write a guest register and the next one reads it straight
+ * back, and a store followed by a load of the same address is a
+ * store-to-load-forwarding stall. Four host registers mirror guest registers,
+ * so the read becomes a register move.
+ *
+ * Write-through, deliberately: G_ST stores to g_cpu *and* records the value in
+ * a slot, so g_cpu is correct after every instruction and a slot is only ever a
+ * hint. Dropping the mapping can therefore never lose a value -- a wrong guess
+ * costs one reload, never a wrong answer.
+ *
+ * The deferred variant is worth considerably more (a stub experiment measured
+ * +63% for the store side alone) but it needs a publish point at every exit,
+ * branch, conditional body, host call and translation rollback; two attempts
+ * left a path unpublished and the guest looped. A hint cannot have that failure
+ * mode, and the reload it costs is one instruction.
+ *
+ * w5..w8 are the slots: the emitters use w0, w1 and w9..w15 as scratch, w23 for
+ * exit targets, and pin x19..x28. Checked by grepping every encoder call. */
+#define RC_N 4
+static const int rc_host[RC_N] = { 5, 6, 7, 8 };
+static int8_t rc_slot[16];
+static int8_t rc_of[RC_N];
+
+/* Forget the mapping. g_cpu is already correct, so nothing has to be published.
+ * Called before anything that can write g_cpu behind the mapping's back: a host
+ * call, the block's own PC write, a block boundary, and a translation rollback
+ * (which discards the emitted code the slots describe). */
+static void rc_sync(void)
+{
+    for (int i = 0; i < RC_N; i++) rc_of[i] = -1;
+    for (int i = 0; i < 16; i++) rc_slot[i] = -1;
+}
+
+/* Nothing to publish: g_cpu is current after every G_ST. Kept because the
+ * deferred variant needed the same call sites. */
+static void rc_flush(void) { }
+
+static int rc_alloc(int g)
+{
+    for (int i = 0; i < RC_N; i++)
+        if (rc_of[i] == g) return i;
+    int i = -1;
+    for (int k = 0; k < RC_N; k++)
+        if (rc_of[k] < 0) { i = k; break; }
+    if (i < 0) {
+        static int rr;
+        i = rr; rr = (rr + 1) % RC_N;
+        rc_slot[(int)rc_of[i]] = -1;
+    }
+    rc_of[i] = (int8_t)g;
+    rc_slot[g] = (int8_t)i;
+    return i;
+}
+
+#define G_LD(w, g) \
+    do { \
+        int _s = rc_slot[(g)]; \
+        if (_s >= 0) { \
+            if (rc_host[_s] != (w)) \
+                emit(enc_logic_reg(0, 1, 0, (w), R_WZR, rc_host[_s], 0, 0)); \
+        } else \
+            emit(enc_ldst_imm(2, 1, (w), 28, (uint32_t)(g))); \
+    } while (0)
+
+#define G_ST(g, w) \
+    do { \
+        emit(enc_ldst_imm(2, 0, (w), 28, (uint32_t)(g))); \
+        int _s = rc_alloc((g)); \
+        if (rc_host[_s] != (w)) \
+            emit(enc_logic_reg(0, 1, 0, rc_host[_s], R_WZR, (w), 0, 0)); \
+    } while (0)
+
 
 /* guest load/store through the flat address space: [x27, wIdx, uxtw] */
 #define M_LD(size, w, idx)  emit(enc_ldst_reg(size, 1, (w), 27, (idx), 2, 0, 0))
@@ -677,6 +749,7 @@ static void emit_flags_to_cpsr(void)
     emit(enc_logic_reg(0, 1, 0, 12, 12, 13, 0, 28));
     emit(enc_addsub_imm(0, 0, 0, 12, 12, 0x10)); /* user mode bit */
     emit(enc_ldst_imm(2, 0, 12, 28, 16));        /* str w12, [x28,#64] */
+    /* Not a guest register: the slot is untouched. */
 }
 
 
@@ -968,7 +1041,12 @@ static void emit_flags_nz(int reg) { emit_tst(reg); cc_kind = CC_NZ; }
 
 /* Store R[15] first, so a block always names itself in crash reports and in
  * aot_verify(). */
-static void emit_guest_pc(uint32_t pc) { emit_mov_const(9, pc); emit(enc_ldst_imm(2, 0, 9, 28, 15)); }
+static void emit_guest_pc(uint32_t pc)
+{
+    rc_sync();
+    emit_mov_const(9, pc);
+    emit(enc_ldst_imm(2, 0, 9, 28, 15));
+}
 
 static void seq_log(uint32_t pc);
 static uint32_t g_seq_pc;
@@ -1066,6 +1144,7 @@ static void emit_mov_addr64(int rd, uint64_t v)
  * within reach of a 26-bit branch, otherwise movz/movk + blr. */
 static void emit_call(void *fn)
 {
+    rc_sync();              /* the callee sees g_cpu, not the slot */
     intptr_t here = (intptr_t)g_emit;
     intptr_t off = ((intptr_t)fn - here);
     if (off > -(128 * 1024 * 1024) && off < (128 * 1024 * 1024) && (off & 3) == 0) {
@@ -1144,6 +1223,7 @@ static void emit_fail(const air *i, int why)
 static void emit_exit_to_raw(uint32_t target)
 {
     emit_flags_to_cpsr();
+    rc_sync();              /* the target block reads g_cpu */
     emit_budget_check();
     emit_mov_const(0, target);
     emit_call((void *)aot_enter);
@@ -1173,6 +1253,7 @@ static void emit_exit_indirect(int wreg, int force_thumb)
 {
     /* Flags first: the budget check below is a cmp and would destroy PSTATE. */
     emit_flags_to_cpsr();
+    rc_sync();              /* the target block reads g_cpu */
     emit_budget_check();
     emit_mov_reg(0, wreg);
     if (force_thumb)
@@ -1259,6 +1340,7 @@ static void emit_exit_to(uint32_t target)
 {
     int needs_flags = target_reads_flags(target, g_block_thumb);
     if (needs_flags) emit_flags_to_cpsr();
+    rc_sync();              /* the target block reads g_cpu */
     /* The budget is checked on *backward* edges only: an unconditional walk
      * forward cannot be unbounded, and the whole point of the check is to stop
      * a guest loop. Every loop has a backward edge, so the run still stops
@@ -1609,6 +1691,7 @@ static int emit_one(const air *i)
         g_fix[g_nfix].npend = g_npend;
         for (int i = 0; i < g_npend; i++) g_fix[g_nfix].pend[i] = g_pend[i];
         g_nfix++;
+        rc_flush();         /* the stub exits to another block */
         emit(enc_bcond(0, 0));                      /* patched after the body */
         if (g_check) {
             /* Both paths run the checker, and it has to be *after* the branch:
@@ -2073,6 +2156,11 @@ static int emit_arm_insn(const air *i)
     }
 
     if (skip_at) {
+        /* The body above only runs when the condition holds, so on the other
+         * path the slot still holds whatever was there before. `rc_g` is a
+         * translation-time fact about the emitted code, and it would otherwise
+         * claim a value that one of the two paths never wrote. */
+        rc_sync();
         intptr_t off = skip_to - skip_at;           /* words to skip over */
         *skip_at = enc_bcond((int)(cond ^ 1u), (int32_t)off);
     }
@@ -2174,6 +2262,7 @@ static uint32_t *translate(uint32_t pc, int thumb)
 
     g_last_block_pc = pc;
     uint32_t *start = g_emit;
+    rc_sync();              /* a block never inherits a slot */
     emit_guest_pc(pc);
     /* The --stop-at check is a host call per block, so it is emitted only when
      * the run actually asked for one. --stop-at is parsed before any guest code
@@ -2251,6 +2340,11 @@ static uint32_t *translate(uint32_t pc, int thumb)
          * instruction that failed is interpreted, and the counter says how
          * often, so coverage is a number rather than a hope. */
         g_emit = start;
+        /* The rollback discards the emitted code, so the register cache
+         * must forget its mapping too: those slots describe instructions
+         * that no longer exist. Missing this left the fallback reading a
+         * register that was never written. */
+        rc_sync();
         g_aot_fallback_blocks++;
         if (g_aot_why_count[g_fail_why] < 8) {
             host_log("aot: no translation for %08x op=%02x insn=%04x (%s) "
@@ -2268,6 +2362,7 @@ static uint32_t *translate(uint32_t pc, int thumb)
     if (!ended)
         emit_exit_to(p | (uint32_t)thumb);          /* fall off the end */
 
+    rc_sync();              /* nothing may survive the block */
     /* out-of-line branch stubs, then the patch */
     if (getenv("AOT_FIXDBG") && pc == 0x010d1fcc)
         host_log("aot fixdbg: block %08x, %d fixup(s), end at +%ld\n",
