@@ -1594,3 +1594,51 @@ Remaining, in the order the measurements argue for:
    which multiplies the benefit of 15.8's chaining;
 3. `--aot-stats`: misses, fallbacks per block, code size;
 4. the disk cache (M4 in section 12).
+
+### 15.11 Deferred stores: +62% measured, one hole left
+
+The measurement that matters: replacing the guest-register *store* with a register
+move (unsound, for attribution only) takes the bench from 908 to 1636 MIPS, while
+replacing the *load* takes it from 908 to 894 -- i.e. **the store is 44% of the
+run and the load is free**. So deferring the store, not caching the load, is where
+the money is.
+
+A deferred single/multi-slot store reached **1477 MIPS on the bench, with the
+exact instruction count (54,449,405)**. It does not land yet: `__divsi3` breaks.
+Three real bugs were found and fixed on the way, all worth recording:
+
+1. **`AOP_BCOND` captured `g_fix[].at = g_emit` before emitting the branch.** The
+   fixup rewrites the word at that address, so anything emitted in between was
+   overwritten by the patch -- and the branch became `b .` (offset zero). The
+   generated code then had a `b.eq` to itself, which is what the bench's
+   infinite loop looked like. The flush now happens before the capture.
+2. **`emit_budget_check()` can halt the run**, and the halt stub returns to the
+   runner, which reads `g_cpu`. It must publish first.
+3. **A conditionally executed body runs on one path only.** A deferred store
+   inside it describes a value the other path never wrote, and `rc_alloc` may have
+   taken the slot from a *different* guest register, so publishing at the merge
+   writes one register's value into another. Inside such a body the store is now
+   immediate (`g_rc_cond`), which costs nothing measurable because the bench --
+   and most hot code -- is Thumb and has no conditional data processing.
+
+The remaining hole is a stale slot in the ARM-mode path. At this point the
+reproducer is one second:
+
+```
+build/spike-aarch64 game/libgame.so --entry=10d1bf4 --args=a22b9,3,0,0 \
+    --budget=200000 --no-profile --aot=arm64
+```
+
+The interpreter gives `r0=000360e8`; the deferred build gives 0. Sweeping
+`0xd1bf4..0xd1c40` with `--stop-at` + `--dump-guest` localises it exactly: state
+is identical up to `0x10d1c10` and `r3` is 0 instead of `0xa22b9` at `0x10d1c14`.
+`0x10d1c10` is `rsbmi r3, r0, #0`, whose body reads guest r0 through the slot:
+g_cpu holds `0xa22b9` but the slot holds 0, so the slot was left behind by a write
+to g_cpu that the deferred protocol did not account for. `w5..w8` are provably
+unused by the emitter (grepped), so the suspect is one more publish point, and
+the list of "things that write g_cpu" is short enough to enumerate.
+
+Also learned: `AOT_VERIFY` reports three blocks (0x010b6a08, 0x010d9bac,
+0x010db636) as divergent on the *write-through* build too, which is gate-green --
+so those three are an artifact of the verifier, not real. `AOT_CHECK` is the
+trustworthy one here.
