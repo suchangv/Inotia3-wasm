@@ -90,14 +90,23 @@ fi
 
 # Optional per-install overrides, one KEY=VALUE per line: SPIKE_ROTATE=270 to
 # turn the picture the other way, SDL_VIDEODRIVER=wayland to force a backend,
-# SPIKE_LANG=zh-CN, SPIKE_DEBUG=1. Editing a text file beats a new download to
-# try a value.
+# SPIKE_LANG=zh-CN, SPIKE_DEBUG=1, AOT=off. Editing a text file beats a new
+# download to try a value.
 if [ -f env.txt ]; then
     while IFS= read -r line; do
         case "$line" in ''|'#'*) continue ;; esac
         export "$line" 2>/dev/null || say "  env.txt: ignoring '$line'"
     done < env.txt
 fi
+
+# Guest code runs through the AOT translator: it is compiled into this binary
+# (tools/build.sh handheld-aot) and turns each guest instruction into native
+# AArch64 once, on the first arrival, instead of interpreting it every time.
+# Measured at ~16x the interpreter on this class of core. env.txt can still say
+# AOT=off to fall back, which is the first thing to try if a translation bug is
+# suspected -- the interpreter is the reference implementation.
+AOT=${AOT:-arm64}
+export AOT
 
 # PortMaster's preamble, in the order its own ports use.
 controlfolder="/roms/ports/PortMaster"

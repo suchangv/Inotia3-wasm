@@ -1,9 +1,14 @@
 Inotia 3 -- Children of Carnia
 ==============================
 
-A PortMaster port of the Android game, running its original ARM libgame.so
-under the same interpreter the browser and Android builds use. No reimplementation
-of the game: the ELF from your own APK is the game.
+A PortMaster port of the Android game: the original ARM libgame.so from your
+own APK is executed by a translator built into this binary, which turns each
+guest instruction into native AArch64 once, on first arrival, and then runs it
+at full speed. No reimplementation of the game.
+
+If a translation bug is ever suspected, put AOT=off in env.txt and the same
+binary interprets instead -- the interpreter is the reference implementation
+and the two are verified to agree instruction for instruction.
 
 What you have to supply
 -----------------------

@@ -217,7 +217,10 @@ build_sdl() {
     [ -f "$GL4ES/libGL.a" ] || {
         echo "   no gl4es build. Run tools/build_gl4es.sh native"; exit 1; }
     mkdir -p build
-    $CC $CFLAGS -g -O2 -DSPIKE_SDL -Isrc -I"$SDL2/include/SDL2" \
+    # _GNU_SOURCE: -std=c11 defines __STRICT_ANSI__, which hides MAP_ANONYMOUS,
+    # MAP_FIXED_NOREPLACE and setenv behind the feature macros. The AOT needs the
+    # first two and main.c the third.
+    $CC $CFLAGS -g -O2 -DSPIKE_SDL -D_GNU_SOURCE -Isrc -I"$SDL2/include/SDL2" \
         $COMMON src/gl4es_bridge.c src/text_ttf.c src/platform_sdl.c src/main.c \
         "$GL4ES/libGL.a" \
         -L"$SDL2/lib" -lSDL2 -ldl -lm -lpthread ${AARCH64_LINK_LIBS:-} \
@@ -228,6 +231,10 @@ build_sdl() {
 
 # The same for the handheld: aarch64, statically linked against gl4es, SDL2 from
 # libs/ next to the binary (see tools/build-portmaster.sh).
+# AOT=1 (or the handheld-aot target) links the aarch64 translator into the
+# handheld binary. Same source list as the measurement target plus the SDL host
+# layer, which is the difference between "the engine ran fast under qemu" and
+# "the game runs fast on the device".
 build_handheld() {
     # SDL2 carries a NEEDED on libasound.so.2, so the link needs an aarch64
     # libasound to resolve against (tools/fetch-deps.sh provides one).
@@ -248,9 +255,15 @@ build_handheld() {
         echo "   no aarch64 SDL2. Run tools/build_sdl2.sh aarch64"; exit 1; }
     [ -f "$GL4ES/libGL.a" ] || {
         echo "   no aarch64 gl4es. Run tools/build_gl4es.sh aarch64"; exit 1; }
+    SRC=$COMMON
+    [ -n "${HANDHELD_AOT:-}" ] && {
+        SRC="$COMMON_AOT"
+        echo "   with the AOT translator"
+    }
     mkdir -p build
-    $CC $SYSROOT_FLAG $CFLAGS -O2 -DSPIKE_SDL -Isrc -I"$SDL2/include/SDL2" \
-        $COMMON src/gl4es_bridge.c src/text_ttf.c src/platform_sdl.c src/main.c \
+    $CC $SYSROOT_FLAG $CFLAGS -O2 -DSPIKE_SDL -D_GNU_SOURCE -Isrc \
+        -I"$SDL2/include/SDL2" \
+        $SRC src/gl4es_bridge.c src/text_ttf.c src/platform_sdl.c src/main.c \
         "$GL4ES/libGL.a" \
         -L"$SDL2/lib" -lSDL2 -ldl -lm -lpthread ${AARCH64_LINK_LIBS:-} \
         -Wl,-rpath,'$ORIGIN/libs' \
@@ -278,11 +291,12 @@ case "${1:-both}" in
     aot)     build_aot ;;
     sdl)     build_sdl ;;
     handheld) build_handheld ;;
+    handheld-aot) HANDHELD_AOT=1 build_handheld ;;
     check)   build_check ;;
     wasm)    build_wasm ;;
     browser) build_browser ;;
     web)     build_web ;;
     both)    build_native; build_wasm ;;
     all)     build_native; build_wasm; build_browser; build_web ;;
-    *) echo "usage: $0 [native|check|wasm|browser|web|sdl|handheld|both|all]"; exit 2 ;;
+    *) echo "usage: $0 [native|check|wasm|browser|web|sdl|handheld|handheld-aot|both|all]"; exit 2 ;;
 esac

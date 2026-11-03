@@ -1,17 +1,19 @@
 # The PortMaster build (RK3566 handhelds)
 
 An SDL2 application that runs the same engine as every other build: the guest
-`libgame.so` from the player's own APK, executed by the ARM interpreter, with
-gl4es doing GLES1 → GLES2 and SDL2 owning the window, the pad and the clock.
+`libgame.so` from the player's own APK, executed by the aarch64 translator in
+`src/aot_arm64.c`, with gl4es doing GLES1 → GLES2 and SDL2 owning the window,
+the pad and the clock.
 
-**The interpreter stays.** RK3566 (4× Cortex-A55 @ 1.8–2.0 GHz) does not need
-native execution: gameplay frames are 2.1–2.7 M guest instructions and 15 fps is
-66 ms, so ~80 MIPS of interpreter — a third of what this one already achieves on
-a desktop core — leaves the frame with room to spare. Dropping the interpreter
-would mean running an *armeabi* (32-bit) Android `.so` under an armhf userspace
-with a C reimplementation of bionic + JNI + GLES1: the Vita port's glue layer,
-from scratch, for a speed-up the game does not need. See the table in
-`docs/ANDROID.md` for the same engine's instruction counts.
+**Guest code runs translated, not interpreted.** `tools/build.sh handheld-aot`
+links the same translator the measurement target uses into the SDL binary, and
+the launcher exports `AOT=arm64` for it. Each guest instruction is turned into
+native AArch64 the first time it is reached and then runs at full speed; the
+interpreter stays in the binary as the reference implementation, one `AOT=off`
+in `env.txt` away. Measured on a qemu-aarch64 host at ~16x the interpreter on
+the real game (cold start 1.30 s vs 16.5 s for `--frames=1200` plus a tap) and
+~40x on pure guest compute; see `docs/aot-plan.md` for the numbers and §15 for
+the bugs that were found.
 
 ## Layout
 
@@ -51,9 +53,13 @@ tools/build_sdl2.sh aarch64           # the handheld (KMSDRM + offscreen)
 tools/build_gl4es.sh native           # desktop window / measurement
 tools/build_gl4es.sh aarch64
 tools/build.sh sdl                    # -> build/inotia3        (x86_64)
-tools/build.sh handheld               # -> build/inotia3-aarch64
+tools/build.sh handheld-aot           # -> build/inotia3-aarch64 (with the AOT)
 tools/build-portmaster.sh --zip       # -> dist/…
 ```
+
+`handheld-aot` is `handheld` with `src/aot_arm64.c` linked in; the plain
+`handheld` target still builds the interpreter-only binary, which is what to
+compare against when a translation bug is suspected.
 
 The aarch64 builds need `aarch64-linux-gnu-gcc`. Two things about SDL2's
 KMSDRM backend, both easy to get wrong:
@@ -157,3 +163,39 @@ Android build.
 
 Not verified yet: the handheld itself (KMSDRM, Mali-G52, the real pad), sound
 (the audio backend is the next step), and everything below "Next" above.
+
+## The AOT in this package
+
+`src/aot_arm64.c` translates guest code to AArch64 and installs a dispatch table
+over the guest image; the first arrival at a guest address emits a block, and
+every later arrival jumps straight into it. Nothing of the game ships with the
+port: the translator works on the player's own `libgame.so`, and the translations
+it produces are cached in `data/aot-code.cache`, keyed on a checksum of that
+image (delete the file to force a retranslation).
+
+Which mode is in use is in `inotia3.log`:
+
+```
+aot: 2904 block(s), 23363 guest insn(s) translated, 71 fallback block(s),
+     175153 word(s) of code (1.2% of the 14680064-word arena)
+aot: register cache: 4918 read(s), 2489 from a slot (51%), 5555 write(s)
+```
+
+A `fallback block` is a guest instruction the translator declined to handle; it
+is counted and interpreted, never guessed, so a high number costs speed and
+nothing else. `AOT=predec` runs the pre-decode prototype, `AOT=off` the
+interpreter. All three are verified to agree instruction for instruction
+(`tools/aotdiff.sh`, `AOT_CHECK=1`).
+
+The binary is built against a Debian bullseye arm64 sysroot (glibc 2.31), so its
+floor is `GLIBC_2.29` -- checked with
+
+```sh
+aarch64-linux-gnu-objdump -T build/inotia3-aarch64 | grep -oE 'GLIBC_2\.[0-9]+' | sort -uV | tail -1
+```
+
+which matters because the firmware is frozen and a build machine's newer glibc
+shows up on the device as `GLIBC_2.34 not found` in `inotia3.log`. Note that a
+buildroot cross toolchain has no `limits.h` in its GCC include directory, which
+glibc's `<limits.h>` expects to `#include_next`; that file has to be supplied
+(one screen of `#define INT_MAX __INT_MAX__` and friends) before SDL2 compiles.
