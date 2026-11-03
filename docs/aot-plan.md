@@ -1736,3 +1736,33 @@ and the fallback block's `str x25, [x26]`). Reverted rather than left in; the
 flush points are `emit_budget_check()`, `emit_call()`, the block start and the
 block epilogue, which is a short enough list to finish, but it is not worth the
 risk for one instruction in nine.
+
+### 15.14 Batching the instruction counter: +7%, not exact, backed out
+
+`add x25, x25, #n` is emitted once per guest instruction, so accumulating per
+block and adding once is a tenth of the generated code and measured **+7%**
+(bench 1475 vs 1377, interleaved A/B over three rounds).
+
+It does not land: over the 211 engine frames of the gate the AOT counts 2353975
+instructions where the interpreter counts 2354080 -- 105 too few, 0.004%. It is
+not a matter of a missing flush at a block boundary (those are all covered): the
+first 41 engine frames agree exactly, so it is a rarely taken path.
+
+The places x25 is *read* are only four (grepped): the budget check's `cmp`, the
+two `str x25, [x26]` in the import and fallback stubs, and `.Laot_exit`, which
+every abort and halt stub branches to. The flush points that make the bench exact
+are:
+
+* the top of `emit_budget_check()`,
+* the top of `emit_call()` (the import and fallback stubs go through it),
+* the top of every exit -- a forward edge chains straight into the next block
+  without either of the above, so the epilogue's flush is unreachable,
+* immediately before a conditional branch, because the taken path leaves there
+  and the epilogue flush is on the fall-through side,
+* the translation rollback, which must *zero* it (the discarded instructions
+  never run) -- that one alone accounts for 49 phantom instructions on the gate.
+
+So the accounting is exact on the bench (54,449,405) and on the first 41 engine
+frames, and wrong by 105 over 211. Worth another look: the answer is in a path
+the bench does not reach, and running the gate with `SPIKE_TRACE_LIMIT` on the
+frame *where it first differs* would name it in one run.
