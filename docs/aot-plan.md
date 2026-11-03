@@ -1803,3 +1803,41 @@ Cumulative, bench median under qemu: interpreter 42, then 566 (first working
 translator), 884 (exit chaining), 914 (write-through cache), 1447 (deferred
 stores), **1478** (batched counting) -- 35x as qemu measures it. The planning
 number stays 3x until the RK3566 has been measured.
+
+### 15.16 Block linking across conditionals: the constraint and the trap
+
+Two things were established, one of them a real bug in the current code.
+
+**A latent +/-1 MB bug in the budget check.** `emit_budget_check` emitted
+`b.hs <halt stub>` with `enc_bcond`, whose range is +/-1 MB, while the halt stub
+sits at the start of a 56 MB arena. A block far enough from it encoded a wrapped
+offset -- the same class of bug that was fixed for the abort stub by using an
+inverted branch over a `b`. It never fired because the budget check was emitted
+only on *backward* edges, which are all near the beginning of the arena in
+practice. The fix is `b.cc +2; b halt`, and it is correct standalone (gate green)
+but on its own it is ~2% *slower*, because moving the check to every block entry
+costs more than the backward-edge checks it replaces. It is not in the tree.
+
+**A conditional branch cannot check the budget and test a condition.** The check
+is a `cmp`, so it destroys the flags the branch is about to read. That is why a
+backward conditional branch has to keep its stub: the stub runs the check *after*
+the branch. Making backward edges linkable therefore requires moving the budget
+check to the block entry -- where the flags are dead, and where a loop is entered
+exactly once per iteration. That combination is gate-green and is the shape the
+next attempt should start from.
+
+**The trap: backpatching a b.cond breaks the boot.** Re-aiming a conditional
+branch from its stub to the target block through the same `disp_set()` link table
+that static exits use -- forward edges only, only when the target does not read
+flags, with the +/-1 MB range checked at patch time -- still corrupts the boot: a
+guest pointer of `0x100000b` reaches an import and the host faults. Emitting the
+identical `b.cond` at *emit* time works, so the instruction is not the problem;
+something about the branch site is different once it is patched later. The
+candidates are the fixup loop, which rewrites the same word from `g_fix[]` at the
+end of the block (the link patch happens later, so it should win, but the
+interaction has not been proven), or the flags/count publishes that the stub
+performs on the taken path and that a bare `b.cond` skips when the target is a
+block the emit-time path would have refused.
+
+Not in the tree. Cost so far: three build-and-gate cycles, and the gate names the
+failure in one run each time (`--frames=1200`, 19 s).
