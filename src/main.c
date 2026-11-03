@@ -32,6 +32,7 @@
 #include "timers.h"
 #include "input.h"
 #include "text.h"
+#include "aot.h"
 
 #ifndef WASM_FREESTANDING
 #include <stdio.h>
@@ -294,6 +295,10 @@ static int spike_resume_if_stopped(int reason, uint64_t budget);
 
 /* `arg0` is placed in r0 before the entry runs -- JNI_OnLoad expects the
  * JavaVM* there, and the native* entry points expect a JNIEnv*. */
+/* Guest arguments for --args=, in hex. Set before the entry runs. */
+static uint32_t g_entry_args[4];
+static int      g_args_given;   /* --args= was used, zeros included */
+
 static run_result run_entry_arg(const char *what, uint32_t entry, uint32_t arg0,
                                 uint64_t budget)
 {
@@ -316,6 +321,9 @@ static run_result run_entry_arg(const char *what, uint32_t entry, uint32_t arg0,
     for (int i = 0; i < 13; i++)
         g_cpu.r[i] = 0;
     g_cpu.r[0] = arg0;
+    if (g_args_given)
+        for (int i = 0; i < 4; i++)
+            g_cpu.r[i] = g_entry_args[i];
     g_cpu.cpsr = 0x10;   /* user mode, Thumb via the entry's bit0 */
 
     uint64_t before = g_insn_count;
@@ -1759,6 +1767,23 @@ int main(int argc, char **argv)
     int do_init_array = 0, do_jni = 0, do_profile = 1, trace = 0, do_boot = 0;
     (void)timer_id;   /* parsed but never used: the ids come from timers_due() */
 
+    /* Which runner executes guest code. Set here, before any option, so that
+     * --aot= on the command line wins over the environment; on a device the
+     * environment is the only lever (env.txt), which is what --aot=off is for
+     * as an escape hatch. See docs/aot-plan.md.
+     *
+     * Hosted builds only: getenv in the freestanding wasm32 target would leave an
+     * `env.getenv` import behind and the module would fail to instantiate -- the
+     * same failure mode that took an afternoon to find for
+     * host_file_get_full_path_name (docs/HANDOFF.md). */
+#ifndef WASM_FREESTANDING
+    {
+        const char *env = getenv("AOT");
+        if (env && *env && aot_set_mode(env) != 0)
+            host_log("aot: unknown AOT=%s (off|predec), staying off\n", env);
+    }
+#endif
+
 #ifdef __EMSCRIPTEN__
     /* First thing: these are the page's options and the block below consumes
      * them. Reading them further down (where the GL setup lives) left
@@ -1784,7 +1809,13 @@ int main(int argc, char **argv)
      * preloaded into it -- so only the option parsing is skipped. */
 #else
     for (int i = 1; i < argc; i++) {
-        if (strncmp(argv[i], "--g_budget=", 11) == 0 ||
+        if (strncmp(argv[i], "--aot=", 6) == 0) {
+            if (aot_set_mode(argv[i] + 6) != 0) {
+                host_log("aot: unknown --aot=%s (off|predec)\n", argv[i] + 6);
+                return 2;
+            }
+        }
+        else if (strncmp(argv[i], "--g_budget=", 11) == 0 ||
             strncmp(argv[i], "--budget=", 9) == 0) {
             /* Into the local, not the global: `g_budget = budget` below
              * overwrites the global with the default, so writing it here made
@@ -1845,6 +1876,15 @@ int main(int argc, char **argv)
             trace_path = argv[i] + 14;
         else if (strncmp(argv[i], "--entry=", 8) == 0)
             only_entry = (uint32_t)strtoul(argv[i] + 8, NULL, 16);
+        else if (strncmp(argv[i], "--args=", 7) == 0) {
+            /* up to four hex arguments, comma separated: r0..r3 */
+            char *q = (char *)argv[i] + 7;
+            g_args_given = 1;
+            for (int k = 0; k < 4 && *q; k++) {
+                g_entry_args[k] = (uint32_t)strtoul(q, &q, 16);
+                if (*q == ',') q++;
+            }
+        }
         else if (argv[i][0] != '-')
             path = argv[i];
         else {
@@ -1978,6 +2018,11 @@ int main(int argc, char **argv)
          * into one trace file. */
         run_result rr = run_entry_arg("entry", only_entry, 0, g_budget);
         report_run(&rr);
+        /* With --args= the point of the run is the result, so print it: a
+         * single ARM helper can then be A/B'd against the interpreter. */
+        if (g_args_given)
+            host_log("  result: r0=%08x r1=%08x r2=%08x r3=%08x cpsr=%08x\n",
+                     g_cpu.r[0], g_cpu.r[1], g_cpu.r[2], g_cpu.r[3], g_cpu.cpsr);
     } else if (do_init_array) {
         if (!g_img.init_array) {
             host_log("no DT_INIT_ARRAY in the image\n");
@@ -2025,6 +2070,7 @@ int main(int argc, char **argv)
     if (dump_path)
         dump_guest(dump_path);   /* after the run, so it shows the end state */
 
+    aot_stats_report();
     spike_finish();
     return 0;
 }

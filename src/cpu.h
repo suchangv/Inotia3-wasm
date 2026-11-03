@@ -101,4 +101,12 @@ void cpu_trace_final(void);
 
 void guest_text_bounds(uint32_t *lo, uint32_t *hi);
 
+/* The instruction set the interpreter is currently in, for the AOT verifier:
+ * bx/pop-to-pc may have switched it under the caller. */
+int cpu_thumb_state(void);
+
+/* Where the last cpu_run() stopped. R[15] is not it: for ARM instructions it
+ * holds instruction+8. */
+uint32_t cpu_last_pc(void);
+
 #endif /* CPU_H */

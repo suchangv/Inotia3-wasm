@@ -989,7 +989,13 @@ void host_import_call(guest_import *im)
     switch (im->impl) {
 
     /* ---- memory ---- */
-    case IMPL_malloc:  R[0] = heap_alloc(a0); break;
+    case IMPL_malloc: {
+        uint32_t p = heap_alloc(a0);
+        if (getenv("SPIKE_TRACE_MALLOC"))
+            host_log("  [malloc] %u -> %08x\n", a0, p);
+        R[0] = p;
+        break;
+    }
     case IMPL_free:    heap_free(a0); break;
     case IMPL_calloc: {
         uint32_t n = a0 * a1;

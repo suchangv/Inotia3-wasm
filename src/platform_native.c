@@ -48,6 +48,7 @@ static void segv_handler(int sig, siginfo_t *info, void *uctx)
     (void)sig;
     uintptr_t bad = (uintptr_t)info->si_addr;
     intptr_t off = (intptr_t)(bad - (uintptr_t)g_mem);
+
     (void)uctx;
 
     fprintf(stderr,
@@ -193,6 +194,18 @@ void host_trace_insn(uint32_t pc, const uint32_t *r, uint32_t cpsr)
 {
     if (!g_trace_out)
         return;
+    /* SPIKE_TRACE_LIMIT=n: stop after n lines. A whole boot is tens of millions
+     * of instructions and ~150 bytes each, which fills the disk; a bounded
+     * prefix is what a sequence comparison against the AOT's log needs. */
+    {
+        static long limit = -1, written;
+        if (limit < 0) {
+            const char *e = getenv("SPIKE_TRACE_LIMIT");
+            limit = e ? atol(e) : 0;
+        }
+        if (limit && written >= limit) { fclose(g_trace_out); g_trace_out = NULL; return; }
+        written++;
+    }
     fprintf(g_trace_out,
             "%08x %08x %08x %08x %08x %08x %08x %08x %08x %08x %08x %08x "
             "%08x %08x %08x %08x %08x\n",

@@ -24,6 +24,7 @@
 #include "guest.h"
 #include "imports.h"
 #include "compat.h"
+#include "aot.h"
 
 cpu_state g_cpu;
 uint64_t  g_insn_count;
@@ -53,6 +54,15 @@ void guest_text_bounds(uint32_t *lo, uint32_t *hi)
 }
 static int      g_thumb = 1;          /* the guest starts in Thumb state */
 static uint64_t g_budget;
+
+int cpu_thumb_state(void) { return g_thumb; }
+
+/* The interpreter keeps the next PC in a local, not in R[15]: for ARM, R[15]
+ * holds instruction+8 because that is what a PC-relative operand must read.
+ * Anything outside cpu_run() that needs to know where the run stopped -- the
+ * AOT's fallback and its verifier -- has to ask. */
+uint32_t g_last_pc;
+uint32_t cpu_last_pc(void) { return g_last_pc; }
 
 /* ---- instruction trace ---------------------------------------------------
  * A ring buffer of the last N (pc, instruction) pairs. Off by default; enabled
@@ -486,9 +496,34 @@ int cpu_run(uint32_t entry, uint32_t sp, uint64_t budget)
     g_tr_i = 0;
     prof_transfer(pc);
 
+    /* The same run, executed from pre-decoded instructions instead of from the
+     * halfword stream. Entered here, after the state above is set up, so there
+     * is exactly one place that decides what a run looks like and the two
+     * runners cannot drift apart in their setup. aot_predec_run() honours the
+     * same g_budget / g_insn_count / HALT_* contract; see src/aot.h.
+     *
+     * Only Thumb: the pre-decoder does not implement ARM mode or Thumb-2 yet,
+     * and an ARM entry (bit 0 clear) must keep working, so it falls through to
+     * the interpreter below. */
+    if (g_aot_mode == AOT_PREDEC && g_thumb)
+        return aot_predec_run(g_budget);
+#if defined(__aarch64__) && !defined(WASM_FREESTANDING)
+    if (g_aot_mode == AOT_ARM64) {
+        /* `entry`, not g_cpu.r[15]: the interpreter stores the PC with the
+         * Thumb bit masked off (R[15] = pc), and the mode bit is what tells the
+         * translator which instruction set to decode. */
+        int r = aot_arm64_run(entry, g_cpu.r[13], g_budget);
+        if (r != AOT_NOT_AVAILABLE)
+            return r;               /* on NOT_AVAILABLE, fall through and
+                                     * interpret: no exec memory, no problem  */
+    }
+#endif
+
     for (;;) {
-        if (g_insn_count >= g_budget)
+        if (g_insn_count >= g_budget) {
+            g_last_pc = pc;
             return HALT_BUDGET;
+        }
 #ifdef GUEST_CHECK
         if (g_guest_check_fault)
             return HALT_BAD_MEM;
@@ -508,6 +543,7 @@ int cpu_run(uint32_t entry, uint32_t sp, uint64_t budget)
          * the engine's real state at a chosen address instead of at a function
          * entry with no arguments. */
         if (g_stop_at && pc == g_stop_at) {
+            g_last_pc = pc;
             /* Return rather than call out: a dump taken from inside the
              * interpreter loop reads the register file at a moment the caller
              * cannot see, and this port has already spent time on one

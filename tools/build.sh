@@ -35,8 +35,13 @@ find_wasm_ld() {
     return 1
 }
 
-COMMON="src/util.c src/elf_loader.c src/cpu.c src/host_hooks.c src/imports.c src/host_libc.c src/jni.c src/gl.c src/patches.c src/timers.c src/asset_zip.c src/input.c src/text.c src/sound.c"
+COMMON="src/util.c src/elf_loader.c src/cpu.c src/aot_predec.c src/host_hooks.c src/imports.c src/host_libc.c src/jni.c src/gl.c src/patches.c src/timers.c src/asset_zip.c src/input.c src/text.c src/sound.c"
 COMMON_BROWSER="$COMMON"
+
+# The aarch64 translator (src/aot_arm64.c) contains aarch64 assembly, so it is
+# compiled only into the hosts that can execute what it emits: the handheld and
+# the measurement target below. Everything else keeps the interpreter.
+COMMON_AOT="$COMMON src/aot_arm64.c"
 
 build_native() {
     echo "== native =="
@@ -253,8 +258,24 @@ build_handheld() {
     echo "   -> build/inotia3-aarch64"
 }
 
+# The AOT measurement target: the same windowless CLI as `native`, cross-built
+# for aarch64 with the translator linked in, to be run under qemu-aarch64 on a
+# development machine (or natively on an aarch64 box). Timing under qemu is
+# meaningless in absolute terms; the tool is for correctness (tools/aotdiff.sh)
+# and for relative A/B on the same emulator.
+build_aot() {
+    CC=${CROSS_CC:-aarch64-linux-gnu-gcc}
+    echo "== aot (aarch64 CLI) =="
+    mkdir -p build
+    $CC ${CROSS_CFLAGS:-} $CFLAGS -I src \
+        $COMMON_AOT src/platform_native.c src/main.c \
+        -lm -o build/spike-aarch64
+    echo "   -> build/spike-aarch64"
+}
+
 case "${1:-both}" in
     native)  build_native ;;
+    aot)     build_aot ;;
     sdl)     build_sdl ;;
     handheld) build_handheld ;;
     check)   build_check ;;
