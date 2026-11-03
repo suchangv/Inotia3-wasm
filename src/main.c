@@ -1705,8 +1705,11 @@ static int spike_sdl_run(int argc, char **argv)
     g_do_profile = getenv("SPIKE_DEBUG") || getenv("SPIKE_PROFILE") ? 1 : 0;
     cpu_set_profile(g_do_profile);
     /* Real elapsed time: the engine's own 66 ms frame period is the game's
-     * speed, and a fixed step would fight it. */
-    g_use_fixed_step = 0;
+     * speed, and a fixed step would fight it. A differential run needs the
+     * opposite -- two processes must take the same path -- so SPIKE_FIXED_STEP=1
+     * pins the clock. Without it the interpreter does not even agree with
+     * itself run to run, and a trace comparison reports noise as a bug. */
+    g_use_fixed_step = getenv("SPIKE_FIXED_STEP") && *getenv("SPIKE_FIXED_STEP") != '0';
 
     host_log("\n=== booting ===\n");
     if (spike_boot() != 0) {
@@ -1845,6 +1848,8 @@ int main(int argc, char **argv)
             timer_id = (int)strtol(argv[i] + 8, NULL, 10);
         else if (strncmp(argv[i], "--stop-at=", 10) == 0)
             g_stop_at = (uint32_t)strtoul(argv[i] + 10, NULL, 16);
+        else if (strncmp(argv[i], "--stop-nth=", 11) == 0)
+            g_stop_nth = (uint32_t)strtoul(argv[i] + 11, NULL, 10);
         else if (strncmp(argv[i], "--watch=", 8) == 0)
             g_watch_addr = (uint32_t)strtoul(argv[i] + 8, NULL, 16);
         else if (strncmp(argv[i], "--probe=", 8) == 0) {

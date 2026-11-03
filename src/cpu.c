@@ -29,6 +29,21 @@
 cpu_state g_cpu;
 uint64_t  g_insn_count;
 uint32_t  g_stop_at;
+uint32_t  g_stop_nth = 1;
+
+/* Shared by the interpreter and the translator so both arms of a comparison
+ * stop on the same arrival. Clears g_stop_at when it fires, as before. */
+int cpu_stop_hit(uint32_t pc)
+{
+    if (!g_stop_at || pc != (g_stop_at & ~1u))
+        return 0;
+    if (g_stop_nth > 1) {
+        g_stop_nth--;
+        return 0;
+    }
+    g_stop_at = 0;
+    return 1;
+}
 uint32_t  g_fault_pc;
 uint32_t  g_fault_insn;
 int       g_fault_width;
@@ -542,7 +557,7 @@ int cpu_run(uint32_t entry, uint32_t sp, uint64_t budget)
          * and opens the instruction trace, so the differential can start with
          * the engine's real state at a chosen address instead of at a function
          * entry with no arguments. */
-        if (g_stop_at && pc == g_stop_at) {
+        if (cpu_stop_hit(pc)) {
             g_last_pc = pc;
             /* Return rather than call out: a dump taken from inside the
              * interpreter loop reads the register file at a moment the caller
@@ -550,7 +565,6 @@ int cpu_run(uint32_t entry, uint32_t sp, uint64_t budget)
              * diagnostic that reported a state it was not actually in. The
              * runner dumps and resumes from here, where the state is
              * unambiguous. */
-            g_stop_at = 0;      /* one shot, or the resume stops here again */
             g_cpu.r[15] = pc;
             /* The instruction before the stop must not be the first line of a
              * trace that resumes here: it belongs to the segment the caller

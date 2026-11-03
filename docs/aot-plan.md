@@ -1436,3 +1436,58 @@ arrived where a pointer belongs). The state at the call site `0x010dc73e`
 produced on a *later* visit to that call site; the first-arrival dump cannot see
 it. Next: add a small ring buffer of recently entered block addresses, printed
 by the SIGSEGV handler, so the faulting arrival can be backtracked.
+
+### 15.7 The real game now boots and plays under the AOT
+
+`--boot --frames=6500` with the six scripted taps reports, in both modes:
+
+```
+average over 1271 frame(s): 1614257 instructions
+final pc=0badf00c (_end+0x9d82f12)
+```
+
+and the 54,449,405-instruction bench returns the same instruction count and the
+same result. Seven more bugs, all found by the gates above:
+
+1. **`bx`/`blx` to a Thumb-2 target lost the low bits.** A 32-bit `bl`/`blx`
+   offset is relative to `PC+4` for BL and to `Align(PC+4, 4)` for BLX, and the
+   two differ by 2 for an instruction at a 2-mod-4 address. `blx __aeabi_i2d`
+   landed two bytes into the function.
+2. **A Thumb `mov pc, rX` is not an interworking branch.** The target stays in
+   Thumb whatever bit 0 holds, which is exactly what a jump table produces;
+   entering libpng's switch tables as ARM halted on a valid Thumb instruction.
+3. **`emit_flags_to_cpsr` recomputed from the operands.** Correct only for an
+   unconditional setter -- `cmnmi r0, #0` leaves the *previous* flags when MI is
+   false, and the recomputation published the ones it would have set. Four
+   `cset`s now copy PSTATE out and assume nothing.
+4. **A conditional branch's stub published the flags as of the end of the block.**
+   The fixup stub is emitted after the whole block, by which time the remembered
+   setter had moved on. (Obsolete now that 3 reads PSTATE instead.)
+5. **`cbz`/`cbnz` to the shared abort stub had a ±1 MB range,** and the arena is
+   56 MB: a block near the end encoded a wrapped offset and jumped into arena
+   memory that was never written. Each site is now an inverted branch over a `b`
+   (±128 MB).
+6. **The dispatch table covered only the first megabyte of `.text`.** libgame's
+   text is 1.3 MB, so every block above 0x01100000 was re-translated on each
+   arrival: 131,499 blocks and an exhausted arena. 2^21 entries covers it.
+7. **`--boot` used the wall clock, so it was not even reproducible against
+   itself.** Two interpreter runs diverged at instruction 655 and every
+   cross-run comparison was measuring scheduling noise. `SPIKE_FIXED_STEP=1`
+   pins `host_now()` as well as the frame step, and now two interpreter runs are
+   byte-identical for hundreds of thousands of instructions.
+
+Also added while looking: `--stop-nth=N` (stop at the Nth arrival at
+`--stop-at`, because a call site is reached many times with different state),
+`SIGILL` handling with the host PC mapped back to the guest block, and the
+`SPIKE_FIXED_STEP` virtual clock.
+
+Measured under `qemu-aarch64` on the same host, bench workload (54,449,405
+instructions, identical count both sides):
+
+| runner | MIPS |
+|---|---|
+| interpreter | 43.7 |
+| AOT | 566.8 |
+
+12.98× on qemu. The planning number stays 3×: qemu inflates the ratio, and only
+the RK3566 numbers can settle it.

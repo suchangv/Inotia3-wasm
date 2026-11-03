@@ -59,8 +59,12 @@
 #include <unistd.h>
 #endif
 
-#define AOT_TABLE_ENTRIES (1u << 19)        /* one entry per 2 bytes, 2 MB    */
-#define AOT_CODE_WORDS    (6u << 20)        /* 24 MB of code                  */
+/* One entry per 2 bytes of .text, covering the whole image. libgame.so text
+ * is 1.3 MB (0x01000000..0x0113dac4), so 2^19 entries covered only the first
+ * megabyte and every block above it was re-translated on each arrival --
+ * 131k blocks and an exhausted arena. */
+#define AOT_TABLE_ENTRIES (1u << 21)        /* one entry per 2 bytes, 8 MB    */
+#define AOT_CODE_WORDS    (14u << 20)       /* 56 MB of code                  */
 #define AOT_MAX_BLOCK     96                /* instructions per block         */
 
 /* AOT_CHECK=1 compares every translated instruction against the interpreter,
@@ -72,7 +76,18 @@ static uint64_t  g_shadow_n;
 static uint64_t  g_checks;
 static int       g_seq;            /* AOT_SEQ=1: log the executed stream  */
 static int       g_blkchk;         /* AOT_BLKCHECK=1: validate every branch */
-static void seq_log(uint32_t pc) { if (g_seq) host_log("aotseq %08x\n", pc & ~1u); }
+/* AOT_SEQ=1 logs the executed stream so it can be diffed against the
+ * interpreter's --trace-insns output; SPIKE_TRACE_LIMIT bounds it the same way
+ * (an unbounded boot log is hundreds of megabytes and fills the disk). */
+static void seq_log(uint32_t pc)
+{
+    if (!g_seq) return;
+    static long limit = -1, written;
+    if (limit < 0) { const char *e = getenv("SPIKE_TRACE_LIMIT"); limit = e ? atol(e) : 0; }
+    if (limit && written >= limit) return;
+    written++;
+    host_log("aotseq %08x\n", pc & ~1u);
+}
 
 /* coverage counters, reported by aot_arm64_stats() */
 uint64_t g_aot_blocks, g_aot_insns, g_aot_fallback_blocks;
@@ -157,6 +172,12 @@ static uint32_t enc_ldst_imm(int size, int opc, int rt, int rn, uint32_t imm12)
 
 /* ldr/str (register offset): size 111 0 00 opc 1 Rm option(3) S 10 Rn Rt
  * option 0b010 = UXTW (zero-extend the 32-bit guest address). */
+/* MRS Xt, NZCV / MSR NZCV, Xt. Reading NZCV from EL0 is UNDEFINED without
+ * FEAT_FlagM, which Cortex-A55 does not have, so these are used only by the
+ * AOT_SEQ trace, which runs under qemu on the host. */
+static uint32_t enc_mrs_nzcv(int rt) { return 0xd53b4200u | (uint32_t)rt; }
+static uint32_t enc_msr_nzcv(int rt) { return 0xd51b4200u | (uint32_t)rt; }
+
 static uint32_t enc_ldst_reg(int size, int opc, int rt, int rn, int rm,
                              int option, int S, int amount)
 {
@@ -368,9 +389,6 @@ enum { CC_NONE = 0, CC_EXACT, CC_NZ };
 
 static int cc_kind;
 
-static air g_last_cc;               /* last exact flag setter */
-static int g_last_cc_valid;
-
 /* The last flag-setting instruction, if it was one the flags can be recomputed
  * from exactly (add/sub/cmp/cmn). Used when a block exit lands on a block that
  * reads flags but cannot be translated. */
@@ -557,7 +575,13 @@ static void dec_thumb(uint32_t pc, air *o)
                                 (imm10 << 12) | (imm11 << 1));
         off = (off << 7) >> 7;
         o->op = H ? AOP_BL : AOP_BLX;
-        o->imm = (uint32_t)((int32_t)(pc + 4) + off);
+        /* Base address: BL is relative to PC, i.e. the instruction address + 4,
+         * while BLX (immediate) is relative to Align(PC, 4) -- its targets have
+         * to be word aligned. The two differ by 2 for a 32-bit instruction at a
+         * 2-mod-4 address, which is every other one. Using PC+4 for both made
+         * `blx __aeabi_i2d` land 2 bytes into the function. */
+        uint32_t base = H ? (pc + 4) : ((pc + 4) & ~3u);
+        o->imm = (uint32_t)((int32_t)base + off);
         o->len = 4;
         o->cnt = 2;
         break;
@@ -606,67 +630,29 @@ enum {
 static air g_last_cc;
 static int g_last_cc_valid;
 
-/* Materialise the flags of the last exact setter into g_cpu.cpsr.
+/* Publish PSTATE into g_cpu.cpsr, exactly.
  *
- * AOT code keeps the flags in PSTATE and never touches g_cpu.cpsr, but the
- * *interpreter* -- which is what runs a block the translator could not handle --
- * reads g_cpu.cpsr. A fallback that starts with a conditional instruction would
- * therefore branch on a stale value, so any exit into such a block has to write
- * the flags out first. Recomputed from the operands (the setter is remembered in
- * g_last_cc), which is exact for add/sub/rsb/cmp/cmn; a partial setter makes
- * g_last_cc_valid false and nothing is written, as before. */
+ * AOT code keeps the flags in PSTATE while the interpreter reads g_cpu.cpsr, so
+ * an exit into a block that starts with a conditional instruction has to write
+ * them out. This used to recompute them from the remembered setter's operands,
+ * which is wrong as soon as the setter is itself conditional: a `cmnmi` leaves
+ * the previous flags in place when MI is false, and the recomputation published
+ * the ones it would have set.
+ *
+ * cset reads PSTATE without writing it, so four of them copy the nibble out
+ * with no assumption about how it got there. */
 static void emit_flags_to_cpsr(void)
 {
-    if (!g_last_cc_valid) return;
-    const air *i = &g_last_cc;
-    int is_sub = 1, use_imm = 0;
-    uint32_t imm = 0;
-    int ra = -1, rb = -1;
-
-    if (i->op == AOP_ARM_DP) {
-        if (i->b & 1) {                       /* S: an arithmetic setter */
-            if (i->a == DP_RSB) { is_sub = 1; ra = -1; rb = (int)i->rn; }
-            else if (i->a == DP_CMN) { is_sub = 0; ra = (int)i->rn; rb = (int)i->rm; }
-            else { is_sub = 1; ra = (int)i->rn; rb = (int)i->rm; }
-            if (i->b & 2) { use_imm = 1; imm = i->imm; }
-        } else return;
-    } else if (i->op == AOP_ADDSUB) {
-        is_sub = i->b; ra = (int)i->rn;
-        if (i->a) { use_imm = 1; imm = i->imm; } else rb = (int)i->rm;
-    } else if (i->op == AOP_IMM8) {
-        is_sub = (i->a == 3 || i->a == 1);
-        ra = (int)i->rd; use_imm = 1; imm = i->imm;
-    } else if (i->op == AOP_ALU) {
-        if (i->a == 0x9) { is_sub = 1; ra = -1; rb = (int)i->rm; }
-        else if (i->a == 0xb) { is_sub = 0; ra = (int)i->rd; rb = (int)i->rm; }
-        else { is_sub = 1; ra = (int)i->rd; rb = (int)i->rm; }
-    } else return;
-
-    if (ra < 0) emit_mov_const(9, 0); else G_LD(9, ra);
-    if (use_imm) emit_mov_const(10, imm); else G_LD(10, rb);
-    emit(enc_addsub_reg(0, is_sub, 0, 11, 9, 10, 0, 0));   /* res, no flags */
-
-    /* N into bit 31 of w12 */
-    emit_mov_const(15, 0x80000000u);
-    emit(enc_logic_reg(0, 0, 0, 12, 11, 15, 0, 0));
-    /* Z into bit 30 */
-    emit(enc_addsub_imm(0, 1, 1, R_WZR, 11, 0));
-    emit(enc_cset(13, 0));
+    emit(enc_cset(12, 4));                       /* N: cset w12, mi */
+    emit(enc_logic_reg(0, 1, 0, 12, 12, 12, 0, 31));
+    emit(enc_cset(13, 0));                       /* Z: cset w13, eq */
     emit(enc_logic_reg(0, 1, 0, 12, 12, 13, 0, 30));
-    /* C into bit 29: add wraps when res < a, sub does not borrow when a >= b */
-    if (is_sub) emit(enc_addsub_reg(0, 1, 1, R_WZR, 9, 10, 0, 0));
-    else        emit(enc_addsub_reg(0, 1, 1, R_WZR, 11, 9, 0, 0));
-    emit(enc_cset(13, is_sub ? 2 : 3));
+    emit(enc_cset(13, 2));                       /* C: cset w13, cs */
     emit(enc_logic_reg(0, 1, 0, 12, 12, 13, 0, 29));
-    /* V into bit 28: (a ^ res) & (b ^ res), sign bit */
-    emit(enc_logic_reg(0, 2, 0, 13, 9, 11, 0, 0));
-    emit(enc_logic_reg(0, 2, 0, 14, 10, 11, 0, 0));
-    emit(enc_logic_reg(0, 0, 0, 13, 13, 14, 0, 0));
-    emit(enc_logic_reg(0, 0, 0, 13, 13, 15, 0, 0));
-    emit(enc_logic_reg(0, 1, 0, 12, 12, 13, 0, 3));
-    /* user mode bit, then publish */
-    emit(enc_addsub_imm(0, 0, 0, 12, 12, 0x10));
-    emit(enc_ldst_imm(2, 0, 12, 28, 16));                 /* str w12, [x28,#64] */
+    emit(enc_cset(13, 6));                       /* V: cset w13, vs */
+    emit(enc_logic_reg(0, 1, 0, 12, 12, 13, 0, 28));
+    emit(enc_addsub_imm(0, 0, 0, 12, 12, 0x10)); /* user mode bit */
+    emit(enc_ldst_imm(2, 0, 12, 28, 16));        /* str w12, [x28,#64] */
 }
 
 
@@ -967,11 +953,7 @@ static uint32_t g_seq_pc;
  * address. Returns 1 when this is that address (and consumes the one-shot). */
 static int aot_stop_check(uint32_t pc)
 {
-    if (g_stop_at && (g_stop_at & ~1u) == (pc & ~1u)) {
-        g_stop_at = 0;
-        return 1;
-    }
-    return 0;
+    return cpu_stop_hit(pc);
 }
 
 static int aot_stop_check(uint32_t pc);
@@ -1095,10 +1077,16 @@ static void emit_pending_steps(void)
     g_pending_prev = 0;
 }
 
+/* Branch to the shared abort stub when w0 is non-zero. cbz/cbnz has a +/-1 MB
+ * range and the arena is 56 MB, so a block near the end encoded an offset that
+ * wrapped: the guest jumped into arena memory that was never written and the
+ * host faulted fetching zeroes. A short inverted branch over a `b` (which has
+ * +/-128 MB) is one word longer and cannot wrap. */
 static void emit_cbnz_w0_to_abort(void)
 {
+    emit(enc_cb(0, 0, 0, 2));                       /* cbz w0, +2 (skip the b) */
     intptr_t off = ((intptr_t)g_abort_stub - (intptr_t)g_emit) / 4;
-    emit(enc_cb(0, 1, 0, (int32_t)off));            /* cbnz w0, abort */
+    emit(enc_b((int32_t)off));
 }
 
 /* One guest instruction retired. A superblock only executes the instructions
@@ -1135,8 +1123,32 @@ static void emit_exit_to_raw(uint32_t target)
     emit_budget_check();
     emit_mov_const(0, target);
     emit_call((void *)aot_enter);
-    intptr_t off = ((intptr_t)g_abort_stub - (intptr_t)g_emit) / 4;
-    emit(enc_cb(1, 0, 0, (int32_t)off));
+    {
+        /* cbz/cbnz has +/-1 MB of range and the arena is 56 MB: a block near
+         * the end encoded an offset that wrapped and jumped into arena memory
+         * that was never written. Inverted branch over a b. */
+        emit(enc_cb(1, 1, 0, 2));                   /* cbnz x0, +2 */
+        intptr_t off = ((intptr_t)g_abort_stub - (intptr_t)g_emit) / 4;
+        emit(enc_b((int32_t)off));
+    }
+    emit(enc_br(0));
+}
+
+static void emit_exit_to_thumb_reg(int wreg)
+{
+    emit_flags_to_cpsr();
+    emit_budget_check();
+    emit_mov_reg(0, wreg);
+    emit(enc_addsub_imm(0, 0, 0, 0, 0, 1));          /* add w0, w0, #1 */
+    emit_call((void *)aot_enter);
+    {
+        /* cbz/cbnz has +/-1 MB of range and the arena is 56 MB: a block near
+         * the end encoded an offset that wrapped and jumped into arena memory
+         * that was never written. Inverted branch over a b. */
+        emit(enc_cb(1, 1, 0, 2));                   /* cbnz x0, +2 */
+        intptr_t off = ((intptr_t)g_abort_stub - (intptr_t)g_emit) / 4;
+        emit(enc_b((int32_t)off));
+    }
     emit(enc_br(0));
 }
 
@@ -1146,8 +1158,14 @@ static void emit_exit_to_reg(int wreg)
     emit_budget_check();
     emit_mov_reg(0, wreg);
     emit_call((void *)aot_enter);
-    intptr_t off = ((intptr_t)g_abort_stub - (intptr_t)g_emit) / 4;
-    emit(enc_cb(1, 0, 0, (int32_t)off));            /* cbz x0, abort */
+    {
+        /* cbz/cbnz has +/-1 MB of range and the arena is 56 MB: a block near
+         * the end encoded an offset that wrapped and jumped into arena memory
+         * that was never written. Inverted branch over a b. */
+        emit(enc_cb(1, 1, 0, 2));                   /* cbnz x0, +2 */
+        intptr_t off = ((intptr_t)g_abort_stub - (intptr_t)g_emit) / 4;
+        emit(enc_b((int32_t)off));
+    }
     emit(enc_br(0));
 }
 
@@ -1169,8 +1187,14 @@ static void emit_exit_to(uint32_t target)
     emit_budget_check();
     emit_mov_const(0, target | (g_block_thumb ? 1u : 0u));
     emit_call((void *)aot_enter);
-    intptr_t off = ((intptr_t)g_abort_stub - (intptr_t)g_emit) / 4;
-    emit(enc_cb(1, 0, 0, (int32_t)off));
+    {
+        /* cbz/cbnz has +/-1 MB of range and the arena is 56 MB: a block near
+         * the end encoded an offset that wrapped and jumped into arena memory
+         * that was never written. Inverted branch over a b. */
+        emit(enc_cb(1, 1, 0, 2));                   /* cbnz x0, +2 */
+        intptr_t off = ((intptr_t)g_abort_stub - (intptr_t)g_emit) / 4;
+        emit(enc_b((int32_t)off));
+    }
     emit(enc_br(0));
 }
 
@@ -1333,7 +1357,12 @@ static int emit_one(const air *i)
         if (rd == 15) {                             /* computed jump */
             emit_park_target(9);
             emit_term_check(i->pc);
-            emit_exit_to_reg(23);
+            /* A Thumb `mov pc, rX` keeps the state: it is not an interworking
+             * branch, so the target is entered as Thumb even when bit 0 is
+             * clear -- which is exactly what a jump table produces. Entering
+             * libpng's switch tables in ARM mode decoded `mov r0, sl` as an
+             * ARM instruction and halted at the first switch. */
+            emit_exit_to_thumb_reg(23);
             return 1;
         }
         break;
@@ -1549,8 +1578,14 @@ static int emit_one(const air *i)
         emit_mov_const(0, i->pc);
         emit_call((void *)aot_host_call);
         emit(enc_ldst_imm(3, 1, 25, 26, 0));        /* ldr x25, [x26] */
+    {
+        /* cbz/cbnz has +/-1 MB of range and the arena is 56 MB: a block near
+         * the end encoded an offset that wrapped and jumped into arena memory
+         * that was never written. Inverted branch over a b. */
+        emit(enc_cb(1, 1, 0, 2));                   /* cbnz x0, +2 */
         intptr_t off = ((intptr_t)g_abort_stub - (intptr_t)g_emit) / 4;
-        emit(enc_cb(1, 0, 0, (int32_t)off));
+        emit(enc_b((int32_t)off));
+    }
         emit(enc_br(0));
         return 1;
     }
@@ -1570,13 +1605,26 @@ static uint32_t *emit_fallback_block(uint32_t pcraw)
     uint32_t *start = g_emit;
     emit_budget_check();
     emit(enc_ldst_imm(3, 0, 25, 26, 0));            /* str x25, [x26] */
+    if (g_seq) {
+        /* A fallback instruction runs on the interpreter, so without this the
+         * AOT_SEQ stream silently skips it and a stream comparison reports a
+         * divergence that is only a log artefact. */
+        emit_mov_const(0, pcraw);
+        emit_call((void *)seq_log);
+    }
     emit_mov_const(0, pcraw);
     emit_call((void *)aot_step);
     /* The interpreter owned the counter while that instruction ran (and a shim
      * may have run a nested one), so the AOT copy is stale. */
     emit(enc_ldst_imm(3, 1, 25, 26, 0));            /* ldr x25, [x26] */
-    intptr_t off = ((intptr_t)g_abort_stub - (intptr_t)g_emit) / 4;
-    emit(enc_cb(1, 0, 0, (int32_t)off));
+    {
+        /* cbz/cbnz has +/-1 MB of range and the arena is 56 MB: a block near
+         * the end encoded an offset that wrapped and jumped into arena memory
+         * that was never written. Inverted branch over a b. */
+        emit(enc_cb(1, 1, 0, 2));                   /* cbnz x0, +2 */
+        intptr_t off = ((intptr_t)g_abort_stub - (intptr_t)g_emit) / 4;
+        emit(enc_b((int32_t)off));
+    }
     emit(enc_br(0));
     __builtin___clear_cache((char *)start, (char *)g_emit);
     return start;
@@ -1866,9 +1914,15 @@ static int emit_arm_insn(const air *i)
 
     case AOP_ARM_B: {
         /* LR is pc+4 with no Thumb bit: an ARM call returns to ARM code. BLX
-         * immediate (b == 2) is the one place ARM code reaches Thumb. */
-        emit_mov_const(10, i->pc + 4);
-        G_ST(14, 10);
+         * immediate (b == 2) is the one place ARM code reaches Thumb. Only a
+         * call writes LR, though: an unconditional `b` that overwrote it broke
+         * the tail-call idiom at the end of __aeabi_cdrcmple, where the callee
+         * `pop {r0, pc}` then returned to the `b` itself instead of to the
+         * caller (r14 diverged by exactly the branch address). */
+        if (i->b) {
+            emit_mov_const(10, i->pc + 4);
+            G_ST(14, 10);
+        }
         emit_term_check(i->pc);
         if (i->b == 2) emit_exit_to_raw(i->imm | 1u);
         else           emit_exit_to(i->imm);
@@ -1965,6 +2019,45 @@ static void decode_any(uint32_t pc, int thumb, air *a)
     dec_thumb(pc, a);
 }
 
+
+/* ---- crash reporting ---------------------------------------------------- */
+
+/* A fault inside generated code reports a host PC. Turning it back into the
+ * guest PC of the block is the difference between "something stored through a
+ * bad pointer" and "this instruction's base register or write-back is wrong".
+ * AOT_DUMP_CODE records the mapping; without a dump the answer is "unknown"
+ * and the register file is all there is. */
+static struct { uint32_t *start; uint32_t *end; uint32_t pc; } g_blkmap[1 << 16];
+static int g_nblkmap;
+
+/* The nearest block at or below the host PC, whether or not the PC is inside
+ * it: a jump into the middle of the arena is exactly the case that matters, and
+ * an "inside" test reports nothing for it. */
+uint32_t *aot_host_pc_block(uintptr_t hp)
+{
+    uint32_t *best = NULL;
+    for (int i = 0; i < g_nblkmap; i++)
+        if ((uintptr_t)g_blkmap[i].start <= hp &&
+            (!best || g_blkmap[i].start > best))
+            best = g_blkmap[i].start;
+    return best;
+}
+
+uint32_t aot_host_pc_block_end(uint32_t *start)
+{
+    for (int i = 0; i < g_nblkmap; i++)
+        if (g_blkmap[i].start == start) return (uint32_t)(uintptr_t)g_blkmap[i].end;
+    return 0;
+}
+
+uint32_t aot_block_guest_pc(uint32_t *start)
+{
+    for (int i = 0; i < g_nblkmap; i++)
+        if (g_blkmap[i].start == start)
+            return g_blkmap[i].pc;
+    return 0;
+}
+
 static uint32_t *translate(uint32_t pc, int thumb)
 {
     g_block_thumb = thumb;
@@ -2024,36 +2117,33 @@ static uint32_t *translate(uint32_t pc, int thumb)
     g_pending_prev = 0;
     g_npend = 0;
     for (int k = 0; k < n; k++) {
-        /* Track the last flag setter so an exit into an interpreted block can
-         * publish the flags (see emit_flags_to_cpsr). Exact arithmetic setters
-         * are remembered; anything else that writes flags invalidates it. */
-        {
-            const air *c = &blk[k];
-            int exact = 0, writes = 1;
-            if (c->op == AOP_ADDSUB) exact = 1;
-            else if (c->op == AOP_IMM8) { exact = (c->a != 0); writes = 1; }
-            else if (c->op == AOP_ALU) {
-                exact = (c->a == 0x9 || c->a == 0xa || c->a == 0xb);
-                writes = exact || c->a == 0x0 || c->a == 0x1 || c->a == 0x2 ||
-                         c->a == 0x3 || c->a == 0x4 || c->a == 0x5 ||
-                         c->a == 0x6 || c->a == 0x7 || c->a == 0x8 ||
-                         c->a == 0xc || c->a == 0xd || c->a == 0xe || c->a == 0xf;
-            } else if (c->op == AOP_ARM_DP) {
-                exact = (c->b & 1) && (c->a == DP_ADD || c->a == DP_SUB ||
-                                       c->a == DP_RSB || c->a == DP_CMP ||
-                                       c->a == DP_CMN);
-                writes = (c->b & 1) != 0;
-            } else if (c->op == AOP_SHIFT || c->op == AOP_HI) {
-                writes = (c->op == AOP_SHIFT) || (c->op == AOP_HI && c->a == 1);
-            } else writes = 0;
-            if (exact) { g_last_cc = *c; g_last_cc_valid = 1; }
-            else if (writes) g_last_cc_valid = 0;
-        }
         emit_count(blk[k].cnt);
         if (g_seq) {
+            /* The trace call is a host call and destroys PSTATE, which the next
+             * instruction in the block may still need (cmp; bcond is emitted as
+             * one block). Without this the trace perturbs what it measures: it
+             * reported a divergence at `cmp r0,#0; beq` that only existed
+             * because seq_log itself had cleared Z. */
+            emit(0xf81f0fe9);                        /* str x9, [sp, #-16]! */
+            emit(enc_mrs_nzcv(9));                   /* mrs x9, nzcv        */
+            emit(0xf81f0fe9);                        /* str x9, [sp, #-16]! */
             emit_mov_const(0, blk[k].pc | (uint32_t)(thumb ? 1 : 0));
             emit_call((void *)seq_log);
+            emit(0xf84107e9);                        /* ldr x9, [sp], #16   */
+            emit(enc_msr_nzcv(9));                   /* msr nzcv, x9        */
+            emit(0xf84107e9);                        /* ldr x9, [sp], #16   */
         }
+        /* A terminator ends the block, so the "flush the pending producers
+         * before their consumer is checked" step that normally happens on the
+         * *next* instruction would land after the branch -- dead code, and the
+         * checker's shadow then stops advancing at that instruction. Flushing
+         * here keeps the shadow in step with the generated code. */
+        if (g_check && g_npend > 0 &&
+            (blk[k].op == AOP_B || blk[k].op == AOP_BL || blk[k].op == AOP_BLX ||
+             blk[k].op == AOP_BX || blk[k].op == AOP_ARM_B ||
+             blk[k].op == AOP_ARM_BX || blk[k].op == AOP_BKPT ||
+             blk[k].op == AOP_SWI))
+            emit_pending_steps();
         int r = emit_one(&blk[k]);
         if (g_check && r == 0 && blk[k].op != AOP_BCOND) {
             int next_reads = (k + 1 < n) && insn_reads_flags(&blk[k + 1]);
@@ -2115,6 +2205,12 @@ static uint32_t *translate(uint32_t pc, int thumb)
             emit_call((void *)aot_check_branch);
             emit_cbnz_w0_to_abort();
         }
+        /* Publish the flags as they were at the branch, not at the end of the
+         * block: the target may be interpreted (a block whose first instruction
+         * is conditional cannot be translated), and the interpreter reads
+         * g_cpu.cpsr. */
+        if (target_reads_flags(g_fix[f].pc, g_block_thumb))
+            emit_flags_to_cpsr();
         emit_exit_to(g_fix[f].pc);
         intptr_t off = stub - g_fix[f].at;
         if (getenv("AOT_FIXDBG") && pc == 0x010d1fcc)
@@ -2146,6 +2242,12 @@ static uint32_t *translate(uint32_t pc, int thumb)
                          "outside the arena %p..%p\n", pc, (long)(q - start),
                          (void *)t, (void *)g_code, (void *)g_emit);
         }
+    }
+    if (g_nblkmap < (int)(sizeof(g_blkmap)/sizeof(g_blkmap[0]))) {
+        g_blkmap[g_nblkmap].start = start;
+        g_blkmap[g_nblkmap].end = g_emit;
+        g_blkmap[g_nblkmap].pc = pc;
+        g_nblkmap++;
     }
     aot_dump_block(start, g_emit, pc);
     __builtin___clear_cache((char *)start, (char *)g_emit);
@@ -2237,6 +2339,15 @@ static int shadow_step(uint32_t pcraw)
     if ((g_shadow.r[15] & ~1u) != (pcraw & ~1u)) {
         host_log("aot check: path diverged -- code at %08x, interpreter at %08x\n",
                  pcraw & ~1u, g_shadow.r[15] & ~1u);
+        host_log("   mode code=%d shadow=%d\n", (int)(pcraw & 1u),
+                 (int)(g_shadow.r[15] & 1u));
+        host_log("   code   : r0=%08x r1=%08x r2=%08x r3=%08x lr=%08x "
+                 "sp=%08x cpsr=%08x\n", g_cpu.r[0], g_cpu.r[1], g_cpu.r[2],
+                 g_cpu.r[3], g_cpu.r[14], g_cpu.r[13], g_cpu.cpsr);
+        host_log("   interp : r0=%08x r1=%08x r2=%08x r3=%08x lr=%08x "
+                 "sp=%08x cpsr=%08x\n", g_shadow.r[0], g_shadow.r[1],
+                 g_shadow.r[2], g_shadow.r[3], g_shadow.r[14], g_shadow.r[13],
+                 g_shadow.cpsr);
         return 1;
     }
     g_cpu = g_shadow;
@@ -2666,4 +2777,23 @@ void aot_arm64_stats(void)
              (unsigned long long)g_aot_blocks, (unsigned long long)g_aot_insns,
              (unsigned long long)g_aot_fallback_blocks,
              (unsigned)(g_emit - g_code));
+}
+
+/* Is a host PC inside the emitted code, and if so which block? Used by the
+ * crash handler; printing the arena bounds makes "inside the arena but never
+ * written" (executing zeroes) distinguishable from "outside the arena". */
+void aot_report_code_range(uintptr_t hp);
+void aot_report_code_range(uintptr_t hp)
+{
+    host_log("  arena is %p..%p (emit cursor %p); pc %s the arena\n",
+             (void *)g_code, (void *)g_emit_end, (void *)g_emit,
+             (hp >= (uintptr_t)g_code && hp < (uintptr_t)g_emit_end)
+                 ? "IS inside" : "is OUTSIDE");
+    uint32_t *b = aot_host_pc_block(hp);
+    if (!b) { host_log("  host pc is below the first block\n"); return; }
+    uint32_t *e = (uint32_t *)(uintptr_t)aot_host_pc_block_end(b);
+    host_log("  block for guest %08x: %p..%p, pc offset %+ld words%s\n",
+             aot_block_guest_pc(b), (void *)b, (void *)e,
+             (long)((hp - (uintptr_t)b) / 4),
+             (hp >= (uintptr_t)b && hp < (uintptr_t)e) ? "" : "  (OUTSIDE it)");
 }

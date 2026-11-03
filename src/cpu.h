@@ -24,6 +24,13 @@ extern uint64_t   g_insn_count;
  * take a dump with the engine's real state at a chosen point. */
 extern uint32_t   g_stop_at;
 
+/* A snapshot is usually wanted at the *first* arrival at g_stop_at, but a bug
+ * can only show itself on a later one -- the same call site is reached many
+ * times with different state. g_stop_nth makes the stop fire on the nth
+ * arrival instead, and a caller can walk the arrivals one dump at a time. */
+extern uint32_t   g_stop_nth;
+int cpu_stop_hit(uint32_t pc);
+
 /* g_stop_at makes cpu_run return HALT_STOPPED, with r15 set to the stop
  * address. The runner dumps memory and registers there and resumes from the
  * same instruction, so the dump describes the engine's real state at a chosen

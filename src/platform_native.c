@@ -27,6 +27,8 @@
 #include <time.h>
 #include <signal.h>
 #include <string.h>
+#include <ucontext.h>
+#include <asm/sigcontext.h>
 #include <sys/stat.h>
 #include <unistd.h>
 
@@ -43,6 +45,10 @@
  * what actually identifies the bug. Without this, every bring-up crash is a
  * manual bisect.
  */
+extern uint32_t *aot_host_pc_block(uintptr_t hp);
+extern uint32_t aot_block_guest_pc(uint32_t *start);
+extern uint32_t aot_host_pc_block_end(uint32_t *start);
+
 static void segv_handler(int sig, siginfo_t *info, void *uctx)
 {
     (void)sig;
@@ -63,6 +69,32 @@ static void segv_handler(int sig, siginfo_t *info, void *uctx)
     else
         fprintf(stderr, "  => %+ld bytes OUTSIDE the guest space\n", (long)off);
 
+    /* The host PC says *which* generated instruction faulted. Without it a
+     * wild store is indistinguishable from a wild load three blocks away. */
+#if defined(__aarch64__)
+    {
+        ucontext_t *uc = (ucontext_t *)uctx;
+        /* musl's ucontext_t exposes the kernel's struct sigcontext here. */
+        struct sigcontext *sc = (struct sigcontext *)&uc->uc_mcontext;
+        uintptr_t hpc = (uintptr_t)sc->pc;
+        fprintf(stderr, "  (sigcontext: fault=%p pc=%p lr=%p sp=%p)\n",
+                (void *)(uintptr_t)sc->fault_address, (void *)hpc,
+                (void *)(uintptr_t)sc->regs[30], (void *)(uintptr_t)sc->sp);
+        aot_report_code_range(hpc);
+        fprintf(stderr, "  host pc            : %p\n", (void *)hpc);
+        void *in_arena = aot_host_pc_block(hpc);
+        if (in_arena) {
+            fprintf(stderr, "  => nearest block: guest %08x, host %p..%p, "
+                    "offset +%ld words\n",
+                    aot_block_guest_pc((uint32_t *)in_arena),
+                    (void *)in_arena,
+                    (void *)(uintptr_t)aot_host_pc_block_end((uint32_t *)in_arena),
+                    (long)((hpc - (uintptr_t)in_arena) / 4));
+            fprintf(stderr, "  => word at fault : %08x\n",
+                    *(uint32_t *)hpc);
+        }
+    }
+#endif
     fprintf(stderr, "  guest pc           : %08x\n", g_cpu.r[15]);
     fprintf(stderr, "  instructions run   : %llu\n",
             (unsigned long long)g_insn_count);
@@ -96,6 +128,10 @@ static void install_segv_handler(void)
     sa.sa_flags = SA_SIGINFO;
     sigaction(SIGSEGV, &sa, NULL);
     sigaction(SIGBUS, &sa, NULL);
+    /* SIGILL as well: generated code that jumps into the wrong place lands on
+     * a word the host cannot execute, and without this the report is qemu's
+     * "uncaught target signal 4" with no guest state at all. */
+    sigaction(SIGILL, &sa, NULL);
 }
 
 /* Called from main() before any guest code runs. */
@@ -154,6 +190,22 @@ void *host_alloc(size_t n)
 
 double host_now(void)
 {
+    /* SPIKE_FIXED_STEP makes a run reproducible: the guest reads the clock
+     * through gettimeofday as well as through the frame loop, and a differential
+     * comparison is meaningless if two interpreter runs disagree with each other.
+     * The virtual clock advances 16 ms per call so nothing divides by zero and
+     * the "time since the last frame" the engine computes stays plausible. */
+    static int fixed = -1;
+    static double virt;
+    if (fixed < 0) {
+        const char *e = getenv("SPIKE_FIXED_STEP");
+        fixed = e && *e && *e != '0';
+        virt = 100000.0;
+    }
+    if (fixed) {
+        virt += 0.016;
+        return virt;
+    }
     struct timespec ts;
     clock_gettime(CLOCK_MONOTONIC, &ts);
     return (double)ts.tv_sec + (double)ts.tv_nsec * 1e-9;
