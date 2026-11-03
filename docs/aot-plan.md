@@ -1766,3 +1766,40 @@ So the accounting is exact on the bench (54,449,405) and on the first 41 engine
 frames, and wrong by 105 over 211. Worth another look: the answer is in a path
 the bench does not reach, and running the gate with `SPIKE_TRACE_LIMIT` on the
 frame *where it first differs* would name it in one run.
+
+### 15.15 Batching the instruction counter lands: +6.5%
+
+`add x25, x25, #n` is now emitted once per run of instructions rather than once
+per guest instruction -- a tenth of the generated code. Bench **1478 MIPS** (from
+1393, interleaved A/B over three rounds), gate exact.
+
+The whole difficulty was that the accumulator is a *translation-time* value
+while the flushes are *runtime* code: whichever flush is emitted first consumes
+it, and if that flush sits on a path the guest does not take, the instructions
+are silently dropped. Four such paths, each found by a gate:
+
+1. **The block epilogue.** It is emitted after the exit instruction, so it is
+   unreachable. A forward edge chains straight into the next block and never
+   passes any other flush -- so the flush belongs at the top of each exit.
+2. **A conditional branch.** The taken path leaves at the branch; the epilogue
+   flush is on the fall-through side. Flush before the `b.cond`.
+3. **A conditional ARM terminator** (`bxeq lr`, `pople`, `ldmiane sp!, {..pc}`).
+   Its body's flush is inside the guarded region, so it is skipped when the
+   condition is false, and the fall-through exit's flush had already been
+   consumed at translation time. This is the one that cost 8 instructions in
+   frame 611 of the boot, and it is why the failure is invisible on the bench
+   (which is Thumb and has no conditional data processing).
+4. **The translation rollback**: `g_emit = start` discards the emitted code, so
+   the accumulator must be zeroed with it -- worth 49 phantom instructions on
+   the gate.
+
+Localised by diffing the per-frame instruction counts of a deterministic run
+rather than bisecting: frames 0..610 agreed, frame 611 was 8 short, and 8 is one
+block's worth. A translation-time sentinel in the epilogue ("this block leaked N
+counted instructions") stays in the source as the check that would have caught
+all four in one run.
+
+Cumulative, bench median under qemu: interpreter 42, then 566 (first working
+translator), 884 (exit chaining), 914 (write-through cache), 1447 (deferred
+stores), **1478** (batched counting) -- 35x as qemu measures it. The planning
+number stays 3x until the RK3566 has been measured.

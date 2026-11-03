@@ -1175,8 +1175,32 @@ static void emit_mov_addr64(int rd, uint64_t v)
 
 /* Call a C function at `fn`. A direct `bl` when the arena and the binary are
  * within reach of a 26-bit branch, otherwise movz/movk + blr. */
+/* The instruction counter (x25) is accumulated and added once instead of once
+ * per guest instruction: a block averages eight instructions, so this is one
+ * `add` instead of eight -- a tenth of the generated code.
+ *
+ * x25 is *read* in exactly four places (grepped): the budget check's cmp, the
+ * two `str x25, [x26]` in the import and fallback stubs, and .Laot_exit, which
+ * every abort and halt stub branches to. So the accumulator is flushed at the
+ * top of emit_budget_check(), at the top of emit_call() -- the import and
+ * fallback stubs both go through it -- and at the top of every exit, because a
+ * forward edge chains straight into the next block without either. Flushing in
+ * the block *epilogue* instead is wrong: the epilogue sits after the exit
+ * instruction and is therefore never reached. */
+static uint32_t g_pend_cnt;
+
+static void emit_count(uint32_t n) { g_pend_cnt += n; }
+
+static void emit_flush_cnt(void)
+{
+    if (!g_pend_cnt) return;
+    emit(enc_addsub_imm(1, 0, 0, 25, 25, g_pend_cnt));
+    g_pend_cnt = 0;
+}
+
 static void emit_call(void *fn)
 {
+    emit_flush_cnt();       /* the callee may store x25 to g_insn_count */
     rc_sync();              /* the callee sees g_cpu, not the slot */
     intptr_t here = (intptr_t)g_emit;
     intptr_t off = ((intptr_t)fn - here);
@@ -1229,15 +1253,12 @@ static void emit_cbnz_w0_to_abort(void)
  * before its first taken conditional branch, so the pre-scanned block length is
  * NOT how many retired: counting per instruction is what makes g_insn_count
  * exact. */
-static void emit_count(uint32_t n)
-{
-    emit(enc_addsub_imm(1, 0, 0, 25, 25, n));       /* add x25, x25, #n */
-}
 
 /* The budget is checked on the way out of a block, so the count is exact and the
  * halt point is a block start. */
 static void emit_budget_check(void)
 {
+    emit_flush_cnt();   /* the cmp below reads x25 */
     rc_flush();     /* the halt stub leaves the run; g_cpu must be current */
     emit(enc_addsub_reg(1, 1, 1, R_WZR, 25, 24, 0, 0));   /* cmp x25, x24 */
     intptr_t off = ((intptr_t)g_halt_budget_stub - (intptr_t)g_emit) / 4;
@@ -1257,6 +1278,7 @@ static void emit_fail(const air *i, int why)
 static void emit_exit_to_raw(uint32_t target)
 {
     emit_flags_to_cpsr();
+    emit_flush_cnt();       /* a chained forward edge skips every other flush */
     rc_sync();              /* the target block reads g_cpu */
     emit_budget_check();
     emit_mov_const(0, target);
@@ -1287,6 +1309,7 @@ static void emit_exit_indirect(int wreg, int force_thumb)
 {
     /* Flags first: the budget check below is a cmp and would destroy PSTATE. */
     emit_flags_to_cpsr();
+    emit_flush_cnt();       /* a chained forward edge skips every other flush */
     rc_sync();              /* the target block reads g_cpu */
     emit_budget_check();
     emit_mov_reg(0, wreg);
@@ -1372,6 +1395,7 @@ static void emit_exit_slow(uint32_t *slot, uint32_t target, uint32_t raw,
  * those, still publish the flags and take the slow path. */
 static void emit_exit_to(uint32_t target)
 {
+    emit_flush_cnt();       /* a chained forward edge skips every other flush */
     int needs_flags = target_reads_flags(target, g_block_thumb);
     if (needs_flags) emit_flags_to_cpsr();
     rc_sync();              /* the target block reads g_cpu */
@@ -1721,6 +1745,9 @@ static int emit_one(const air *i)
          * between the capture and the branch would be overwritten -- the branch
          * then became 'b .' (offset zero) and the guest hung. */
         rc_flush();
+        /* Count what has run so far before the branch: the taken path leaves
+         * here, and the block epilogue's flush is on the fall-through side. */
+        emit_flush_cnt();
         uint32_t target = (uint32_t)((int32_t)(i->pc + 4) + (int32_t)i->imm);
         /* A taken conditional branch is a loop iteration. Sending it through
          * the out-of-line stub costs a host call into aot_enter for a lookup
@@ -1903,6 +1930,12 @@ static int emit_arm_insn(const air *i)
          * #0` immediate inside the body, and the fall-through reading r3 from
          * memory where it still held the old value. */
         rc_sync();
+        /* Count what has run so far before the guard. The body's own flush is
+         * inside the guarded region -- skipped when the condition is false --
+         * while the fall-through exit's flush was already consumed at
+         * translation time, so the instructions before a conditional ARM
+         * terminator were never counted on the skipped path. */
+        emit_flush_cnt();
         g_rc_cond++;
         skip_at = g_emit;
         emit(enc_bcond((int)(cond ^ 1u), 0));       /* b.!cond over the body */
@@ -2330,6 +2363,7 @@ static uint32_t *translate(uint32_t pc, int thumb)
 
     g_last_block_pc = pc;
     uint32_t *start = g_emit;
+    g_pend_cnt = 0;         /* a block never inherits a pending count */
     rc_sync();              /* a block never inherits a slot */
     emit_guest_pc(pc);
     /* The --stop-at check is a host call per block, so it is emitted only when
@@ -2408,6 +2442,7 @@ static uint32_t *translate(uint32_t pc, int thumb)
          * instruction that failed is interpreted, and the counter says how
          * often, so coverage is a number rather than a hope. */
         g_emit = start;
+        g_pend_cnt = 0;     /* the discarded instructions never ran */
         /* The rollback discards the emitted code, so the register cache
          * must forget its mapping too: those slots describe instructions
          * that no longer exist. Missing this left the fallback reading a
@@ -2430,6 +2465,18 @@ static uint32_t *translate(uint32_t pc, int thumb)
     if (!ended)
         emit_exit_to(p | (uint32_t)thumb);          /* fall off the end */
 
+    /* Every exit flushes the counter, so nothing may be left here. If it is,
+     * those instructions would be silently dropped when the next block resets
+     * the accumulator -- which is exactly the kind of slow leak a whole-run
+     * instruction count is too coarse to localise. */
+    if (g_pend_cnt) {
+        /* Every exit flushes the counter, so this cannot happen; if it ever
+         * does, the instructions would be silently dropped when the next block
+         * resets the accumulator. Translation-time check, no runtime cost. */
+        host_log("aot: block %08x leaked %u counted instruction(s)\n",
+                 pc, g_pend_cnt);
+        g_pend_cnt = 0;
+    }
     rc_sync();              /* nothing may survive the block */
     /* out-of-line branch stubs, then the patch */
     if (getenv("AOT_FIXDBG") && pc == 0x010d1fcc)
