@@ -1491,3 +1491,59 @@ instructions, identical count both sides):
 
 12.98× on qemu. The planning number stays 3×: qemu inflates the ratio, and only
 the RK3566 numbers can settle it.
+
+### 15.8 Four optimisations, measured
+
+Baseline was the boot-capable `a000895`. Each step was gated on the bench's exact
+instruction count (54,449,405) plus the deterministic `--frames=1200` boot
+reporting the same 211 engine frames and the same final pc.
+
+| # | change | effect |
+|---|---|---|
+| 1 | `--stop-at` check emitted only when a stop is armed | 566 → 680 MIPS |
+| 2 | static exits chained: emit `b <target block>` once the target exists, backpatched from `disp_set()`; a one-word slot holds the placeholder branch until then | 680 → 890 |
+| 3 | budget check only on **backward** edges (an unconditional walk forward cannot be unbounded) | small, folded into 2 |
+| 4 | indirect exits (every function return) do the dispatch lookup inline from the pinned x20/x21 instead of calling `aot_enter` | folded into 2 |
+
+Bench, median of 5, same host under qemu: **884 MIPS**, against the
+interpreter's 43.1 → 20.5×. Real workload is the honest number: `--frames=1200`
+with a tap takes **1.55 s** under the AOT and **16.5 s** interpreted, 10.5×.
+
+The exit path went from ~21 words and a host call to one `b`.
+
+### 15.9 The register cache: tried, backed out
+
+The remaining cost is that g_cpu is memory: every guest register write is a store
+immediately followed by a load in the next instruction. Replacing those with a
+4-slot host-register cache measured **1442 MIPS** (+63%) in a stub experiment, so
+it is worth real money.
+
+It was backed out. Four independent bugs, each found by a gate, and only three
+fixed before the time budget ran out:
+
+1. a taken conditional branch jumps to an out-of-line stub at the end of the
+   block, skipping the epilogue's flush (fixed: flush before the `b.cond`);
+2. a conditionally executed body changes the cache on one path only (fixed:
+   bracket it with a sync);
+3. `rc_reset()` drops dirty values without publishing them, so it may only be
+   used where g_cpu is already current (fixed: the conditional-body bracket
+   uses `rc_sync`);
+4. **still open**: with the cache enabled the bench loops forever. `AOT_VERIFY`
+   says the very first block diverges, and a write-through variant (memory
+   always current, so only the read side can be wrong) diverges too, which
+   points at a slot being reused while a value the emitter still expects is
+   live. `M_LD`/`M_ST` walk addresses in w9 and read guest registers through
+   `G_LD`, so an interaction there is the prime suspect.
+
+Not attempted: dispatching on the fact that the static linking of #2 makes an
+`aot_enter` call per exit unnecessary also for the *conditional* stubs.
+
+Next steps, in the order the measurements argue for:
+
+1. finish the register cache (the +63% is measured, not estimated);
+2. block linking across conditionals, and longer superblocks via dual-path
+   inlining of `cmp; b.cond` -- both multiply the benefit of #2;
+3. `--aot-stats`: misses, fallbacks per block, code size, so the next round has
+   a number instead of an impression;
+4. the disk cache (M4 in section 12): 5,000 blocks is real startup time on an
+   RK3566.

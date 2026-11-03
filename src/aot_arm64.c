@@ -319,6 +319,18 @@ typedef struct {
     uint32_t insns;         /* guest instructions in the block               */
 } block_t;
 
+/* Static exits that could not be linked yet: their placeholder `b` is rewritten
+ * when the target block is translated. A block has at most a handful of these,
+ * so a flat array with an append-only cursor is enough; when it fills up the
+ * only consequence is that later exits stay on the slow path, which is exactly
+ * what the code did before linking existed. */
+struct pend_link { uint32_t *slot; uint32_t target; };
+#define AOT_MAX_LINKS (1u << 15)
+static struct pend_link g_link[AOT_MAX_LINKS];
+static uint32_t g_nlink;
+
+static void disp_set(uint32_t pc, uint32_t *code);
+
 /* Guest PC -> host code, or 0. Indexed by (pc - text_lo) / 2 for Thumb. */
 static inline uint32_t *disp_get(uint32_t pc)
 {
@@ -330,6 +342,17 @@ static inline void disp_set(uint32_t pc, uint32_t *code)
 {
     uint32_t i = (pc - g_text_lo) >> 1;
     if (i < AOT_TABLE_ENTRIES) g_disp[i] = (uint64_t)(uintptr_t)code;
+
+    /* Link every exit that was waiting for this block. The slot holds a `b` to
+     * its own slow path; rewriting it makes the next arrival a single branch.
+     * Compiled lazily, so this is the only place that knows a block appeared. */
+    for (uint32_t k = 0; k < g_nlink; k++) {
+        if (g_link[k].target != pc) continue;
+        uint32_t *slot = g_link[k].slot;
+        *slot = enc_b((int32_t)(code - slot));
+        __builtin___clear_cache((char *)slot, (char *)(slot + 1));
+        g_link[k].target = 0;                    /* done, skipped from now on */
+    }
 }
 
 /* ------------------------------------------------------------------------- */
@@ -388,6 +411,7 @@ typedef struct {
 enum { CC_NONE = 0, CC_EXACT, CC_NZ };
 
 static int cc_kind;
+static uint32_t g_block_pc;      /* guest PC of the block being emitted */
 
 /* The last flag-setting instruction, if it was one the flags can be recomputed
  * from exactly (add/sub/cmp/cmn). Used when a block exit lands on a block that
@@ -1134,34 +1158,46 @@ static void emit_exit_to_raw(uint32_t target)
     emit(enc_br(0));
 }
 
-static void emit_exit_to_thumb_reg(int wreg)
+/* An indirect exit: the target is only known at run time (`bx lr`, a return
+ * through `pop {pc}`, a call through a function pointer). These are the most
+ * common exits in real code -- every function return is one -- and they used to
+ * take a host call into aot_enter for a dispatch-table lookup the generated
+ * code can do itself: x20 is the table, x21 its entry count, x19 the text base,
+ * all three pinned and otherwise unused.
+ *
+ * The lookup is the same expression disp_get() evaluates:
+ *   index = ((pc & ~1) - text_lo) / 2;  index < entries;  code = table[index]
+ * Bit 0 is the mode bit, and shifting it out is exactly what disp_get's >>1
+ * does for an even address, so the shift is all that is needed. */
+static void emit_exit_indirect(int wreg, int force_thumb)
 {
+    /* Flags first: the budget check below is a cmp and would destroy PSTATE. */
     emit_flags_to_cpsr();
     emit_budget_check();
     emit_mov_reg(0, wreg);
-    emit(enc_addsub_imm(0, 0, 0, 0, 0, 1));          /* add w0, w0, #1 */
-    emit_call((void *)aot_enter);
-    {
-        /* cbz/cbnz has +/-1 MB of range and the arena is 56 MB: a block near
-         * the end encoded an offset that wrapped and jumped into arena memory
-         * that was never written. Inverted branch over a b. */
-        emit(enc_cb(1, 1, 0, 2));                   /* cbnz x0, +2 */
-        intptr_t off = ((intptr_t)g_abort_stub - (intptr_t)g_emit) / 4;
-        emit(enc_b((int32_t)off));
-    }
-    emit(enc_br(0));
-}
+    if (force_thumb)
+        emit(enc_addsub_imm(0, 0, 0, 0, 0, 1));     /* add w0, w0, #1 */
 
-static void emit_exit_to_reg(int wreg)
-{
-    emit_flags_to_cpsr();
-    emit_budget_check();
-    emit_mov_reg(0, wreg);
+    emit(enc_bitfield(0, 2, 11, 0, 1, 30));         /* ubfx w11, w0, #1, #31 */
+
+    uint32_t *b_slow = g_emit;
+    emit(enc_bcond(2, 0));                          /* b.hs slow, patched later */
+    emit(enc_addsub_reg(0, 0, 0, 11, 11, 19, 0, 0));/* sub w11, w11, w19       */
+    emit(enc_addsub_reg(0, 1, 1, R_WZR, 11, 21, 0, 0)); /* cmp w11, w21        */
+    {
+        uint32_t *g2 = g_emit;
+        emit(enc_bcond(2, 0));                      /* b.hs slow, patched later */
+        emit(enc_ldst_reg(3, 1, 9, 20, 11, 2, 0, 3)); /* ldr x9,[x20,w11,uxtw #3] */
+        uint32_t *nul = g_emit;
+        emit(enc_cb(1, 0, 9, 0));                   /* cbz x9, slow, patched    */
+        emit(enc_br(9));
+        uint32_t *slow = g_emit;
+        *b_slow = enc_bcond(2, (int32_t)(slow - b_slow));
+        *g2     = enc_bcond(2, (int32_t)(slow - g2));
+        *nul    = enc_cb(1, 0, 9, (int32_t)(slow - nul));
+    }
     emit_call((void *)aot_enter);
     {
-        /* cbz/cbnz has +/-1 MB of range and the arena is 56 MB: a block near
-         * the end encoded an offset that wrapped and jumped into arena memory
-         * that was never written. Inverted branch over a b. */
         emit(enc_cb(1, 1, 0, 2));                   /* cbnz x0, +2 */
         intptr_t off = ((intptr_t)g_abort_stub - (intptr_t)g_emit) / 4;
         emit(enc_b((int32_t)off));
@@ -1181,11 +1217,24 @@ static int target_reads_flags(uint32_t target, int thumb)
     return insn_reads_flags(&t);
 }
 
-static void emit_exit_to(uint32_t target)
+/* The slow path taken by an exit whose target block does not exist yet: ask
+ * aot_enter for it, and if it hands back code (which also translates it, and so
+ * patches `slot` to branch straight there) continue in it. The slot is one
+ * word: a `b` to the next instruction until it is patched, which is why the
+ * block still runs correctly on the very first arrival. */
+static void emit_exit_slow(uint32_t *slot, uint32_t target, uint32_t raw,
+                           int needs_flags)
 {
-    if (target_reads_flags(target, g_block_thumb)) emit_flags_to_cpsr();
-    emit_budget_check();
-    emit_mov_const(0, target | (g_block_thumb ? 1u : 0u));
+    *slot = enc_b(1);                               /* b +1: fall into the slow path */
+    if (g_nlink < AOT_MAX_LINKS) {
+        g_link[g_nlink].slot = slot;
+        g_link[g_nlink].target = target;
+        g_nlink++;
+    }
+    /* Before the budget check: `cmp x25, x24` overwrites NZCV, and this is the
+     * last point where the block's own flags are still in PSTATE. */
+    if (needs_flags) emit_flags_to_cpsr();
+    emit_mov_const(0, raw);
     emit_call((void *)aot_enter);
     {
         /* cbz/cbnz has +/-1 MB of range and the arena is 56 MB: a block near
@@ -1196,6 +1245,33 @@ static void emit_exit_to(uint32_t target)
         emit(enc_b((int32_t)off));
     }
     emit(enc_br(0));
+}
+
+/* A static exit. Once the target has been translated this is a single `b`:
+ * no host call, no dispatch-table lookup, no range check.
+ *
+ * A direct `b` keeps PSTATE live, which is exactly what a translated target
+ * wants -- but a target whose first instruction *reads* flags can never be
+ * translated (it would need a flag the block did not produce), so it stays a
+ * fallback block and the interpreter reads g_cpu.cpsr instead. Those, and only
+ * those, still publish the flags and take the slow path. */
+static void emit_exit_to(uint32_t target)
+{
+    int needs_flags = target_reads_flags(target, g_block_thumb);
+    if (needs_flags) emit_flags_to_cpsr();
+    /* The budget is checked on *backward* edges only: an unconditional walk
+     * forward cannot be unbounded, and the whole point of the check is to stop
+     * a guest loop. Every loop has a backward edge, so the run still stops
+     * within one block of the budget -- which the gates measure. */
+    if (target <= g_block_pc) emit_budget_check();
+    uint32_t *known = needs_flags ? NULL : disp_get(target);
+    if (known) {
+        emit(enc_b((int32_t)(known - g_emit)));
+        return;
+    }
+    uint32_t *slot = g_emit;
+    emit(enc_b(1));                                 /* placeholder, see above */
+    emit_exit_slow(slot, target, target | (g_block_thumb ? 1u : 0u), 0);
 }
 
 /* AOT_DUMP_CODE=path: append each translated block so a fault inside generated
@@ -1362,7 +1438,7 @@ static int emit_one(const air *i)
              * clear -- which is exactly what a jump table produces. Entering
              * libpng's switch tables in ARM mode decoded `mov r0, sl` as an
              * ARM instruction and halted at the first switch. */
-            emit_exit_to_thumb_reg(23);
+            emit_exit_indirect(23, 1);
             return 1;
         }
         break;
@@ -1375,7 +1451,7 @@ static int emit_one(const air *i)
             G_ST(14, 10);
         }
         emit_term_check(i->pc);
-        emit_exit_to_reg(23);
+        emit_exit_indirect(23, 0);
         return 1;
     }
 
@@ -1473,7 +1549,7 @@ static int emit_one(const air *i)
             G_ST(13, 9);
             emit_park_target(11);
             emit_term_check(i->pc);
-            emit_exit_to_reg(23);
+            emit_exit_indirect(23, 0);
             return 1;
         }
         G_ST(13, 9);
@@ -1810,7 +1886,7 @@ static int emit_arm_insn(const air *i)
                 }
                 emit_park_target(10);
                 emit_term_check(i->pc);
-                emit_exit_to_reg(23);
+                emit_exit_indirect(23, 0);
                 rc = 1;
                 break;
             }
@@ -1866,7 +1942,7 @@ static int emit_arm_insn(const air *i)
         if (returned) {
             G_LD(23, 15);
             emit_term_check(i->pc);
-            emit_exit_to_reg(23);
+            emit_exit_indirect(23, 0);
             rc = 1;
         }
         break;
@@ -1937,7 +2013,7 @@ static int emit_arm_insn(const air *i)
             G_ST(14, 10);
         }
         emit_term_check(i->pc);
-        emit_exit_to_reg(23);
+        emit_exit_indirect(23, 0);
         rc = 1;
         break;
     }
@@ -2061,6 +2137,7 @@ uint32_t aot_block_guest_pc(uint32_t *start)
 static uint32_t *translate(uint32_t pc, int thumb)
 {
     g_block_thumb = thumb;
+    g_block_pc = pc;
     air blk[AOT_MAX_BLOCK];
     int n = 0;
     uint32_t p = pc;
@@ -2098,7 +2175,11 @@ static uint32_t *translate(uint32_t pc, int thumb)
     g_last_block_pc = pc;
     uint32_t *start = g_emit;
     emit_guest_pc(pc);
-    {
+    /* The --stop-at check is a host call per block, so it is emitted only when
+     * the run actually asked for one. --stop-at is parsed before any guest code
+     * runs, so g_stop_at is already final here; a block translated without it
+     * simply cannot be a stop point. */
+    if (g_stop_at) {
         emit_mov_const(0, pc);
         emit_call((void *)aot_stop_check);
         /* w0 != 0 -> halt with HALT_STOPPED, so the runner can dump and resume */
