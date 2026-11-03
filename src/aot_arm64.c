@@ -366,16 +366,30 @@ static inline void disp_set(uint32_t pc, uint32_t *code)
  * store-to-load-forwarding stall. Four host registers mirror guest registers,
  * so the read becomes a register move.
  *
- * Write-through, deliberately: G_ST stores to g_cpu *and* records the value in
- * a slot, so g_cpu is correct after every instruction and a slot is only ever a
- * hint. Dropping the mapping can therefore never lose a value -- a wrong guess
- * costs one reload, never a wrong answer.
+ * The store is DEFERRED: the value waits in the slot until something outside
+ * G_LD/G_ST can observe g_cpu. A guest register written twice in a block costs
+ * one store, and the very common write-then-read pair never touches memory --
+ * which is the point, because a store immediately followed by a load of the same
+ * address is a store-to-load-forwarding stall. Measured: the store is 44% of the
+ * run (replacing it with a register move takes the bench from 908 to 1636 MIPS)
+ * and the load is free (894), so deferring the store is where the money is.
  *
- * The deferred variant is worth considerably more (a stub experiment measured
- * +63% for the store side alone) but it needs a publish point at every exit,
- * branch, conditional body, host call and translation rollback; two attempts
- * left a path unpublished and the guest looped. A hint cannot have that failure
- * mode, and the reload it costs is one instruction.
+ * Correctness rests on one rule: rc_sync() publishes and forgets the mapping
+ * before anything that can read or write g_cpu from outside G_LD/G_ST. The list
+ * is short and every entry was found by a failing gate:
+ *
+ *   - a host call (emit_call);
+ *   - the block's own PC write (emit_guest_pc);
+ *   - every exit, including the budget check's halt stub, which returns to a
+ *     runner that reads g_cpu;
+ *   - a conditional branch, whose taken path leaves for an out-of-line stub;
+ *   - a conditional body, whose store clears the slot's dirty flag at
+ *     translation time -- so a deferred store from before the guard would vanish
+ *     from the publish list even on the path where the body never ran;
+ *   - a translation rollback, which discards the emitted code the slots describe.
+ *
+ * r13/r15 are written to g_cpu directly (the block's PC, the exit's stack) and
+ * r14 is the return address the exit reads, so those three are never deferred.
  *
  * w5..w8 are the slots: the emitters use w0, w1 and w9..w15 as scratch, w23 for
  * exit targets, and pin x19..x28. Checked by grepping every encoder call. */
@@ -388,15 +402,27 @@ static int8_t rc_of[RC_N];
  * Called before anything that can write g_cpu behind the mapping's back: a host
  * call, the block's own PC write, a block boundary, and a translation rollback
  * (which discards the emitted code the slots describe). */
+
+static uint8_t rc_dirty[RC_N];
+static int g_rc_cond;      /* inside a conditionally executed body */
+
+/* Publish every dirty slot, keeping the mapping: both paths of a branch, and
+ * the fall-through, continue to use the same slots. */
+static void rc_flush(void)
+{
+    for (int i = 0; i < RC_N; i++)
+        if (rc_of[i] >= 0 && rc_dirty[i]) {
+            emit(enc_ldst_imm(2, 0, rc_host[i], 28, (uint32_t)rc_of[i]));
+            rc_dirty[i] = 0;
+        }
+}
+
 static void rc_sync(void)
 {
+    rc_flush();
     for (int i = 0; i < RC_N; i++) rc_of[i] = -1;
     for (int i = 0; i < 16; i++) rc_slot[i] = -1;
 }
-
-/* Nothing to publish: g_cpu is current after every G_ST. Kept because the
- * deferred variant needed the same call sites. */
-static void rc_flush(void) { }
 
 static int rc_alloc(int g)
 {
@@ -408,7 +434,10 @@ static int rc_alloc(int g)
     if (i < 0) {
         static int rr;
         i = rr; rr = (rr + 1) % RC_N;
+        if (rc_dirty[i])
+            emit(enc_ldst_imm(2, 0, rc_host[i], 28, (uint32_t)rc_of[i]));
         rc_slot[(int)rc_of[i]] = -1;
+        rc_dirty[i] = 0;
     }
     rc_of[i] = (int8_t)g;
     rc_slot[g] = (int8_t)i;
@@ -427,10 +456,14 @@ static int rc_alloc(int g)
 
 #define G_ST(g, w) \
     do { \
-        emit(enc_ldst_imm(2, 0, (w), 28, (uint32_t)(g))); \
         int _s = rc_alloc((g)); \
         if (rc_host[_s] != (w)) \
             emit(enc_logic_reg(0, 1, 0, rc_host[_s], R_WZR, (w), 0, 0)); \
+        if (g_rc_cond) { \
+            emit(enc_ldst_imm(2, 0, (w), 28, (uint32_t)(g))); \
+            rc_dirty[_s] = 0; \
+        } else \
+            rc_dirty[_s] = 1; \
     } while (0)
 
 
@@ -1205,6 +1238,7 @@ static void emit_count(uint32_t n)
  * halt point is a block start. */
 static void emit_budget_check(void)
 {
+    rc_flush();     /* the halt stub leaves the run; g_cpu must be current */
     emit(enc_addsub_reg(1, 1, 1, R_WZR, 25, 24, 0, 0));   /* cmp x25, x24 */
     intptr_t off = ((intptr_t)g_halt_budget_stub - (intptr_t)g_emit) / 4;
     emit(enc_bcond(2, (int32_t)off));                     /* b.hs halt    */
@@ -1682,6 +1716,11 @@ static int emit_one(const air *i)
     case AOP_BCOND: {
         if (cond_bits(i->a) & ~cc_provides()) { emit_fail(i, 2); return -1; }
         if (g_nfix >= AOT_MAX_BLOCK) { emit_fail(i, 3); return -1; }
+        /* Publish the deferred stores BEFORE g_fix[].at is captured. The fixup
+         * rewrites the word at that address into the branch, so anything emitted
+         * between the capture and the branch would be overwritten -- the branch
+         * then became 'b .' (offset zero) and the guest hung. */
+        rc_flush();
         uint32_t target = (uint32_t)((int32_t)(i->pc + 4) + (int32_t)i->imm);
         g_fix[g_nfix].at = g_emit;
         g_fix[g_nfix].pc = target;
@@ -1691,7 +1730,6 @@ static int emit_one(const air *i)
         g_fix[g_nfix].npend = g_npend;
         for (int i = 0; i < g_npend; i++) g_fix[g_nfix].pend[i] = g_pend[i];
         g_nfix++;
-        rc_flush();         /* the stub exits to another block */
         emit(enc_bcond(0, 0));                      /* patched after the body */
         if (g_check) {
             /* Both paths run the checker, and it has to be *after* the branch:
@@ -1837,6 +1875,20 @@ static int emit_arm_insn(const air *i)
 
     if (cond != 0xe) {
         if (cond_bits((int)cond) & ~cc_provides()) { emit_fail(i, 2); return -1; }
+        /* A conditionally executed body runs on one path only, so a deferred
+         * store inside it describes a value the other path never wrote; and
+         * rc_alloc may have taken the slot from another guest register, so
+         * publishing at the merge would write one register's value into
+         * another. Inside such a body the store is immediate. */
+        /* Publish and forget BEFORE the guard. A conditionally executed body
+         * may write a guest register, and that write clears the slot's dirty
+         * flag at *translation* time -- so a deferred store from before the
+         * guard would be dropped from the publish list even on the path where
+         * the body never runs. Seen as: `movs r3, r0` deferred, `rsbmi r3, r0,
+         * #0` immediate inside the body, and the fall-through reading r3 from
+         * memory where it still held the old value. */
+        rc_sync();
+        g_rc_cond++;
         skip_at = g_emit;
         emit(enc_bcond((int)(cond ^ 1u), 0));       /* b.!cond over the body */
     }
@@ -2161,6 +2213,7 @@ static int emit_arm_insn(const air *i)
          * translation-time fact about the emitted code, and it would otherwise
          * claim a value that one of the two paths never wrote. */
         rc_sync();
+        g_rc_cond--;
         intptr_t off = skip_to - skip_at;           /* words to skip over */
         *skip_at = enc_bcond((int)(cond ^ 1u), (int32_t)off);
     }
@@ -2890,7 +2943,10 @@ static int aot_verify_run(uint32_t entry, uint64_t budget)
         for (int k = 0; k < 15; k++)
             if (g_cpu.r[k] != aot.r[k]) { bad = k; break; }
         if (bad >= 0 || (replay & ~1u) != (next & ~1u)) {
-            host_log("aot verify: block at %08x diverges\n", pcraw & ~1u);
+            host_log("aot verify: block at %08x diverges (r%d: code %08x vs interp %08x;"
+                     " next %08x vs %08x)\n", pcraw & ~1u, bad,
+                     bad >= 0 ? g_cpu.r[bad] : 0, bad >= 0 ? aot.r[bad] : 0,
+                     replay & ~1u, next & ~1u);
             if (bad >= 0)
                 host_log("  r%d: interpreter %08x, aot %08x\n",
                          bad, g_cpu.r[bad], aot.r[bad]);

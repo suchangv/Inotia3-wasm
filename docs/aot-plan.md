@@ -1642,3 +1642,65 @@ Also learned: `AOT_VERIFY` reports three blocks (0x010b6a08, 0x010d9bac,
 0x010db636) as divergent on the *write-through* build too, which is gate-green --
 so those three are an artifact of the verifier, not real. `AOT_CHECK` is the
 trustworthy one here.
+
+### 15.12 Deferred stores land: +61%
+
+The guest-register store is now deferred: the value waits in a host register
+until something outside `G_LD`/`G_ST` can observe g_cpu. Bench **1472 MIPS**
+(from 914, +61%), deterministic `--frames=1200` boot **1373 ms** (from 1522),
+against the interpreter's 16.9 s for the same run.
+
+The rule is one sentence: `rc_sync()` publishes and forgets the mapping before
+anything that can read or write g_cpu from outside `G_LD`/`G_ST`. Every entry in
+that list was found by a failing gate, and each is a distinct way to lose a
+store:
+
+| publish point | the failure it was found by |
+|---|---|
+| host call | a shim rewrites any register (longjmp does) |
+| the block's PC write | g_cpu.r[15] is written directly by `emit_guest_pc` |
+| every exit, **including the budget check's halt stub** | the halt stub returns to the runner, which reads g_cpu; without this the bench looped |
+| a conditional branch | the taken path leaves for an out-of-line stub that skips the block epilogue |
+| a conditional body | the body's store clears the slot's dirty flag *at translation time*, so a deferred store from before the guard vanishes from the publish list even on the path where the body never ran |
+| a translation rollback | `g_emit = start` discards the emitted code the slots describe |
+
+Two more that were carried over from the write-through version and still matter:
+the fixup's `g_fix[].at` must be captured **before** anything is emitted (a flush
+inserted in between made the patch rewrite a store, and the branch became `b .`),
+and r13/r15 are written to g_cpu directly / r14 is the return address the exit
+reads, so those three are never deferred.
+
+The last one to fall was the conditional body. Its 1-second reproducer, still
+worth keeping for any future change to this protocol:
+
+```
+build/spike-aarch64 game/libgame.so --entry=10d1bf4 --args=a22b9,3,0,0 \
+    --budget=200000 --no-profile --aot=arm64
+```
+
+The interpreter returns `r0=000360e8`; the broken build returned 0. The generated
+code made it obvious once disassembled: `movs r3, r0` became `mov w6, w9` (slot,
+deferred), `rsbmi r3, r0, #0` inside the guarded body stored immediately and so
+cleared the dirty bit, and the fall-through then read r3 back from memory, where
+it still held the old value.
+
+Gate: bench 54,449,405 instructions; `--frames=1200` boot 211 engine frames /
+2,354,080 instructions per frame / final pc; the full 6500-frame gameplay run
+1271 engine frames / 1,614,257 instructions per frame / `final pc=0badf00c`; and
+`__divsi3`, `__aeabi_i2d`, `__aeabi_ddiv`, `__aeabi_cdcmpeq`, `__aeabi_dcmpgt`
+all match the interpreter.
+
+Cumulative, bench median under qemu: interpreter 43, then 566 (first working
+translator), 884 (exit chaining), 914 (write-through cache), **1472** (deferred
+stores) -- 34x the interpreter as qemu measures it. The planning number stays 3x
+until the RK3566 has been measured.
+
+What is left, in the order the measurements argue for:
+
+1. block linking across conditionals, and dual-path inlining of `cmp; b.cond`,
+   which lengthens blocks and so multiplies both the exit chaining and this
+   cache;
+2. `--aot-stats`: misses, fallbacks per block, code size;
+3. the disk cache (M4);
+4. the remaining 56 MIPS of the *load* side is worth nothing (measured), so no
+   further work there.
