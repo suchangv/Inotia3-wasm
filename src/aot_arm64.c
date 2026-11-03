@@ -1722,6 +1722,21 @@ static int emit_one(const air *i)
          * then became 'b .' (offset zero) and the guest hung. */
         rc_flush();
         uint32_t target = (uint32_t)((int32_t)(i->pc + 4) + (int32_t)i->imm);
+        /* A taken conditional branch is a loop iteration. Sending it through
+         * the out-of-line stub costs a host call into aot_enter for a lookup
+         * the block can do with one instruction -- so when the target is already
+         * translated, the edge goes forward (so no budget check is owed) and it
+         * does not need the flags published, branch straight there. The b.cond
+         * range is +/-1 MB, which is why the distance is checked. */
+        if (!g_check && target > g_block_pc) {
+            uint32_t *known = target_reads_flags(target, g_block_thumb)
+                                  ? NULL : disp_get(target);
+            intptr_t d = known ? (intptr_t)(known - g_emit) : 0;
+            if (known && d > -(1 << 18) && d < (1 << 18)) {
+                emit(enc_bcond((int)i->a, (int32_t)d));
+                break;
+            }
+        }
         g_fix[g_nfix].at = g_emit;
         g_fix[g_nfix].pc = target;
         g_fix[g_nfix].cond = i->a;

@@ -1704,3 +1704,35 @@ What is left, in the order the measurements argue for:
 3. the disk cache (M4);
 4. the remaining 56 MIPS of the *load* side is worth nothing (measured), so no
    further work there.
+
+### 15.13 Conditional branches go straight to the target
+
+A taken conditional branch is a loop iteration, and it used to leave the block
+for an out-of-line stub that called `aot_enter` for a lookup the block can do
+with one instruction. Now, when the target is already translated, the edge goes
+forward (so no budget check is owed) and it does not need the flags published,
+the branch is emitted directly:
+
+```
+    b.cond target        ; instead of:  b.cond stub ... stub: bl aot_enter; br x0
+```
+
+The `b.cond` range is +/-1 MB against a 56 MB arena, so the distance is checked
+and anything further keeps the stub. `!g_check` as well, because the checker has
+to see both paths.
+
+Measured on a noisy host with an interleaved A/B (three rounds, alternating
+builds): 1395 vs 1390 MIPS, i.e. inside the noise. It is kept because it removes
+a host call from every taken branch, which costs far more on a Cortex-A55 than
+under qemu's TCG, and because the stub is 10 words that most blocks no longer
+carry. Boot `--frames=1200`: 1349 ms.
+
+**Tried and backed out: batching the instruction counter.** `add x25, x25, #n` is
+emitted once per guest instruction, so accumulating per block and adding once
+would remove a tenth of the generated code. Implemented and it broke the bench --
+the guest returned after 13,565 of 54,449,405 instructions, so the counter is
+read somewhere the flush did not cover (the candidates are the `.Laot_exit` path
+and the fallback block's `str x25, [x26]`). Reverted rather than left in; the
+flush points are `emit_budget_check()`, `emit_call()`, the block start and the
+block epilogue, which is a short enough list to finish, but it is not worth the
+risk for one instruction in nine.
