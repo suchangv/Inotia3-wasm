@@ -1630,9 +1630,12 @@ static int spike_tick_browser(void)
 static int spike_sdl_run(int argc, char **argv)
 {
     const char *so = "libgame.so";
+    const char *aot_opt = NULL;   /* --aot= wins over the environment */
     for (int i = 1; i < argc; i++) {
         if (strncmp(argv[i], "--so=", 5) == 0)
             so = argv[i] + 5;
+        else if (strncmp(argv[i], "--aot=", 6) == 0)
+            aot_opt = argv[i] + 6;
         else if (strcmp(argv[i], "--windowed") == 0)
             g_sdl_windowed = 1;
         else if (strncmp(argv[i], "--rotate=", 9) == 0)
@@ -1683,6 +1686,24 @@ static int spike_sdl_run(int argc, char **argv)
         }
     }
 
+    /* Which runner executes guest code. This is the SDL build's copy of the
+     * block near the top of main(), and it is not optional: main() returns into
+     * this function under SPIKE_SDL, so before this existed the device build
+     * ignored AOT and --aot= entirely and always ran the interpreter -- the
+     * translator was linked in, cached, and never entered. Same contract as the
+     * CLI: the environment first (the only lever from env.txt on a device),
+     * then --aot=. */
+    {
+        const char *pick = (aot_opt && *aot_opt) ? aot_opt : getenv("AOT");
+        if (pick && *pick && aot_set_mode(pick) != 0) {
+            host_log("aot: unknown AOT=%s (off|predec|arm64), staying off\n",
+                     pick);
+            aot_set_mode("off");
+        }
+        if (g_aot_mode != AOT_NONE)
+            host_log("aot: mode %d\n", g_aot_mode);
+    }
+
     if (host_sdl_init() != 0)
         return 1;
     host_log("loading %s\n", so);
@@ -1690,6 +1711,23 @@ static int spike_sdl_run(int argc, char **argv)
         host_sdl_finish();
         return 1;
     }
+
+    /* Translations of libgame.so are reused across launches. Written from the
+     * player's own image and keyed on it (see aot_arm64.c), next to the game's
+     * data rather than in the working directory. AOT_CACHE overrides it and an
+     * empty value disables it. */
+#ifndef __EMSCRIPTEN__
+    if (!getenv("AOT_CACHE")) {
+        static char cache[512];
+        const char *dir = host_app_data_dir("com.com2us.inotia3");
+        if (dir && *dir) {
+            size_t n = strlen(dir);
+            snprintf(cache, sizeof cache, "%s%saot-code.cache", dir,
+                     (n && dir[n - 1] == (char)47) ? "" : "/");
+            setenv("AOT_CACHE", cache, 1);
+        }
+    }
+#endif
     /* Replace the guest's libgcc division helpers with host arithmetic: they
      * are half the instructions in a frame (see host_hooks.h). --no-hooks
      * exists so the hooked and unhooked builds can be compared. */
@@ -1716,6 +1754,9 @@ static int spike_sdl_run(int argc, char **argv)
         host_sdl_finish();
         return 1;
     }
+#if defined(__aarch64__)
+    aot_arm64_save_cache();   /* the boot translated everything; keep it */
+#endif
     input_init(spike_dispatch_event);
     host_log("=== frame loop ===\n");
 
@@ -1743,6 +1784,7 @@ static int spike_sdl_run(int argc, char **argv)
             break;
     }
     host_log("\n=== %d engine frame(s) ===\n", engine_frames);
+    aot_stats_report();
     spike_finish();
     host_sdl_finish();
     return 0;
